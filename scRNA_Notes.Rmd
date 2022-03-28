@@ -1,0 +1,65 @@
+---
+title: "scRNA notes"
+author: "liuc"
+date: '2022-03-28'
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## scRNA Notes
+
+测序流程：现在主流的主要10X Genomics Chromium（较多细胞），SMART-seq2（较多基因）和Fluidigm C1等。当然还有其他的如：CELL-seq、Drop-seq、mas-seq和Wafergen ICELL8等.
+
+
+10X用到的建库技术是微滴droplet-based 技术, 其下机fastq数据包括三个，分别是I1，R1，R2这三个文件，其中I1为index文件，
+R1为Barcodes+UMI文件，R2是转录本3'/5'端测序数据。
+
+
+```{bash}
+
+i='samplename'
+time fastq-dump --gzip --split-files -A $i ${i}.sra && echo "** ${i}.sra to fastq done **"
+```
+
+### cellranger 的具体使用
+cellrange 包装的较好
+
+cellranger mkfastq ： 它借鉴了Illumina的bcl2fastq ，可以将一个或多个lane中的混样测序样本按照index标签生成样本对应的fastq文件
+
+cellranger count ：利用mkfastq生成的fq文件，进行比对(基于STAR)、过滤、UMI计数。利用细胞的barcode生成gene-barcode矩阵，然后进行样本分群、基因表达分析
+
+cellranger aggr ：接受cellranger count的输出数据，将同一组的不同测序样本的表达矩阵整合在一起，比如tumor组原来有4个样本，PBMC组有两个样本，现在可以使用aggr生成最后的tumor和PBMC两个矩阵，并且进行标准化去掉测序深度的影响
+
+cellranger reanalyze ：接受cellranger count或cellranger aggr生成的gene-barcode矩阵，使用不同的参数进行降维、聚类
+
+```{bash}
+
+cellranger sitecheck #系统信息的整合
+
+# 测试安装成功与否
+/home/liuc/Software/cellranger-6.1.2/cellranger testrun --id=cellranger_test
+
+# 参考序列下载
+curl -O https://cf.10xgenomics.com/supp/cell-exp/refdata-gex-GRCh38-2020-A.tar.gz
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
