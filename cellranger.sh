@@ -46,7 +46,7 @@ cellranger count --id=sample345 \
                   --sample=mysample \
                   --expect-cells=1000 \
                   --nosecondary
-# id指定输出文件存放目录名
+# id指定输出文件存放目录名 
 # transcriptome指定与CellRanger兼容的参考基因组
 # fastqs指定mkfastq或者自定义的测序文件
 # sample要和fastq文件的前缀中的sample保持一致，作为软件识别的标志
