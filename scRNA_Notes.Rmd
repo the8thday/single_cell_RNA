@@ -14,8 +14,12 @@ knitr::opts_chunk$set(echo = TRUE)
 测序流程：现在主流的主要10X Genomics Chromium（较多细胞），SMART-seq2（较多基因）和Fluidigm C1等。当然还有其他的如：CELL-seq、Drop-seq、mas-seq和Wafergen ICELL8等.
 
 
-10X用到的建库技术是微滴droplet-based 技术, 其下机fastq数据包括三个，分别是I1，R1，R2这三个文件，其中I1为index文件，
-R1为Barcodes+UMI文件，R2是转录本3'/5'端测序数据。
+10X用到的建库技术是微滴droplet-based 技术, 通过Poly(dT)与RNA 分子 3'端poly(A)尾巴互补配对以捕获 RNA分子.其下机fastq数据包括三个，分别是I1，R1，R2这三个文件，其中I1为index文件，
+R1为Barcodes+UMI文件，R2是转录本3'端测序数据(测序长度为90？)。可以记成index标识样本、barcode标识细胞、UMI校准定量。
+10X免疫组库建库一般会同时测V(D)J 区段的全长序列和5’端转录组。
+
+
+*10X的测序样本数目和数据量: *一个样本100G的数据量，测大概10000个细胞，每个细胞可以测1000-2000左右的基因。
 
 
 ```{bash}
