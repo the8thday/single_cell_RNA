@@ -1,25 +1,45 @@
 # Seurat的一些用法
 
 library(tidyverse)
+library(patchwork)
 library(Seurat)
 
 
 # read 10X data -----------------------------------------------------------
 
-# counts 数据
-pbmc.data <- Read10X(data.dir = "/Users/congliu/Downloads/pbmc3k/filtered_gene_bc_matrices/hg19/")
-pbmc <- CreateSeuratObject(counts = pbmc.data, 
-                           project = "pbmc3k", 
-                           assay = 'RNA',
-                           min.cells = 1, min.features = 200)
+# 读取单样本counts 数据
+# pbmc.data <- Read10X(data.dir = "/Users/congliu/Downloads/pbmc3k/filtered_gene_bc_matrices/hg19/")
+# pbmc <- CreateSeuratObject(counts = pbmc.data, 
+#                            project = "pbmc3k", 
+#                            assay = 'RNA',
+#                            min.cells = 1, min.features = 200)
 
+## 读取多个文件的counts数据并merge在一起
+for (file in c("SRR7722939", "SRR7722940","SRR7722941","SRR7722942")){
+  seurat_data <- Read10X(data.dir = paste0("/Users/congliu/Downloads/Rawdata/", file))
+  seurat_obj <- CreateSeuratObject(counts = seurat_data,
+                                   min.cells = 3,
+                                   min.features = 100,
+                                   project = file)
+  assign(file, seurat_obj)
+}
+# 对于不同10X的count数据是采用merge还是integrate来合并数据呢
+# merge将不同数据集中的cell相加，合并基因
+merged_seurat <- merge(x = SRR7722939,
+                       y = c(SRR7722940, SRR7722941,SRR7722942),
+                       add.cell.id = c("Pre", "EarlyD27",
+                                       "RespD376","ARD614"))
+merged_seurat
+head(merged_seurat@meta.data)
+
+pbmc <- merged_seurat
 slotNames(pbmc)
 dim(pbmc)
 # pbmc[["RNA"]]@counts # counts矩阵
 
 # 直接读入https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE115469下的数据
-# a <- read.csv('GSE115469_Data.csv')
-# raw_sce <- CreateSeuratObject(counts = a)
+# foo <- read.csv('/Users/congliu/Downloads/GSE115469_Data.csv')
+# raw_sce <- CreateSeuratObject(counts = foo)
 
 
 # Standard pre-processing workflow ----------------------------------------
@@ -31,13 +51,35 @@ head(pbmc@meta.data, 5)
 # nCount_RNA为：应该就是count数
 # 
 FeatureScatter(object = pbmc, feature1 = 'nCount_RNA', feature2 = 'percent.mt')
-VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+# 还可以对核糖体基因、红血细胞基因、管家基因等
+pbmc <- PercentageFeatureSet(pbmc, "^RP[SL]",col.name = "percent.ribo")
+pbmc <- PercentageFeatureSet(pbmc, "^HB[^(P)]", col.name = "percent.hb")
+head(pbmc@meta.data, 5)
+
+VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt", 'percent.ribo', 'percent.hb'), 
+        ncol = 5)
 
 
 # unique feature counts over 2,500 or less than 200 & cells that have >5% mitochondrial counts
 # 此处只是为了演示筛选, 筛选满足条件的细胞
-pbmc <- subset(pbmc, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 5)
+pbmc <- subset(pbmc, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 15)
 dim(pbmc)
+# 筛选基因
+pbmc.qc <- pbmc
+if(T){
+  # Extract counts
+  counts <- GetAssayData(object = pbmc.qc, slot = "counts")
+  # Output a logical matrix specifying for each gene on whether or not there are more than zero counts per cell
+  nonzero <- counts > 0
+  # Sums all TRUE values and returns TRUE if more than 10 TRUE values per gene
+  keep_genes <- Matrix::rowSums(nonzero) >= 10
+  # Only keeping those genes expressed in more than 10 cells
+  pbmc.qc_counts <- counts[keep_genes,]
+  # Reassign to filtered Seurat object
+  pbmc.qc <- CreateSeuratObject(pbmc.qc_counts, meta.data = pbmc.qc@meta.data)
+}
+pbmc.qc 
 
 # normalizing the data
 pbmc <- NormalizeData(pbmc, normalization.method = "LogNormalize", 
@@ -48,7 +90,7 @@ GetAssay(pbmc, assay = 'RNA')
 
 # feature selection -------------------------------------------------------
 
-# 在不同细胞群体中差异较大的基因往往最具有研究价值
+# 在不同细胞群体中表达差异较大的基因往往最具有研究价值
 # highly variable features 指的是在一群细胞中高表达，在另一群中低表达的基因
 pbmc <- FindVariableFeatures(pbmc, selection.method = "vst", 
                              nfeatures = 2000 # nfeature 依据具体的情况进行选择，此处选择2000个
@@ -130,6 +172,16 @@ DimPlot(pbmc,reduction = "tsne",label=TRUE)
 
 # saveRDS(pbmc, file = "../output/pbmc_tutorial.rds")
 
+### 检查批次效应
+colnames(pbmc@meta.data)    
+p1.compare <- wrap_plots(ncol = 3,
+                      DimPlot(pbmc, reduction = "pca", group.by = "group")+NoAxes()+ggtitle("Before_PCA"),
+                      DimPlot(pbmc, reduction = "tsne", group.by = "group")+NoAxes()+ggtitle("Before_tSNE"),
+                      DimPlot(pbmc, reduction = "umap", group.by = "group")+NoAxes()+ggtitle("Before_UMAP"),
+                      guides = "collect"
+)
+p1.compare
+
 # 整合orig.ident的样本信息
 phe <- data.frame(cell=rownames(pbmc@meta.data),
                cluster =pbmc@meta.data$seurat_clusters)
@@ -146,7 +198,7 @@ DimPlot(pbmc,reduction = "tsne",label=TRUE,
 
 # find cluster's marker gene
 # find all markers of cluster 2, 选择cluster2的marker 基因
-unique(sce@meta.data$seurat_clusters) # list all clusters
+unique(pbmc@meta.data$seurat_clusters) # list all clusters
 
 cluster2.markers <- FindMarkers(pbmc, 
                                 ident.1 = 2, # which cluster
@@ -154,11 +206,29 @@ cluster2.markers <- FindMarkers(pbmc,
                                 test.use = "wilcox"
                                 )
 head(cluster2.markers, n = 5)
+# p_val : p_val (unadjusted)
+# avg_log2FC : log fold-change of the average expression between the two groups. 
+# Positive values indicate that the feature is more highly expressed in the first group.
+# pct.1 : The percentage of cells where the feature is detected in the first group
+# pct.2 : The percentage of cells where the feature is detected in the second group
+# p_val_adj : Adjusted p-value, based on Bonferroni correction using all features in the dataset.
 
 # find all markers distinguishing cluster 5 from clusters 0 and 3
-# cluster之间的差异marker
-cluster5.markers <- FindMarkers(pbmc, ident.1 = 5, ident.2 = c(0, 3), min.pct = 0.25)
+# cluster之间的差异marker, 此步骤为DEGs.
+# 此处只是找到一个样本内不同cell type间的DEGs，不同样本间同样的cell type间的差异？
+cluster5.markers <- FindMarkers(pbmc, ident.1 = 5, 
+                                ident.2 = c(0, 3), 
+                                min.pct = 0.25,
+                                test.use = "wilcox"
+                                )
 head(cluster5.markers, n = 5)
+
+cluster5.markers2 <- FindAllMarkers(pbmc,
+                                    ident.1 = 5,
+                                    ident.2 = NULL,
+                                    test.use = 'DESeq2'
+                                    )
+head(cluster5.markers2, n = 5)
 
 # find markers for every cluster compared to all remaining cells, report only the positive ones
 pbmc.markers <- FindAllMarkers(pbmc, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
@@ -177,7 +247,7 @@ FeaturePlot(pbmc, features = c("MS4A1", "GNLY", "CD3E"),
             slot = 'data'
             )
 RidgePlot(pbmc, features = c("MS4A1", "CD79A"))
-CellScatter(pbmc)
+CellScatter(pbmc, cell1 = '', cell2 = '')
 DotPlot(pbmc)
 
 # Assigning cell type identity to clusters --------------------------------
@@ -194,6 +264,135 @@ DimPlot(pbmc, reduction = "umap", label = TRUE, pt.size = 0.3) +
 # 细胞聚类分群后，如何定义每一类的细胞分群
 # cellmarker，可以查找组织的细胞构成
 # 可参考SingleR.Rmd脚本中关于SingleR的用法。
+
+
+
+# ‘SubsetData’ then re-run the Seurat -------------------------------------
+# use SubsetData to select particular clusters 
+dermal.subset <- SubsetData(object = pbmc, ident.use = '')
+
+
+# CCA RPCA merge ----------------------------------------------------------
+
+# 将不同的数据集整合在一起, 可以消除批次效应
+# RPCA 整合的更快，更适合数据集间细胞种类差别大，或者数据集分lane测的时候，或者数据集较多的情况
+# CCA 适合
+
+# integrate datasets by RPCA
+
+## split
+pbmc_list <- SplitObject(pbmc, split.by = "orig.ident")
+# select features that are repeatedly variable across datasets for integration
+features <- SelectIntegrationFeatures(object.list = pbmc_list)
+# 找到整合的锚点anchors
+pbmc_anchors <- FindIntegrationAnchors(object.list = pbmc_list, anchor.features = features)
+# 利用anchors进行整合
+pbmc_seurat <- IntegrateData(anchorset = pbmc_anchors)
+names(pbmc_seurat@assays)
+pbmc_seurat@active.assay
+
+# Perform an integrated analysis
+# Now we can run a single integrated analysis on all cells
+pbmc_seurat <- ScaleData(pbmc_seurat, verbose = FALSE)
+pbmc_seurat <- RunPCA(pbmc_seurat, npcs = 30, verbose = FALSE)
+pbmc_seurat <- RunTSNE(pbmc_seurat, reduction = "pca", dims = 1:10)
+pbmc_seurat <- RunUMAP(pbmc_seurat, reduction = "pca", dims = 1:10)
+pbmc_seurat <- FindNeighbors(pbmc_seurat, reduction = "pca", dims = 1:30)
+# pbmc_seurat <- FindClusters(pbmc_seurat, resolution = 0.5)
+
+
+p2.compare=wrap_plots(ncol = 3,
+                      DimPlot(pbmc_seurat, reduction = "pca", group.by = "group")+NoAxes()+ggtitle("After_PCA"),
+                      DimPlot(pbmc_seurat, reduction = "tsne", group.by = "group")+NoAxes()+ggtitle("After_tSNE"),
+                      DimPlot(pbmc_seurat, reduction = "umap", group.by = "group")+NoAxes()+ggtitle("After_UMAP"),
+                      guides = "collect"
+)
+p1.compare / p2.compare
+
+
+for (res in c(0.05, 0.1, 0.2, 0.3, 0.5,0.8,1,1.2)) {
+  # res=0.01
+  print(res)
+  pbmc_seurat <- FindClusters(pbmc_seurat, graph.name = "integrated_snn", resolution = res, algorithm = 1)
+}
+
+#umap可视化
+cluster_umap <- plot_grid(ncol = 4,  
+                          DimPlot(pbmc_seurat, reduction = "umap", group.by = "integrated_snn_res.0.05", label = T)& NoAxes(),
+                          DimPlot(pbmc_seurat, reduction = "umap", group.by = "integrated_snn_res.0.1", label = T) & NoAxes(),
+                          DimPlot(pbmc_seurat, reduction = "umap", group.by = "integrated_snn_res.0.2", label = T)& NoAxes(),
+                          DimPlot(pbmc_seurat, reduction = "umap", group.by = "integrated_snn_res.0.3", label = T)& NoAxes(),
+                          DimPlot(pbmc_seurat, reduction = "umap", group.by = "integrated_snn_res.0.5", label = T) & NoAxes(),
+                          DimPlot(pbmc_seurat, reduction = "umap", group.by = "integrated_snn_res.0.8", label = T) & NoAxes(),
+                          DimPlot(pbmc_seurat, reduction = "umap", group.by = "integrated_snn_res.1", label = T) & NoAxes(),
+                          DimPlot(pbmc_seurat, reduction = "umap", group.by = "integrated_snn_res.1.2", label = T) & NoAxes()
+)
+
+cluster_umap
+## 选择合适的分辨率（resolution）
+DimPlot(pbmc_seurat, reduction = "umap", group.by = "integrated_snn_res.0.5", label = T)
+pbmc_seurat <- SetIdent(pbmc_seurat,value = "integrated_snn_res.0.5")
+DimPlot(pbmc_seurat,label = T)
+
+
+## 5.2 marker genes
+DefaultAssay(pbmc) <- "RNA"
+markerGenes <- c("CD3D", # 定位T细胞
+                 "CD3E", # 定位T细胞
+                 "TRAC", # 定位T细胞
+                 "IL7R", # CD4 T cells
+                 "GZMA", # NK T /效应T
+                 "NKG7", # NK T cells
+                 "CD8B", # CD8 T cells
+                 "FCGR3A", # CD16(FCGR3A)+ Mono / NK / 效应 CD8+ T
+                 "CD14", # CD14+ monocyte
+                 "LYZ", #Mono
+                 "MS4A1", #B细胞
+                 "FCER1A","LILRA4","TPM2", #DC
+                 "PPBP","GP1BB"# platelets
+)
+p1 = VlnPlot(pbmc, features = markerGenes)
+p2 = DotPlot(pbmc, features = markerGenes, dot.scale = 8) + RotatedAxis()
+p3 = FeaturePlot(pbmc,
+                 features = markerGenes,
+                 label.size = 4,
+                 repel = T,label = T)&
+  theme(plot.title = element_text(size=10))&
+  scale_colour_gradientn(colours = rev(brewer.pal(n = 11, name = "Spectral"))) ##更改配色
+
+
+## 5.3 根据markers重新命名clusters
+celltype=data.frame(ClusterID=0:13,celltype='NA')
+celltype[celltype$ClusterID %in% c(0,13),2]='B cells'
+celltype[celltype$ClusterID %in% c(1),2]='NK cells'
+celltype[celltype$ClusterID %in% c(2),2]='CD8+ Effector T cells'
+celltype[celltype$ClusterID %in% c(12),2]='CD8+ cytotoxic T cells'
+celltype[celltype$ClusterID %in% c(4,6),2]='Naive/memory T cells'
+celltype[celltype$ClusterID %in% c(3),2]='CD4+ T cells'
+celltype[celltype$ClusterID %in% c(10),2]='Dendritic cells'
+celltype[celltype$ClusterID %in% c(5,7),2]='CD14+ monocyte'
+celltype[celltype$ClusterID %in% c(8),2]='CD16+ monocyte'  
+celltype[celltype$ClusterID %in% c(9),2]='Platelets'
+celltype[celltype$ClusterID %in% c(11),2]='RBC'
+celltype
+
+pbmc@meta.data$celltype = "NA"
+for(i in 1:nrow(celltype)){
+  pbmc@meta.data[which(pbmc@active.ident == celltype$ClusterID[i]),'celltype'] <- celltype$celltype[i]}
+table(pbmc@meta.data$celltype)
+
+## 5.4 可视化
+pbmc = SetIdent(pbmc, value = "celltype")
+wrap_plots(ncol = 2,
+           DimPlot(pbmc, reduction = "umap", label = T,repel = T),
+           DimPlot(pbmc, reduction = "tsne", label = T,repel = T),
+           guides = "collect"
+)
+ggsave(filename = "Output/Step5.annotation_plot.pdf",
+       width = 9,height = 17)
+
+## 保存
+write_rds(pbmc,file = "Output/Step5.annotation_pbmc.rds")
 
 
 
