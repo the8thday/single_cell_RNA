@@ -16,7 +16,7 @@ library(Seurat)
 
 ## 读取多个文件的counts数据并merge在一起
 for (file in c("SRR7722939", "SRR7722940","SRR7722941","SRR7722942")){
-  seurat_data <- Read10X(data.dir = paste0("/Users/congliu/Downloads/Rawdata/", file))
+  seurat_data <- Read10X(data.dir = paste0("/Users/congliu/Downloads/10X_Rawdata/", file))
   seurat_obj <- CreateSeuratObject(counts = seurat_data,
                                    min.cells = 3,
                                    min.features = 100,
@@ -36,10 +36,16 @@ pbmc <- merged_seurat
 slotNames(pbmc)
 dim(pbmc)
 # pbmc[["RNA"]]@counts # counts矩阵
+# head(as.data.frame(pbmc@assays$RNA@counts))[1:5]
 
 # 直接读入https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE115469下的数据
 # foo <- read.csv('/Users/congliu/Downloads/GSE115469_Data.csv')
 # raw_sce <- CreateSeuratObject(counts = foo)
+
+SRR7722939@meta.data$group <- "PBMC_Pre"
+SRR7722940@meta.data$group <- "PBMC_EarlyD27"
+SRR7722941@meta.data$group <- "PBMC_RespD376"
+SRR7722942@meta.data$group <- "PBMC_ARD614"
 
 
 # Standard pre-processing workflow ----------------------------------------
@@ -63,6 +69,7 @@ VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt", 'percent.
 
 # unique feature counts over 2,500 or less than 200 & cells that have >5% mitochondrial counts
 # 此处只是为了演示筛选, 筛选满足条件的细胞
+dim(pbmc)
 pbmc <- subset(pbmc, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 15)
 dim(pbmc)
 # 筛选基因
@@ -79,7 +86,7 @@ if(T){
   # Reassign to filtered Seurat object
   pbmc.qc <- CreateSeuratObject(pbmc.qc_counts, meta.data = pbmc.qc@meta.data)
 }
-pbmc.qc 
+dim(pbmc.qc)
 
 # normalizing the data
 pbmc <- NormalizeData(pbmc, normalization.method = "LogNormalize", 
@@ -125,7 +132,7 @@ pbmc[["RNA"]]@scale.data[1:5, 1:5]
 # Note that this single command replaces NormalizeData(), ScaleData(), and FindVariableFeatures()
 # pbmc <- SCTransform(pbmc, vars.to.regress = "percent.mt", verbose = FALSE)
 
-
+write_rds(pbmc.qc,file = "./Output/Step2.after.qc_merged_seurat.rds")
 
 # Perform linear dimensional reduction ------------------------------------
 
@@ -135,7 +142,7 @@ pbmc <- RunPCA(pbmc,
 # Examine and visualize PCA results a few different ways
 print(pbmc[["pca"]], dims = 1:5, nfeatures = 5)
 
-VizDimLoadings(pbmc, dims = 1:2, reduction = "pca")
+VizDimLoadings(pbmc, dims = 1:5, reduction = "pca")
 DimPlot(pbmc, reduction = "pca")
 DimHeatmap(pbmc, 
            dims = 1:4, # PC
@@ -173,25 +180,34 @@ DimPlot(pbmc,reduction = "tsne",label=TRUE)
 # saveRDS(pbmc, file = "../output/pbmc_tutorial.rds")
 
 ### 检查批次效应
-colnames(pbmc@meta.data)    
+colnames(pbmc@meta.data)
 p1.compare <- wrap_plots(ncol = 3,
-                      DimPlot(pbmc, reduction = "pca", group.by = "group")+NoAxes()+ggtitle("Before_PCA"),
-                      DimPlot(pbmc, reduction = "tsne", group.by = "group")+NoAxes()+ggtitle("Before_tSNE"),
-                      DimPlot(pbmc, reduction = "umap", group.by = "group")+NoAxes()+ggtitle("Before_UMAP"),
+                      DimPlot(pbmc, reduction = "pca", group.by = "orig.ident")+NoAxes()+ggtitle("Before_PCA"),
+                      DimPlot(pbmc, reduction = "tsne", group.by = "orig.ident")+NoAxes()+ggtitle("Before_tSNE"),
+                      DimPlot(pbmc, reduction = "umap", group.by = "orig.ident")+NoAxes()+ggtitle("Before_UMAP"),
                       guides = "collect"
 )
 p1.compare
+# ggsave(plot=p1.compare,filename="./Output/Step3.Before_inter_sum.pdf", width = 20,height = 9)
+DimPlot(pbmc,reduction = "umap", # pca, umap, tsne       
+        group.by = "orig.ident",       
+        label = F,       
+        split.by = "orig.ident") + ggtitle("Before_UMAP")
+# 判断批次效应是通过不同样本在不同聚集处的分布情况
+
 
 # 整合orig.ident的样本信息
 phe <- data.frame(cell=rownames(pbmc@meta.data),
                cluster =pbmc@meta.data$seurat_clusters)
 head(phe)
 table(phe$cluster)
-tsne_pos <- Embeddings(pbmc,'tsne') 
+tsne_pos <- Embeddings(pbmc,'tsne')
 DimPlot(pbmc,reduction = "tsne",
         group.by  ='orig.ident') # 查看样本的聚类信息
 DimPlot(pbmc,reduction = "tsne",label=TRUE,
         split.by ='orig.ident')
+
+# 下一步可以通过数据整合消除批次效应
 
 
 # Finding differentially expressed features (cluster biomarkers) ----------
@@ -284,12 +300,17 @@ dermal.subset <- SubsetData(object = pbmc, ident.use = '')
 pbmc_list <- SplitObject(pbmc, split.by = "orig.ident")
 # select features that are repeatedly variable across datasets for integration
 features <- SelectIntegrationFeatures(object.list = pbmc_list)
-# 找到整合的锚点anchors
+# 找到整合的锚点anchors, 默认为CCA
 pbmc_anchors <- FindIntegrationAnchors(object.list = pbmc_list, anchor.features = features)
 # 利用anchors进行整合
 pbmc_seurat <- IntegrateData(anchorset = pbmc_anchors)
 names(pbmc_seurat@assays)
 pbmc_seurat@active.assay
+
+# 对于以上过程的integrate过程，有很多整合方法的选择
+# library(harmony)
+# pbmc_seurat <- pbmc_seurat %>% RunHarmony("orig.ident", plot_convergence = T)
+
 
 # Perform an integrated analysis
 # Now we can run a single integrated analysis on all cells
@@ -301,7 +322,7 @@ pbmc_seurat <- FindNeighbors(pbmc_seurat, reduction = "pca", dims = 1:30)
 # pbmc_seurat <- FindClusters(pbmc_seurat, resolution = 0.5)
 
 
-p2.compare=wrap_plots(ncol = 3,
+p2.compare <- wrap_plots(ncol = 3,
                       DimPlot(pbmc_seurat, reduction = "pca", group.by = "group")+NoAxes()+ggtitle("After_PCA"),
                       DimPlot(pbmc_seurat, reduction = "tsne", group.by = "group")+NoAxes()+ggtitle("After_tSNE"),
                       DimPlot(pbmc_seurat, reduction = "umap", group.by = "group")+NoAxes()+ggtitle("After_UMAP"),
@@ -309,7 +330,7 @@ p2.compare=wrap_plots(ncol = 3,
 )
 p1.compare / p2.compare
 
-
+# 寻找最佳的分辨率，resolution参数。
 for (res in c(0.05, 0.1, 0.2, 0.3, 0.5,0.8,1,1.2)) {
   # res=0.01
   print(res)
@@ -317,7 +338,7 @@ for (res in c(0.05, 0.1, 0.2, 0.3, 0.5,0.8,1,1.2)) {
 }
 
 #umap可视化
-cluster_umap <- plot_grid(ncol = 4,  
+cluster_umap <- cowplot::plot_grid(ncol = 4,  
                           DimPlot(pbmc_seurat, reduction = "umap", group.by = "integrated_snn_res.0.05", label = T)& NoAxes(),
                           DimPlot(pbmc_seurat, reduction = "umap", group.by = "integrated_snn_res.0.1", label = T) & NoAxes(),
                           DimPlot(pbmc_seurat, reduction = "umap", group.by = "integrated_snn_res.0.2", label = T)& NoAxes(),
@@ -334,8 +355,13 @@ DimPlot(pbmc_seurat, reduction = "umap", group.by = "integrated_snn_res.0.5", la
 pbmc_seurat <- SetIdent(pbmc_seurat,value = "integrated_snn_res.0.5")
 DimPlot(pbmc_seurat,label = T)
 
+write_rds(pbmc_seurat,file = "./Output/Step3.Intergration_seurat.rds")
 
-## 5.2 marker genes
+
+## 5.2 marker genes，用于进行初步的细胞注释
+pbmc <- pbmc_seurat
+DimPlot(pbmc, reduction = "tsne",label = T) + DimPlot(pbmc, reduction = "umap",label = T)
+
 DefaultAssay(pbmc) <- "RNA"
 markerGenes <- c("CD3D", # 定位T细胞
                  "CD3E", # 定位T细胞
@@ -351,14 +377,15 @@ markerGenes <- c("CD3D", # 定位T细胞
                  "FCER1A","LILRA4","TPM2", #DC
                  "PPBP","GP1BB"# platelets
 )
-p1 = VlnPlot(pbmc, features = markerGenes)
-p2 = DotPlot(pbmc, features = markerGenes, dot.scale = 8) + RotatedAxis()
+VlnPlot(pbmc, features = markerGenes)
+DotPlot(pbmc, features = markerGenes, dot.scale = 8) + RotatedAxis()
 p3 = FeaturePlot(pbmc,
                  features = markerGenes,
                  label.size = 4,
                  repel = T,label = T)&
   theme(plot.title = element_text(size=10))&
-  scale_colour_gradientn(colours = rev(brewer.pal(n = 11, name = "Spectral"))) ##更改配色
+  scale_colour_gradientn(colours = rev(RColorBrewer::brewer.pal(n = 11, name = "Spectral"))) ##更改配色
+p3
 
 
 ## 5.3 根据markers重新命名clusters
