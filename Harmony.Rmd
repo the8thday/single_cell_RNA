@@ -1,0 +1,82 @@
+---
+title: "Harmony"
+author: "liuc"
+date: '2022-04-02'
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Harmony
+
+```{r}
+library(Seurat)
+library(dplyr)
+library(patchwork)
+library(readr)
+library(ggplot2)
+library(RColorBrewer)
+library(future)
+library(clustree)
+library(cowplot)
+library(stringr)
+library(SeuratDisk)
+library(SeuratWrappers)
+library(harmony)
+library(rliger)
+library(reshape2)
+```
+
+Harmony
+
+```{r}
+# change the current plan to access parallelization
+plan("multisession", workers = 2)
+plan()
+#设置可用的内存
+options(future.globals.maxSize = 10 * 1024^3)
+```
+
+```{r}
+# install dataset
+InstallData("ifnb")
+
+#### 1.load dataset
+ifnb.data = LoadData("ifnb")
+
+#### 2.normalize/HVG/scale三步走
+ifnb.data <- ifnb.data %>% NormalizeData(verbose = F) %>%
+  FindVariableFeatures(selection.method = "vst", nfeatures = 2000, verbose = F) %>% 
+  ScaleData(verbose = F) %>%
+  RunPCA(npcs = 30, verbose = F)
+
+#### 3. harmony
+# harmony对数据的整合发生在RunPCA之后
+ifnb.data <- ifnb.data %>% RunHarmony("orig.ident", plot_convergence = T)
+#Check the generated embeddings:
+harmony_embeddings <- Embeddings(ifnb.data, 'harmony')
+harmony_embeddings[1:5, 1:5]
+
+#### 4.降维聚类：进行 UMAP 和 clustering:
+n.pcs = 20
+ifnb.data <- ifnb.data %>% 
+  RunUMAP(reduction = "harmony", dims = 1:n.pcs, verbose = F) %>% 
+  RunTSNE(reduction = "harmony", dims = 1:n.pcs, verbose = F) %>% 
+  FindNeighbors(reduction = "harmony", k.param = 10, dims = 1:n.pcs)
+
+ifnb.data <- FindClusters(ifnb.data,resolution = 0.5, algorithm = 1)%>% 
+  identity()
+
+#### 5.umap可视化
+p1 <- DimPlot(ifnb.data, reduction = "umap", group.by = "stim")
+p2 <- DimPlot(ifnb.data, reduction = "umap",group.by = "seurat_annotations", label = TRUE,
+              repel = TRUE)
+P.total = p1 + p2
+ggsave(P.total,filename = "Output/integrated_snn_res.harmony.pdf",
+       width = 15, height = 6)
+
+saveRDS(ifnb.data,file = "Output/integrated.harmony.rds")
+```
+
