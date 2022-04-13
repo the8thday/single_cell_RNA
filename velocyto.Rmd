@@ -1,0 +1,90 @@
+---
+title: "velocyto"
+author: "liuc"
+date: '2022-04-01'
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## velocyto
+
+velocyto is a package for the analysis of expression dynamics in single cell RNA seq data. In particular, it enables estimations of RNA velocities of single cells by distinguishing unspliced and spliced mRNAs in standard single-cell RNA sequencing protocols (see pre-print below for more information).
+
+我们常用的基因表达矩阵，如velocyto的作者在文献中所讲，反映的是细胞转录组的瞬间快照。其实在生命体中，每时每刻都发生着mRNA的转录、剪接和降解，这些过程都是有速度的，作者在文中用α、β和γ表示。不仅mRNA的转录、剪接和降解有速度，前体mRNA和成熟mRNA的丰度变化也有速度，作者所讲的RNA速度特指成熟mRNA的丰度变化速度。
+在velocyto的动力学模型中，作者假定转录速度α恒定，此时unspliced mRNA(u)和未来的spliced mRNA(s)的丰度高度相关.
+
+*10X的3'建库在测序时只是测了90多bp的mRNA序列，怎么通过利用unspliced mRNA和spliced mRNA的丰度信息计算RNA速率呢？*
+
+
+```{r}
+library(devtools)
+install_github("velocyto-team/velocyto.R")
+```
+
+
+
+```{r}
+library(velocyto)
+library(scVelo)
+```
+
+使用velocyto包从cell ranger输出的bam文件中提取一是成熟mRNA(spliced)的count矩阵，二是未成熟mRNA(unspliced)的count矩阵. 可以在服务器上利用python版的velocyto进行分析。
+
+```{r, engine = 'bash', eval = FALSE}
+rmsk_gtf=$HOME/pipeline/velocyto/hg38_repeat_rmsk.gtf # 从genome.ucsc.edu下载 
+cellranger_outDir=HSY-fushui # 前面cellranger命令的outputs目录 
+cellranger_gtf=$HOME/pipeline/refdata-gex-GRCh38-2020-A/genes/genes.gtf # 这个是cellranger官网提供的
+
+
+nohup velocyto run10x -m $rmsk_gtf  $cellranger_outDir $cellranger_gtf & 
+# 如果是其它单细胞数据，可以换参数，比如run_smartseq2   
+
+```
+
+
+```{r}
+# If you don't have velocyto's example mouse bone marrow dataset, download with the CURL command
+# curl::curl_download(url = 'http://pklab.med.harvard.edu/velocyto/mouseBM/SCG71.loom', destfile
+# = '~/Downloads/SCG71.loom')
+
+# 读取loom格式文件
+ldat <- ReadVelocity(file = "~/Downloads/SCG71.loom")
+# 转为Seurat对象
+bm <- as.Seurat(x = ldat)
+# 数据标准化以及后的降维聚类
+bm <- SCTransform(object = bm, assay = "spliced")
+bm <- RunPCA(object = bm, verbose = FALSE)
+bm <- FindNeighbors(object = bm, dims = 1:20)
+bm <- FindClusters(object = bm)
+bm <- RunUMAP(object = bm, dims = 1:20)
+ 
+# 拟合平衡系数 γ
+bm <- RunVelocity(object = bm, deltaT = 1, kCells = 25, fit.quantile = 0.02)
+ident.colors <- (scales::hue_pal())(n = length(x = levels(x = bm)))
+names(x = ident.colors) <- levels(x = bm)
+cell.colors <- ident.colors[Idents(object = bm)]
+names(x = cell.colors) <- colnames(x = bm)
+ 
+# 将速率投射在降维空间上画图
+show.velocity.on.embedding.cor(emb = Embeddings(object = bm, reduction = "umap"), vel = Tool(object = bm,
+    slot = "RunVelocity"), n = 200, scale = "sqrt", cell.colors = ac(x = cell.colors, alpha = 0.5),
+    cex = 0.8, arrow.scale = 3, show.grid.flow = TRUE, min.grid.cell.mass = 0.5, grid.n = 40, arrow.lwd = 1,
+    do.par = FALSE, cell.border.alpha = 0.1)
+```
+
+
+
+## scVelo
+
+```{python}
+
+```
+
+
+
+
+
+
