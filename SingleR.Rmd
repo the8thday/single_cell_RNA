@@ -1,0 +1,146 @@
+---
+title: "SingleR"
+author: "liuc"
+date: '2022-03-29'
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## SingleR
+
+SingleR is an automatic annotation method for single-cell RNA sequencing (scRNAseq) data.
+
+由`celldex`包所提供的多种reference，当然也可以按照官网自己整理。SingleR所需要的参考数据集和输入矩阵*需要log*
+
+其所提供的5个人类的数据集为：
+BlueprintEncodeData Blueprint (Martens and Stunnenberg 2013) and Encode (The ENCODE Project Consortium 2012) （人）
+DatabaseImmuneCellExpressionData The Database for Immune Cell Expression(/eQTLs/Epigenomics)(Schmiedel et al. 2018)（人）
+HumanPrimaryCellAtlasData the Human Primary Cell Atlas (Mabbott et al. 2013)（人）
+MonacoImmuneData, Monaco Immune Cell Data - GSE107011 (Monaco et al. 2019)（人）
+NovershternHematopoieticData Novershtern Hematopoietic Cell Data - GSE24759（人）
+ImmGenData the murine ImmGen (Heng et al. 2008) （鼠）
+MouseRNAseqData a collection of mouse data sets downloaded from GEO (Benayoun et al. 2019).鼠）
+
+这5个数据集间可以联合使用吗？
+
+
+```{r}
+library(SingleR)
+library(SingleCellExperiment)
+library(SeuratDisk)
+
+
+# Loading reference data with Ensembl annotations.
+# library(celldex)
+# ref.data <- HumanPrimaryCellAtlasData(ensembl=TRUE)
+```
+
+```{r}
+## 将Seurat对象转换为SCE对象
+DefaultAssay(pbmc) <- "RNA"
+# SingleR的输入
+sce_singleR <- as.SingleCellExperiment(DietSeurat(pbmc))
+
+p0 <- DimPlot(pbmc, reduction = "umap",group.by = "integrated_snn_res.0.5",label = T)
+p0
+
+DimPlot(pbmc, reduction = "tsne",label = T) +
+  DimPlot(pbmc, reduction = "umap",label = T)
+
+
+# 另一种SingleR的输入
+pbmc_for_SingleR <- GetAssayData(pbmc, slot="data") ##获取标准化矩阵
+pbmc.hesc <- SingleR(test = pbmc_for_SingleR, ref = hpca.se, labels = hpca.se$label.main) #
+pbmc.hesc
+
+table(pbmc.hesc$labels,meta$seurat_clusters)
+
+pbmc@meta.data$labels <-pbmc.hesc$labels
+
+print(DimPlot(pbmc, group.by = c("seurat_clusters", "labels"),reduction = "umap"))
+
+
+```
+
+### 使用多个数据库注释
+
+```{r}
+pbmc3 <- pbmc
+pbmc3.hesc <- SingleR(test = pbmc_for_SingleR, ref = list(BP=bpe.se, HPCA=hpca.se), 
+                      labels = list(bpe.se$label.main, hpca.se$label.main)) 
+table(pbmc3.hesc$labels,meta$seurat_clusters)
+
+pbmc3@meta.data$labels <-pbmc3.hesc$labels
+
+print(DimPlot(pbmc3, group.by = c("seurat_clusters", "labels"),reduction = "umap"))
+```
+
+
+
+### 5个数据库分别注释
+
+```{r}
+source("./SingleRV3.r")
+
+
+for (i in 1:5) {
+ p.tmp = singleR_vis(input_sce = sce_singleR,
+                     seurat_Data = pbmc,
+                     clusters = sce_singleR$integrated_snn_res.0.5,
+                     ref = ref_human[[i]],
+                     title =names(ref_human)[i],
+                     labels = ref_human[[i]]$label.fine,
+                     reduction = "umap"
+                     )
+ assign(paste0("p.",names(ref_human)[i]), p.tmp)
+}
+
+p.singleR = (p0 | p.BE | p.Monaco) / (p.diced | p.hpca | p.nhd)
+p.singleR
+
+
+# ggsave(p.singleR, filename = "Output/Step5.annotation_singleR.pdf",
+#       width = 9,height = 18)
+```
+
+```{r}
+names(ref_human)
+
+pred.pbmc <- SingleR(test = sce_singleR,
+        ref = ref_human$hpca,
+        labels = ref_human$hpca$label.fine,
+        assay.type.test = "logcounts", 
+        assay.type.ref = "logcounts",
+        clusters = sce_singleR$integrated_snn_res.0.5 # otherwise it defaults to per-cell annotation
+        )
+
+head(pred.pbmc)
+table(pred.pbmc$labels)
+```
+
+### 诊断
+
+each cell (i.e., column of the heatmap) should have one score that is obviously larger than the rest, indicating that it is unambiguously assigned to a single label.
+
+对注释结果可信度的再分析包括labels值和每个细胞（或者分群）的热图，labels和某一细胞的值明显的高于其他细胞则比较可信.
+
+```{r}
+# 热图
+plotScoreHeatmap(pred.pbmc)
+
+# per-cell “deltas”
+# Low deltas indicate that the assignment is uncertain
+plotDeltaDistribution(pred.pbmc, ncol = 3)
+
+
+# 依据marker基因的表达
+all.markers <- metadata(pred.pbmc)$de.genes
+pbmc$labels <- pred.pbmc$labels
+
+```
+
+
+
