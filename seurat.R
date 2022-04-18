@@ -62,7 +62,7 @@ pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc,
 head(pbmc@meta.data, 5)
 # nFeature_RNA为：基因
 # nCount_RNA为：应该就是count数
-# 
+# The number above each plot is a Pearson correlation coefficient
 FeatureScatter(object = pbmc, feature1 = 'nCount_RNA', feature2 = 'percent.mt')
 
 # 还可以对核糖体基因、红血细胞基因、管家基因等
@@ -102,13 +102,7 @@ pbmc <- NormalizeData(pbmc, normalization.method = "LogNormalize",
 head(pbmc[['RNA']]@data) # Normalized values
 GetAssay(pbmc, assay = 'RNA')
 
-
-# 细胞周期归类
-pbmc <- CellCycleScoring(object = pbmc, 
-                         g2m.features = cc.genes$g2m.genes, s.features = cc.genes$s.genes)
-DimPlot(pbmc,reduction = "umap",label = TRUE,group.by="Phase",pt.size = 1.5)
-head(x = pbmc@meta.data)
-VlnPlot(seurat_phase,features =c("S.Score","G2M.Score"))
+Idents(pbmc)
 
 
 # feature selection -------------------------------------------------------
@@ -142,13 +136,23 @@ pbmc[["RNA"]]@scale.data[1:5, 1:5]
 # scaling这步是完全必要的，默认的feature参数对下游的PCA和聚类没有影响，但可能会影响DoHeatmap()的展示
 
 # we could ‘regress out’ heterogeneity associated with (for example) cell cycle stage, or mitochondrial contamination
-pbmc <- ScaleData(pbmc, vars.to.regress = "percent.mt")
+# pbmc <- ScaleData(pbmc, vars.to.regress = "percent.mt")
 # pbmc <- ScaleData(pbmc, vars.to.regress = c("S.Score", "G2M.Score"), 
 #                           features = rownames(seurat_phase))
 
 
+# 细胞周期归类
+# This has to be done after normalization and scaling
+pbmc <- CellCycleScoring(object = pbmc, 
+                         g2m.features = cc.genes.updated.2019$g2m.genes, 
+                         s.features = cc.genes.updated.2019$s.genes)
+table(pbmc[[]]$Phase)
+DimPlot(pbmc,reduction = "umap",label = TRUE,group.by="Phase",pt.size = 1.5)
+head(pbmc@meta.data)
+VlnPlot(seurat_phase,features =c("S.Score","G2M.Score"))
 
-# run sctransform, 这步需要在计算MT基因后进行
+
+# run sctransform, 这步似乎需要在计算MT基因后进行，似乎不需要
 # Note that this single command replaces NormalizeData(), ScaleData(), and FindVariableFeatures()
 # pbmc <- SCTransform(pbmc, vars.to.regress = "percent.mt", verbose = FALSE)
 
@@ -163,9 +167,11 @@ pbmc <- RunPCA(pbmc,
 print(pbmc[["pca"]], dims = 1:5, nfeatures = 5)
 
 VizDimLoadings(pbmc, dims = 1:5, reduction = "pca")
+# it looks for UMAP, then (if not available) tSNE, then PCA
 DimPlot(pbmc, reduction = "pca")
 DimHeatmap(pbmc, 
            dims = 1:4, # PC
+           nfeatures = 30,
            cells = 500, 
            balanced = TRUE)
 # 如何选择 PC 的数目？文档中用到两种方法，此处选择Elbowplot,不过不够精准定量, err on the higher side
@@ -187,6 +193,7 @@ pbmc <- FindClusters(pbmc,
                      ) # Louvain algorithm
 # Look at cluster IDs of the first 5 cells
 head(Idents(pbmc), 5)
+table(pbmc@meta.data$seurat_clusters) # identity在此被设定为clusters
 
 # As input to the UMAP and tSNE, we suggest using the same PCs as input to the clustering analysis
 pbmc <- RunUMAP(pbmc, dims = 1:20) # dims参数同上
@@ -229,6 +236,26 @@ DimPlot(pbmc,reduction = "tsne",
 DimPlot(pbmc,reduction = "tsne",label=TRUE,
         split.by ='orig.ident')
 
+# 在此处进行各种探索是合适的, 不同细胞类别中几个参数的分布
+VlnPlot(pbmc,features = "percent.mt") & theme(plot.title = element_text(size=10))
+FeaturePlot(pbmc,features = "percent.rb",label.size = 4,repel = T,label = T) & 
+  theme(plot.title = element_text(size=10))
+FeaturePlot(pbmc,features = c("S.Score","G2M.Score"),label.size = 4,repel = T,label = T) & 
+  theme(plot.title = element_text(size=10))
+
+# 做完这步之后，active assay现在是SCT
+pbmc <- SCTransform(pbmc, method = "glmGamPoi", 
+                    # ncells = 8824, 
+                    vars.to.regress = c("percent.mt","S.Score","G2M.Score"), verbose = F)
+pbmc
+srat <- pbmc
+srat <- RunPCA(srat, verbose = F)
+srat <- RunUMAP(srat, dims = 1:30, verbose = F)
+srat <- FindNeighbors(srat, dims = 1:30, verbose = F)
+srat <- FindClusters(srat, verbose = F)
+table(srat[[]]$seurat_clusters)
+
+
 # 下一步可以通过数据整合消除批次效应
 
 
@@ -245,16 +272,21 @@ pbmc_list <- SplitObject(pbmc, split.by = "orig.ident")
 # select features that are repeatedly variable across datasets for integration
 features <- SelectIntegrationFeatures(object.list = pbmc_list)
 # 找到整合的锚点anchors, 默认为CCA
-pbmc_anchors <- FindIntegrationAnchors(object.list = pbmc_list, anchor.features = features)
+pbmc_anchors <- FindIntegrationAnchors(object.list = pbmc_list, anchor.features = features,
+                                       reduction = 'rpca'
+                                       )
 # 利用anchors进行整合
 pbmc_seurat <- IntegrateData(anchorset = pbmc_anchors)
 names(pbmc_seurat@assays)
 pbmc_seurat@active.assay
 
+
 # 对于以上过程的integrate过程，有很多整合方法的选择
 # harmony 替换上述的整合过程
 # library(harmony)
 # pbmc_seurat <- pbmc_seurat %>% RunHarmony("orig.ident", plot_convergence = T)
+# harmony_embeddings <- Embeddings(pbmc_harmony, 'harmony')
+# harmony_embeddings[1:5, 1:5]
 
 
 # Perform an integrated analysis
@@ -399,6 +431,7 @@ write_rds(pbmc,file = "Output/Step5.annotation_pbmc.rds")
 
 # find cluster's marker gene
 # find all markers of cluster 2, 选择cluster2的marker 基因, 如果ident.2为NULL，则默认比全部其他
+DefaultAssay(pbmc) <- "RNA"
 unique(pbmc@meta.data$seurat_clusters) # list all clusters
 
 cluster2.markers <- FindMarkers(pbmc, 
@@ -436,7 +469,7 @@ head(cluster5.markers2, n = 5)
 
 # find markers for every cluster compared to all remaining cells, report only the positive ones
 pbmc.markers <- FindAllMarkers(pbmc, only.pos = TRUE, min.pct = 0.25, 
-                               logfc.threshold = 0.25)
+                               logfc.threshold = 0.5)
 print(head(pbmc.markers))
 
 pbmc.markers %>%
