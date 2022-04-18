@@ -1,0 +1,56 @@
+---
+title: "Seurat4"
+author: "liuc"
+date: '2022-04-12'
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+https://www.singlecellcourse.org/index.html
+
+完整而简略的单细胞转录组分析流程，对于多样本数据集。
+
+
+```{r}
+library(SingleCellExperiment)
+library(tidyverse)
+library(patchwork)
+library(Seurat)
+library(clustree)
+```
+
+
+## Complete Seurat4 pipeline
+
+1. 首先是对10X数据的整合
+
+在10X数据下机后，还需要进行·scrublet·进行doublet detection ·soupX·等进行ambient RNA correction等质控的过程。
+
+```{r}
+# merge
+
+```
+
+2. 对Seurat对象的metadata增加所需的样本信息
+
+```{r}
+
+```
+
+3. dd
+
+```{r}
+
+```
+
+
+
+
+
+
+
+
+
