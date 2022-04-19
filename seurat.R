@@ -95,6 +95,7 @@ if(T){
 }
 dim(pbmc.qc)
 table(Idents(pbmc.qc))
+pbmc <- pbmc.qc
 
 # normalizing the data
 pbmc <- NormalizeData(pbmc, normalization.method = "LogNormalize", 
@@ -102,7 +103,7 @@ pbmc <- NormalizeData(pbmc, normalization.method = "LogNormalize",
 head(pbmc[['RNA']]@data) # Normalized values
 GetAssay(pbmc, assay = 'RNA')
 
-Idents(pbmc)
+head(Idents(pbmc))
 
 
 # feature selection -------------------------------------------------------
@@ -143,11 +144,14 @@ pbmc[["RNA"]]@scale.data[1:5, 1:5]
 
 # 细胞周期归类
 # This has to be done after normalization and scaling
-pbmc <- CellCycleScoring(object = pbmc, 
-                         g2m.features = cc.genes.updated.2019$g2m.genes, 
-                         s.features = cc.genes.updated.2019$s.genes)
+pbmc <- CellCycleScoring(object = pbmc,
+                         # g2m.features = cc.genes.updated.2019$g2m.genes,
+                         # s.features = cc.genes.updated.2019$s.genes,
+                         g2m.features = cc.genes$g2m.genes,
+                         s.features = cc.genes$s.genes
+                         )
 table(pbmc[[]]$Phase)
-DimPlot(pbmc,reduction = "umap",label = TRUE,group.by="Phase",pt.size = 1.5)
+DimPlot(pbmc,reduction = "umap",label = TRUE,group.by="Phase",pt.size = .5)
 head(pbmc@meta.data)
 VlnPlot(seurat_phase,features =c("S.Score","G2M.Score"))
 
@@ -166,7 +170,8 @@ pbmc <- RunPCA(pbmc,
 # Examine and visualize PCA results a few different ways
 print(pbmc[["pca"]], dims = 1:5, nfeatures = 5)
 
-VizDimLoadings(pbmc, dims = 1:5, reduction = "pca")
+VizDimLoadings(pbmc, dims = 1:5, reduction = "pca") &
+  theme(axis.text=element_text(size=5), axis.title=element_text(size=8,face="bold"))
 # it looks for UMAP, then (if not available) tSNE, then PCA
 DimPlot(pbmc, reduction = "pca")
 DimHeatmap(pbmc, 
@@ -187,23 +192,29 @@ JackStrawPlot(pbmc, dims = 1:20)
 
 # cluster the cell by previously identified PC
 # seurat依据PCA的结果进行聚类
-pbmc <- FindNeighbors(pbmc, dims = 1:20) # KNN+Jaccard similarity, dims为上一步确定的PC数目,此处刻意选择20
+pbmc <- FindNeighbors(pbmc, dims = 1:15) # KNN+Jaccard similarity, dims为上一步确定的PC数目,此处刻意选择20
 pbmc <- FindClusters(pbmc, 
-                     resolution = 0.5 #0.4-1.2 typically returns good results for single-cell datasets of around 3K 
+                     resolution = 0.5, #0.4-1.2 typically returns good results for single-cell datasets of around 3K 
+                     algorithm = 1
                      ) # Louvain algorithm
 # Look at cluster IDs of the first 5 cells
 head(Idents(pbmc), 5)
 table(pbmc@meta.data$seurat_clusters) # identity在此被设定为clusters
 
 # As input to the UMAP and tSNE, we suggest using the same PCs as input to the clustering analysis
-pbmc <- RunUMAP(pbmc, dims = 1:20) # dims参数同上
+pbmc <- RunUMAP(pbmc, dims = 1:15) # dims参数同上
 DimPlot(pbmc, 
         reduction = "umap",
         label = TRUE
         )
+DimPlot(pbmc, reduction = "umap", group.by = "orig.ident")
 
 pbmc <- RunTSNE(object = pbmc, dims = 1:20, do.fast = TRUE)
 DimPlot(pbmc,reduction = "tsne",label=TRUE)
+
+FeaturePlot(pbmc, features = c("LILRA4", "TPM2", "PPBP", "GP1BB"))
+FeaturePlot(srat, features = "percent.mt") & theme(plot.title = element_text(size=10))
+FeaturePlot(srat, features = "nFeature_RNA") & theme(plot.title = element_text(size=10))
 
 # saveRDS(pbmc, file = "../output/pbmc_tutorial.rds")
 
@@ -218,10 +229,11 @@ p1.compare <- wrap_plots(ncol = 3,
 )
 p1.compare
 # ggsave(plot=p1.compare,filename="./Output/Step3.Before_inter_sum.pdf", width = 20,height = 9)
+
 DimPlot(pbmc,reduction = "umap", # pca, umap, tsne       
         group.by = "orig.ident",       
         label = F,       
-        split.by = "orig.ident") + ggtitle("Before_UMAP")
+        split.by = "orig.ident") + ggtitle("Before_intergrate_UMAP")
 # 判断批次效应是通过不同样本在不同聚集处的分布情况
 
 
@@ -231,12 +243,13 @@ phe <- data.frame(cell=rownames(pbmc@meta.data),
 head(phe)
 table(phe$cluster)
 tsne_pos <- Embeddings(pbmc,'tsne')
-DimPlot(pbmc,reduction = "tsne",
+DimPlot(pbmc,reduction = "umap",
         group.by  ='orig.ident') # 查看样本的聚类信息
-DimPlot(pbmc,reduction = "tsne",label=TRUE,
+DimPlot(pbmc,reduction = "umap",label=TRUE,
         split.by ='orig.ident')
 
 # 在此处进行各种探索是合适的, 不同细胞类别中几个参数的分布
+# 这里的分布也可以提供批次效应的不同
 VlnPlot(pbmc,features = "percent.mt") & theme(plot.title = element_text(size=10))
 FeaturePlot(pbmc,features = "percent.rb",label.size = 4,repel = T,label = T) & 
   theme(plot.title = element_text(size=10))
@@ -254,6 +267,10 @@ srat <- RunUMAP(srat, dims = 1:30, verbose = F)
 srat <- FindNeighbors(srat, dims = 1:30, verbose = F)
 srat <- FindClusters(srat, verbose = F)
 table(srat[[]]$seurat_clusters)
+DimPlot(srat, label = T)
+
+FeaturePlot(srat,"PPBP") & 
+  scale_colour_gradientn(colours = rev(RColorBrewer::brewer.pal(n = 11, name = "Spectral")))
 
 
 # 下一步可以通过数据整合消除批次效应
