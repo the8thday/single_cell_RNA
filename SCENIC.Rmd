@@ -1,0 +1,27 @@
+---
+title: "SCENIC"
+author: "liuc"
+date: '2022-04-02'
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## SCENIC
+
+利用单细胞RNA-seq数据，同时进行基因调控网络重建和细胞状态鉴定,提出并证明了顺式调控网络分析能够用于指导转录因子和细胞状态的鉴定。SCENIC通过使用生物学驱动的features自动清除肿瘤样本特异性等批次效应。
+
+*基因调控网络*可以理解成细胞特定状态下所有的调控网络。转录因子及其靶基因间的关系。
+
+
+
+```{r}
+# 参考基因组等的准备
+# SCENIC的参考基因组还是有点小麻烦的
+
+library(SCENIC)
+
+```
+
