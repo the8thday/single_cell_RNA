@@ -10,8 +10,10 @@ knitr::opts_chunk$set(echo = TRUE)
 ```
 
 https://www.singlecellcourse.org/index.html
+https://github.com/hbctraining/scRNA-seq
 
 完整而简略的单细胞转录组分析流程，对于多样本数据集。
+假设实验组和
 
 
 ```{r}
@@ -27,29 +29,279 @@ library(clustree)
 
 1. 首先是对10X数据的整合
 
-在10X数据下机后，还需要进行·scrublet·进行doublet detection ·soupX·等进行ambient RNA correction等质控的过程。
+在10X数据下机后，还需要·scrublet·进行doublet detection ·soupX·等进行ambient RNA correction等质控的过程。
+不过对于doublet的检测，似乎也不是很着急
+
+此示例样本包括8个PBMC样本，其中4个为control组，四个为stim刺激过后的样本。
 
 ```{r}
 # merge
+for (file in c("ctrl_raw_feature_bc_matrix", "stim_raw_feature_bc_matrix")){
+        seurat_data <- Read10X(data.dir = paste0("./datasets/", file))
+        seurat_obj <- CreateSeuratObject(counts = seurat_data, 
+                                         min.features = 100, 
+                                         project = file)
+        assign(file, seurat_obj)
+}
 
+# Create a merged Seurat object
+merged_seurat <- merge(x = ctrl_raw_feature_bc_matrix, 
+                       y = stim_raw_feature_bc_matrix, 
+                       add.cell.id = c("ctrl", "stim"))
 ```
 
 2. 对Seurat对象的metadata增加所需的样本信息
 
+已知的meta信息
+
 ```{r}
+# Check the metadata in the new Seurat objects
+head(merged_seurat@meta.data)
+
+merged_seurat@meta.data$cells <- rownames(merged_seurat@meta.data)
+
+# Create sample column
+merged_seurat@meta.data$sample <- NA
+merged_seurat@meta.data$sample[which(str_detect(merged_seurat@meta.data$cells, "^ctrl_"))] <- "ctrl"
+merged_seurat@meta.data$sample[which(str_detect(merged_seurat@meta.data$cells, "^stim_"))] <- "stim"
 
 ```
 
-3. dd
+计算后的一些meta信息
 
 ```{r}
+# Add number of genes per UMI for each cell to metadata
+merged_seurat$log10GenesPerUMI <- log10(merged_seurat$nFeature_RNA) / log10(merged_seurat$nCount_RNA)
 
+# Compute percent mito ratio
+merged_seurat$mitoRatio <- PercentageFeatureSet(object = merged_seurat, pattern = "^MT-")
+merged_seurat$mitoRatio <- merged_seurat@meta.data$mitoRatio / 100
+
+
+# Create .RData object to load at any time
+save(merged_seurat, file="datasets//merged_filtered_seurat.RData")
+```
+
+
+3. 对metadata的metrix进行绘图，并确定质控阈值
+
+```{r}
+metadata <- merged_seurat@meta.data
+
+# Visualize the number UMIs/transcripts per cell
+# 对于UMI或是feature数目的分布，单一的峰往往是较好的结果
+metadata %>% 
+  	ggplot(aes(color=sample, x=nCount_RNA, fill= sample)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	ylab("Cell density") +
+  	geom_vline(xintercept = 500)
+```
+
+
+```{r}
+# Visualize the correlation between genes detected and number of UMIs and determine whether strong presence of cells with low numbers of genes/UMIs
+metadata %>% 
+  	ggplot(aes(x=nCount_RNA, y=nFeature_RNA, color=mitoRatio)) + 
+  	geom_point() + 
+	scale_colour_gradient(low = "gray90", high = "black") +
+  	stat_smooth(method=lm) +
+  	scale_x_log10() + 
+  	scale_y_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 500) +
+  	geom_hline(yintercept = 250) +
+  	facet_wrap(~sample)
+```
+
+
+4. filtering 
+QC质控在scRNA中应该结合多种metric的分布进行确定，有些细胞可能是质控不达标，也可能是生物学意义上本就如此的细胞亚群。不同的质控的理解会对下游分析有些许的影响，下面结合对QC的理解进行过滤。
+在过滤过后推荐将上面的QC分析步骤再运行一次，以检验是否达到预期的QC目的。
+
+```{r}
+# Cell-level filtering
+# Filter out low quality reads using selected thresholds - these will change with experiment
+filtered_seurat <- subset(x = merged_seurat, 
+                         subset= (nUMI >= 500) & 
+                           (nGene >= 250) & 
+                           (log10GenesPerUMI > 0.80) & 
+                           (mitoRatio < 0.20)
+                         )
+			                          
+# Gene-level filtering
+# Output a logical vector for every gene on whether the more than zero counts per cell
+# Extract counts
+counts <- GetAssayData(object = filtered_seurat, slot = "counts")
+# Output a logical vector for every gene on whether the more than zero counts per cell
+nonzero <- counts > 0
+# Sums all TRUE values and returns TRUE if more than 10 TRUE values per gene
+keep_genes <- Matrix::rowSums(nonzero) >= 10
+# Only keeping those genes expressed in more than 10 cells
+filtered_counts <- counts[keep_genes, ]
+# Reassign to filtered Seurat object
+filtered_seurat <- CreateSeuratObject(filtered_counts, meta.data = filtered_seurat@meta.data)
+
+
+# Create .RData object to load at any time
+save(filtered_seurat, file="datasets/seurat_filtered.RData")
+```
+
+
+5. Normalization & PCA & clustreing
+
+此处选择SCTransform方法进行normalization、scale等。聚类之前对counts数据进行normalization.
+
+
+以下操作通过PCA确定cell cycle是否需要在SCTransform中regress out。
+```{r}
+# Normalize the counts
+# 此时的normalization还比较的粗糙
+seurat_phase <- NormalizeData(filtered_seurat)
+
+# Score cells for cell cycle
+seurat_phase <- CellCycleScoring(seurat_phase, 
+                                 g2m.features = g2m_genes, 
+                                 s.features = s_genes)
+
+
+# Identify the most variable genes
+seurat_phase <- FindVariableFeatures(seurat_phase, 
+                     selection.method = "vst",
+                     nfeatures = 2000, 
+                     verbose = FALSE)
+		     
+# Scale the counts
+seurat_phase <- ScaleData(seurat_phase)
+
+# Perform PCA
+seurat_phase <- RunPCA(seurat_phase)
+
+# Plot the PCA colored by cell cycle phase
+DimPlot(seurat_phase,
+        reduction = "pca",
+        group.by= "Phase",
+        split.by = "Phase")
+```
+
+
+6. SCTransform
+
+use the sctransform method as a more accurate method of normalizing, estimating the variance of the raw filtered data, and identifying the most variable genes.
+
+在进行SCTransform时，一般会对cell cycle和线粒体等会对聚类引入variation进行regress out，但如果线粒体本就在研究对象 中有意义的话，就不推荐regerss out了。
+
+```{r}
+# Split seurat object by condition to perform cell cycle scoring and SCT on all samples
+split_seurat <- SplitObject(filtered_seurat, split.by = "sample")
+
+split_seurat <- split_seurat[c("ctrl", "stim")]
+
+for (i in 1:length(split_seurat)) {
+    split_seurat[[i]] <- NormalizeData(split_seurat[[i]], verbose = TRUE)
+    split_seurat[[i]] <- CellCycleScoring(split_seurat[[i]], g2m.features=g2m_genes, s.features=s_genes)
+    split_seurat[[i]] <- SCTransform(split_seurat[[i]], vars.to.regress = c("mitoRatio"))
+}
+
+# Check which assays are stored in objects
+split_seurat$ctrl@assays
+```
+
+
+7. integration
+
+```{r}
+# Select the most variable features to use for integration
+integ_features <- SelectIntegrationFeatures(object.list = split_seurat, 
+                                            nfeatures = 3000)
+
+# Prepare the SCT list object for integration
+split_seurat <- PrepSCTIntegration(object.list = split_seurat, 
+                                   anchor.features = integ_features)
+
+# Find best buddies - can take a while to run
+integ_anchors <- FindIntegrationAnchors(object.list = split_seurat, 
+                                        normalization.method = "SCT", 
+                                        anchor.features = integ_features)
+
+# Integrate across conditions
+seurat_integrated <- IntegrateData(anchorset = integ_anchors, 
+                                   normalization.method = "SCT")
+
+# Save integrated seurat object, 毕竟运行时间较久
+saveRDS(seurat_integrated, "results/integrated_seurat.rds")
+```
+
+通过下面的PCA和UMAP检验数据整合的情况。
+
+PCA
+```{r}
+# Run PCA
+seurat_integrated <- RunPCA(object = seurat_integrated)
+
+# Plot PCA
+PCAPlot(seurat_integrated,
+        split.by = "sample")  
+```
+
+
+```{r}
+# Run UMAP
+seurat_integrated <- RunUMAP(seurat_integrated, 
+                             dims = 1:40,
+			     reduction = "pca")
+
+# Plot UMAP                             
+DimPlot(seurat_integrated)                             
+```
+
+
+8. cluster
+
+Seurat利用
+
+
+确定后续所用的PC数:
+不过对于采用了SCTransform方法的分析，PC数目的选择没有以前显的那么重要了。
+In theory, with SCTransform, the more PCs we choose the more variation is accounted for when performing the clustering。
+```{r}
+# Printing out the most variable genes driving PCs
+print(x = seurat_integrated[["pca"]], 
+      dims = 1:10, 
+      nfeatures = 5)
+
+# Plot the elbow plot
+ElbowPlot(object = seurat_integrated, 
+          ndims = 40)
+```
+
+
+The resolution is an important argument that sets the "granularity" of the downstream clustering and will need to be optimized for every individual experiment.
+```{r}
+# Determine the K-nearest neighbor graph
+seurat_integrated <- FindNeighbors(object = seurat_integrated, 
+                                dims = 1:40)
+                                
+# Determine the clusters for various resolutions                                
+seurat_integrated <- FindClusters(object = seurat_integrated,
+                               resolution = c(0.4, 0.6, 0.8, 1.0, 1.4))
+
+
+# Assign identity of clusters
+# 具体到这里的选择：
+Idents(object = seurat_integrated) <- "integrated_snn_res.0.8"
 ```
 
 
 
-
-
+```{r}
+# Plot the UMAP
+DimPlot(seurat_integrated,
+        reduction = "umap",
+        label = TRUE,
+        label.size = 6)
+```
 
 
 
