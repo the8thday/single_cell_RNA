@@ -10,7 +10,8 @@ knitr::opts_chunk$set(echo = TRUE)
 ```
 
 https://www.singlecellcourse.org/index.html
-https://github.com/hbctraining/scRNA-seq
+https://github.com/hbctraining/scRNA-seq_online
+https://hbctraining.github.io/scRNA-seq_online/schedule/links-to-lessons.html
 
 完整而简略的单细胞转录组分析流程，对于多样本数据集。
 假设实验组和
@@ -33,6 +34,7 @@ library(clustree)
 不过对于doublet的检测，似乎也不是很着急
 
 此示例样本包括8个PBMC样本，其中4个为control组，四个为stim刺激过后的样本。
+NOTE: You should always work with non-pooled samples from the beginning of the scRNA-seq workflow, if possible.
 
 ```{r}
 # merge
@@ -124,8 +126,8 @@ QC质控在scRNA中应该结合多种metric的分布进行确定，有些细胞�
 # Cell-level filtering
 # Filter out low quality reads using selected thresholds - these will change with experiment
 filtered_seurat <- subset(x = merged_seurat, 
-                         subset= (nUMI >= 500) & 
-                           (nGene >= 250) & 
+                         subset= (nCount_RNA >= 500) & 
+                           (nFeature_RNA >= 250) & 
                            (log10GenesPerUMI > 0.80) & 
                            (mitoRatio < 0.20)
                          )
@@ -162,8 +164,8 @@ seurat_phase <- NormalizeData(filtered_seurat)
 
 # Score cells for cell cycle
 seurat_phase <- CellCycleScoring(seurat_phase, 
-                                 g2m.features = g2m_genes, 
-                                 s.features = s_genes)
+                                 g2m.features = cc.genes$g2m.genes, 
+                                 s.features = cc.genes$s.genes)
 
 
 # Identify the most variable genes
@@ -200,7 +202,9 @@ split_seurat <- split_seurat[c("ctrl", "stim")]
 
 for (i in 1:length(split_seurat)) {
     split_seurat[[i]] <- NormalizeData(split_seurat[[i]], verbose = TRUE)
-    split_seurat[[i]] <- CellCycleScoring(split_seurat[[i]], g2m.features=g2m_genes, s.features=s_genes)
+    split_seurat[[i]] <- CellCycleScoring(split_seurat[[i]], 
+                                          g2m.features=cc.genes$g2m.genes, 
+                                          s.features=cc.genes$s.genes)
     split_seurat[[i]] <- SCTransform(split_seurat[[i]], vars.to.regress = c("mitoRatio"))
 }
 
@@ -210,6 +214,8 @@ split_seurat$ctrl@assays
 
 
 7. integration
+
+在上一步的SCT后，有一些基因在assay SCT中相较RNA assay少了一些
 
 ```{r}
 # Select the most variable features to use for integration
@@ -245,7 +251,7 @@ PCAPlot(seurat_integrated,
         split.by = "sample")  
 ```
 
-
+通过UMAP查看数据整合的情况
 ```{r}
 # Run UMAP
 seurat_integrated <- RunUMAP(seurat_integrated, 
@@ -280,6 +286,7 @@ ElbowPlot(object = seurat_integrated,
 The resolution is an important argument that sets the "granularity" of the downstream clustering and will need to be optimized for every individual experiment.
 ```{r}
 # Determine the K-nearest neighbor graph
+# 虽则ElbowPLot显示拐弯处在8，9个PC之间，但是考虑到所使用的SCT的方法，以下的dims可以适当的多一些，甚至是全部，不过 比较耗费时间
 seurat_integrated <- FindNeighbors(object = seurat_integrated, 
                                 dims = 1:40)
                                 
@@ -304,5 +311,118 @@ DimPlot(seurat_integrated,
 ```
 
 
+
+```{r}
+# Extract identity and sample information from seurat object to determine the number of cells per cluster per sample
+n_cells <- FetchData(seurat_integrated, 
+                     vars = c("ident", "orig.ident")) %>%
+        dplyr::count(ident, orig.ident) %>%
+        tidyr::spread(ident, n)
+
+# View table
+View(n_cells)
+
+# UMAP of cells in each cluster by sample
+# 分析不同样本间的细胞亚群间的分布，不同处理下样本的细胞组成是否相同。此处还应该对Phase、
+DimPlot(seurat_integrated, 
+        label = TRUE, 
+        split.by = "sample")  + NoLegend()
+```
+
+
+查看在不同的metrics中细胞分布的是否均匀
+```{r}
+# Determine metrics to plot present in seurat_integrated@meta.data
+metrics <-  c("nUMI", "nGene", "S.Score", "G2M.Score", "mitoRatio")
+
+FeaturePlot(seurat_integrated, 
+            reduction = "umap", 
+            features = metrics,
+            pt.size = 0.4, 
+            sort.cell = TRUE,
+            min.cutoff = 'q10',
+            label = TRUE)
+```
+
+Seurat's FeaturePlot() function let's us easily explore the known markers on top of our UMAP visualizations. Let's go through and determine the identities of the clusters
+
+```{r}
+# Select the RNA counts slot to be the default assay
+DefaultAssay(seurat_integrated) <- "RNA"
+
+# Normalize RNA data for visualization purposes
+seurat_integrated <- NormalizeData(seurat_integrated, verbose = FALSE)
+
+
+FeaturePlot(seurat_integrated, 
+            reduction = "umap", 
+            features = c("CD14", "LYZ"), 
+            sort.cell = TRUE,
+            min.cutoff = 'q10', 
+            label = TRUE)
+```
+
+
+9. marker identification analysis
+
+FindAllMarkers函数在计算差异时将所有细胞都当作重复。一般用于单一样本或组别时使用。
+
+
+Identification of conserved markers in all conditions:
+考虑不同分组信息求的cluster比之其他cluster的差异基因; FindConservedMarkers() accepts a single cluster at a time
+```{r}
+DefaultAssay(seurat_integrated) <- "RNA"
+
+cluster0_conserved_markers <- FindConservedMarkers(seurat_integrated,
+                              ident.1 = 0,
+                              grouping.var = "sample",
+                              only.pos = TRUE,
+                              logfc.threshold = 0.25
+                              )
+
+```
+
+
+考虑到FindConservedMarkers每次只能运行一个cluster
+```{r}
+
+```
+
+利用上述得到的Marker基因identify celltype
+```{r}
+# Extract top 10 markers per cluster
+top10 <- conserved_markers %>% 
+  mutate(avg_fc = (ctrl_avg_logFC + stim_avg_logFC) /2) %>% 
+  group_by(cluster_id) %>% 
+  top_n(n = 10, 
+        wt = avg_fc)
+
+# Visualize top 10 markers per cluster
+View(top10)
+
+
+
+```
+
+```{r}
+# Plot interesting marker gene expression for cluster 20
+FeaturePlot(object = seurat_integrated, 
+                        features = c("TPSAB1", "TPSB2", "FCER1A", "GATA1", "GATA2"),
+                         sort.cell = TRUE,
+                         min.cutoff = 'q10', 
+                         label = TRUE,
+			 repel = TRUE)
+
+# Vln plot - cluster 20
+VlnPlot(object = seurat_integrated, 
+        features = c("TPSAB1", "TPSB2", "FCER1A", "GATA1", "GATA2"))
+```
+
+
+在探索了不同的cluster的标记基因后，我们还对同一个cluster群中（同一种细胞亚群）在不同条件下的差异基因(pseudobulk differential expression analysis);
+Biological replicates are necessary to proceed with this analysis. 目前的测试数据集因不满足此分析条件，故
+```{r}
+# 详细内容见DE_analysis_scrnaseq.Rmd
+```
 
 
