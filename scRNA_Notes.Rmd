@@ -35,7 +35,7 @@ cellranger mkfastq ： 它借鉴了Illumina的bcl2fastq ，可以将一个或多
 
 cellranger count ：利用mkfastq生成的fq文件，进行比对(基于STAR)、过滤、UMI计数。利用细胞的barcode生成gene-barcode矩阵，然后进行样本分群、基因表达分析
 
-cellranger aggr ：接受cellranger count的输出数据，将同一组的不同测序样本的表达矩阵整合在一起，比如tumor组原来有4个样本，PBMC组有两个样本，现在可以使用aggr生成最后的tumor和PBMC两个矩阵，并且进行标准化去掉测序深度的影响
+cellranger aggr ：接受cellranger count的输出数据， 将同一组的不同测序样本的表达矩阵整合在一起， 比如tumor组原来有4个样本，PBMC组有两个样本，现在可以使用aggr生成最后的tumor和PBMC两个矩阵，并且进行标准化去掉测序深度的影响
 
 cellranger reanalyze ：接受cellranger count或cellranger aggr生成的gene-barcode矩阵，使用不同的参数进行降维、聚类
 
@@ -54,14 +54,17 @@ curl -O https://cf.10xgenomics.com/supp/cell-exp/refdata-gex-GRCh38-2020-A.tar.g
 
 
 
+## 几个疑问
+
+1. 两分组设计时，需要几个重复
+2. 重复样本怎么分析，怎么merge，DEGs分析时如何考虑重复样本
 
 
+A: 对于生物学重复而言，单细胞测序不具备所谓的生物学重复，因为每一个细胞都是独特的，在分析中以一组细胞作为类似细胞。
 
+在考虑批次和重复时，最好的建库方法为，不同处理的样本在同一批次中进行；单个样本可以在不同的区域进行取样等。
 
-
-
-
-
+A: 对于每一个分组的重复, 可以有效的控制批次效应.if doing DE across conditions or making conclusions at the population level.
 
 
 
