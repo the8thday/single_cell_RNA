@@ -98,6 +98,7 @@ table(Idents(pbmc.qc))
 pbmc <- pbmc.qc
 
 # normalizing the data
+# normalization 对测序深度和基因长度
 pbmc <- NormalizeData(pbmc, normalization.method = "LogNormalize", 
                       scale.factor = 10000)
 head(pbmc[['RNA']]@data) # Normalized values
@@ -257,6 +258,7 @@ FeaturePlot(pbmc,features = c("S.Score","G2M.Score"),label.size = 4,repel = T,la
   theme(plot.title = element_text(size=10))
 
 # 做完这步之后，active assay现在是SCT
+# SCT后再次对细胞进行聚类
 pbmc <- SCTransform(pbmc, method = "glmGamPoi", 
                     # ncells = 8824, 
                     vars.to.regress = c("percent.mt","S.Score","G2M.Score"), verbose = F)
@@ -280,7 +282,7 @@ FeaturePlot(srat,"PPBP") &
 
 # 将不同的数据集整合在一起, 可以消除批次效应
 # RPCA 整合的更快，更适合数据集间细胞种类差别大，或者数据集分lane测的时候，或者数据集较多的情况
-# CCA 适合
+# CCA 适合多个样本具有大致相似的细胞类型分布
 
 # integrate datasets by RPCA
 
