@@ -9,9 +9,54 @@ output: pdf_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-## DE_analysis_scrnaseq
+# DE_analysis_scrnaseq
 
-Single-cell RNA-seq analysis - Pseudobulk DE analysis with DESeq2.
+## Use Seurat plot
+
+首先利用Seurat所提供的绘图方法
+提取具体某一亚群的细胞，然后用每个基因的均值做散点图，离散点可以视为差异基因。
+```{r}
+library(ggplot2)
+library(cowplot)
+theme_set(theme_cowplot())
+
+t.cells <- subset(seurat_integrated, idents = "CD4 Naive T")
+Idents(t.cells) <- "stim"
+avg.t.cells <- as.data.frame(log1p(AverageExpression(t.cells, verbose = FALSE)$RNA))
+avg.t.cells$gene <- rownames(avg.t.cells)
+
+cd14.mono <- subset(seurat_integrated, idents = "CD14 Mono")
+Idents(cd14.mono) <- "stim"
+avg.cd14.mono <- as.data.frame(log1p(AverageExpression(cd14.mono, verbose = FALSE)$RNA))
+avg.cd14.mono$gene <- rownames(avg.cd14.mono)
+
+# 确定此部分基因是重要的
+genes.to.label = c("ISG15", "LY6E", "IFI6", "ISG20", "MX1", "IFIT2", "IFIT1", "CXCL10", "CCL8")
+
+
+p1 <- ggplot(avg.t.cells, aes(CTRL, STIM)) + geom_point() + ggtitle("CD4 Naive T Cells")
+p1 <- LabelPoints(plot = p1, points = genes.to.label, repel = TRUE)
+p2 <- ggplot(avg.cd14.mono, aes(CTRL, STIM)) + geom_point() + ggtitle("CD14 Monocytes")
+p2 <- LabelPoints(plot = p2, points = genes.to.label, repel = TRUE)
+p1 + p2
+
+
+# 通过FindMarkers计算同一种细胞在不同条件下的差异
+seurat_integrated$celltype.sample <- paste(Idents(seurat_integrated), seurat_integrated$sample, 
+                                       sep = "_")
+seurat_integrated$celltype <- Idents(seurat_integrated)
+Idents(seurat_integrated) <- "celltype.sample"
+b.interferon.response <- FindMarkers(seurat_integrated, 
+                                     ident.1 = "2_ctrl", 
+                                     ident.2 = "2_stim", 
+                                     verbose = FALSE)
+print(dim(b.interferon.response))
+head(b.interferon.response, n = 5)
+
+```
+
+
+## Single-cell RNA-seq analysis - Pseudobulk DE analysis with DESeq2.
 
 对某一细胞亚群cluster做sample-level的差异表达分析。
 
@@ -35,6 +80,9 @@ library(png)
 library(DESeq2)
 library(RColorBrewer)
 ```
+
+## use DESeq2
+
 
 加载测试数据
 ```{r}
@@ -166,7 +214,7 @@ table(sce$cluster_id, sce$sample_id)
 ```
 
 
-### use DESeq2
+*use DESeq2*
 
 Sample-level metadata
 ```{r}
@@ -243,5 +291,10 @@ dds <- DESeqDataSetFromMatrix(cluster_counts,
                               colData = cluster_metadata, 
                               design = ~ group_id)
 ```
+
+
+
+
+
 
 
