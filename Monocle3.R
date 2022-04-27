@@ -28,11 +28,17 @@ library(monocle3)
 # Provide the path to the Cell Ranger output.0x_data/outs/filtered_feature_bc_matrix/
 # cds <- load_cellranger_data("~/Downloads/10x_data", umi_cutoff = 100)
 # Monocle 3 is designed for use with absolute transcript counts
-cds <- load_mm_data(mat_path = "~/Downloads/Rawdata/SRR7722937/matrix.mtx.gz", 
-                    feature_anno_path = "~/Downloads/Rawdata/SRR7722937/features.tsv.gz", 
-                    cell_anno_path = "~/Downloads/Rawdata/SRR7722937/barcodes.tsv.gz")
+cds <- load_mm_data(mat_path = "./datasets/ctrl_raw_feature_bc_matrix/matrix.mtx.gz", 
+                    feature_anno_path = "./datasets/ctrl_raw_feature_bc_matrix/features.tsv.gz", 
+                    cell_anno_path = "./datasets/ctrl_raw_feature_bc_matrix/barcodes.tsv.gz")
+
+cds2 <- load_mm_data(mat_path = "./datasets/stim_raw_feature_bc_matrix/matrix.mtx.gz", 
+                     feature_anno_path = "./datasets/stim_raw_feature_bc_matrix/features.tsv.gz", 
+                     cell_anno_path = "./datasets/stim_raw_feature_bc_matrix/barcodes.tsv.gz")
 
 big_cds <- combine_cds(list(cds, cds2))
+
+cds <- big_cds
 colData(cds)
 
 
@@ -53,7 +59,7 @@ cds <- preprocess_cds(cds,
 
 ## Step 3: Reduce the dimensions using UMAP
 cds <- reduce_dimension(cds)
-cds <- reduce_dimension(cds, reduction_method="tSNE")
+cds <- reduce_dimension(cds, reduction_method="UMAP")
 plot_cells(cds = cds)
 plot_cells(cds, genes=c("cpna-2", "egl-21", "ram-2", "inos-1"))
 
