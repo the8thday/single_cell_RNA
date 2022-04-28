@@ -1,0 +1,163 @@
+---
+title: "monocle3"
+author: "liuc"
+date: '2022-04-26'
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## monocle3
+
+从UMAP图识别发育轨迹，可以继承Seurat的质控、批次校正和降维分析结果，实现“一张图”展现细胞的聚类、鉴定和轨迹分析结果。自动对UMAP图分区（partition），可以选择多个起点，轨迹分析算法的逻辑更符合生物学现实。
+
+细胞轨迹分析、拟时序分析是否应该在单一样本中进行？
+提取出目标发育的细胞亚群在轨迹分析中才会更显的有意义。
+
+
+```{r}
+library(monocle3)
+
+seurat_integrated <- readRDS('./Results/seurat_labelled.rds')
+
+
+
+# 从seurat对象中提取关注的细胞亚群
+target_cells <- seurat_integrated[[]] %>% filter(integrated_snn_res.0.8 %in% c(0,2)) %>% 
+  rownames()
+seurat_sub <- seurat_integrated[, target_cells]
+
+```
+
+
+从Seurat对象开始整理成monocle所需的输入文件
+```{r}
+##创建CDS对象并预处理数据
+data <- GetAssayData(seurat_integrated, 
+                     assay = 'RNA', slot = 'counts')
+cell_metadata <- seurat_integrated@meta.data
+gene_annotation <- data.frame(gene_short_name = rownames(data))
+rownames(gene_annotation) <- rownames(data)
+
+
+cds <- new_cell_data_set(data,
+                         cell_metadata = cell_metadata,
+                         gene_metadata = gene_annotation)
+
+#preprocess_cds函数相当于seurat中NormalizeData+ScaleData+RunPCA
+cds <- preprocess_cds(cds, num_dim = 50, method = 'PCA', norm_method = 'log')
+#umap降维
+cds <- reduce_dimension(cds, 
+                        preprocess_method = "PCA",
+                        reduction_method = 'UMAP'
+                        )
+
+p1 <- plot_cells(cds, reduction_method="UMAP", color_cells_by="integrated_snn_res.0.8") + 
+  ggtitle('cds.umap')
+
+##从seurat导入整合过的umap坐标
+cds.embed <- cds@int_colData$reducedDims$UMAP
+int.embed <- Embeddings(seurat_integrated, reduction = "umap")
+int.embed <- int.embed[rownames(cds.embed),]
+cds@int_colData$reducedDims$UMAP <- int.embed
+p2 <- plot_cells(cds, reduction_method="UMAP", color_cells_by="integrated_snn_res.0.8") + 
+  ggtitle('int.umap')
+
+p1 + p2
+```
+
+
+
+```{r}
+## Monocle3聚类分区
+cds <- cluster_cells(cds)
+pp1 <- plot_cells(cds, show_trajectory_graph = FALSE) + ggtitle("label by clusterID")
+pp2 <- plot_cells(cds, color_cells_by = "partition", show_trajectory_graph = FALSE) + 
+        ggtitle("label by partitionID")
+p = wrap_plots(pp1, pp2)
+p
+```
+
+
+
+
+```{r}
+## 识别轨迹
+cds <- learn_graph(cds)
+plot_cells(cds, label_groups_by_cluster = FALSE, label_leaves = FALSE, 
+               label_branch_points = FALSE)
+```
+
+
+```{r}
+# a helper function to identify the root principal points:
+get_earliest_principal_node <- function(cds, time_bin="130-170"){
+  cell_ids <- which(colData(cds)[, "embryo.time.bin"] == time_bin)
+  
+  closest_vertex <-
+  cds@principal_graph_aux[["UMAP"]]$pr_graph_cell_proj_closest_vertex
+  closest_vertex <- as.matrix(closest_vertex[colnames(cds), ])
+  root_pr_nodes <-
+  igraph::V(principal_graph(cds)[["UMAP"]])$name[as.numeric(names
+  (which.max(table(closest_vertex[cell_ids,]))))]
+  
+  root_pr_nodes
+}
+```
+
+```{r}
+##细胞按拟时排序
+cds <- order_cells(cds) # 选择root细胞也不能太主观。。
+# p + geom_vline(xintercept = seq(-7,-6,0.25)) + geom_hline(yintercept = seq(0,1,0.25))
+embed <- data.frame(Embeddings(seurat_integrated, reduction = "umap"))
+embed <- subset(embed, UMAP_1 > -6.75 & UMAP_1 < -6.5 & UMAP_2 > 0.24 & UMAP_2 < 0.25)
+root.cell <- rownames(embed)
+
+cds <- order_cells(cds, root_cells = root.cell)
+plot_cells(cds, color_cells_by = "pseudotime", label_cell_groups = FALSE, 
+           label_leaves = FALSE,  label_branch_points = FALSE)
+```
+
+
+
+寻找拟时轨迹差异基因
+```{r}
+##寻找拟时轨迹差异基因
+#graph_test分析最重要的结果是莫兰指数（morans_I），其值在-1至1之间，0代表此基因没有
+#空间共表达效应，1代表此基因在空间距离相近的细胞中表达值高度相似。
+Track_genes <- graph_test(cds, neighbor_graph="principal_graph", cores=4)
+#挑选top10画图展示
+# 对于基因的挑选可以按照具体的研究问题
+Track_genes_sig <- Track_genes %>% top_n(n=10, morans_I) %>%
+                   pull(gene_short_name) %>% as.character()
+#基因表达趋势图
+plot_genes_in_pseudotime(cds[Track_genes_sig,], 
+                         color_cells_by="integrated_snn_res.0.8", 
+                         min_expr=0.5, ncol = 2)
+
+#FeaturePlot图
+plot_cells(cds, genes=Track_genes_sig, show_trajectory_graph=FALSE,
+               label_cell_groups=FALSE,  label_leaves=FALSE)
+
+
+##寻找共表达模块
+genelist <- pull(Track_genes, gene_short_name) %>% as.character()
+gene_module <- find_gene_modules(cds[genelist,], resolution=1e-2, cores = 10)
+cell_group <- tibble::tibble(cell=row.names(colData(cds)), 
+                             cell_group=colData(cds)$predicted.id)
+agg_mat <- aggregate_gene_expression(cds, gene_module, cell_group)
+row.names(agg_mat) <- stringr::str_c("Module ", row.names(agg_mat))
+pheatmap::pheatmap(agg_mat, scale="column", clustering_method="ward.D2")
+
+```
+
+
+一个小报错：
+```{r}
+# 在用graph_test函数时报错：Error: 'rBind' is defunct.
+# 第93行
+trace('calculateLW', edit = T, where = asNamespace("monocle3"))
+```
+
