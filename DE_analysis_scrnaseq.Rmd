@@ -1,0 +1,300 @@
+---
+title: "DE_analysis_scrnaseq"
+author: "liuc"
+date: '2022-04-24'
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# DE_analysis_scrnaseq
+
+## Use Seurat plot
+
+首先利用Seurat所提供的绘图方法
+提取具体某一亚群的细胞，然后用每个基因的均值做散点图，离散点可以视为差异基因。
+```{r}
+library(ggplot2)
+library(cowplot)
+theme_set(theme_cowplot())
+
+t.cells <- subset(seurat_integrated, idents = "CD4 Naive T")
+Idents(t.cells) <- "stim"
+avg.t.cells <- as.data.frame(log1p(AverageExpression(t.cells, verbose = FALSE)$RNA))
+avg.t.cells$gene <- rownames(avg.t.cells)
+
+cd14.mono <- subset(seurat_integrated, idents = "CD14 Mono")
+Idents(cd14.mono) <- "stim"
+avg.cd14.mono <- as.data.frame(log1p(AverageExpression(cd14.mono, verbose = FALSE)$RNA))
+avg.cd14.mono$gene <- rownames(avg.cd14.mono)
+
+# 确定此部分基因是重要的
+genes.to.label = c("ISG15", "LY6E", "IFI6", "ISG20", "MX1", "IFIT2", "IFIT1", "CXCL10", "CCL8")
+
+
+p1 <- ggplot(avg.t.cells, aes(CTRL, STIM)) + geom_point() + ggtitle("CD4 Naive T Cells")
+p1 <- LabelPoints(plot = p1, points = genes.to.label, repel = TRUE)
+p2 <- ggplot(avg.cd14.mono, aes(CTRL, STIM)) + geom_point() + ggtitle("CD14 Monocytes")
+p2 <- LabelPoints(plot = p2, points = genes.to.label, repel = TRUE)
+p1 + p2
+
+
+# 通过FindMarkers计算同一种细胞在不同条件下的差异
+seurat_integrated$celltype.sample <- paste(Idents(seurat_integrated), seurat_integrated$sample, 
+                                       sep = "_")
+seurat_integrated$celltype <- Idents(seurat_integrated)
+Idents(seurat_integrated) <- "celltype.sample"
+b.interferon.response <- FindMarkers(seurat_integrated, 
+                                     ident.1 = "2_ctrl", 
+                                     ident.2 = "2_stim", 
+                                     verbose = FALSE)
+print(dim(b.interferon.response))
+head(b.interferon.response, n = 5)
+
+```
+
+
+## Single-cell RNA-seq analysis - Pseudobulk DE analysis with DESeq2.
+
+对某一细胞亚群cluster做sample-level的差异表达分析。
+
+
+```{r}
+library(tidyverse)
+library(cowplot)
+library(Matrix.utils)
+library(edgeR)
+library(dplyr)
+library(magrittr)
+library(Matrix)
+library(purrr)
+library(reshape2)
+library(S4Vectors)
+library(tibble)
+library(SingleCellExperiment)
+library(pheatmap)
+library(apeglm)
+library(png)
+library(DESeq2)
+library(RColorBrewer)
+```
+
+## use DESeq2
+
+
+加载测试数据
+```{r}
+# Read in the dataset
+sce <- readRDS("datasets/scRNA-seq_input_data_for_DE.rds")
+```
+
+从Seurat对象中提取所需要的文件, 不过此处用测试数据
+```{r}
+# Bring in Seurat object
+seurat <- readRDS("path/to/seurat.rds")
+
+# Extract raw counts and metadata to create SingleCellExperiment object
+counts <- seurat@assays$RNA@counts 
+
+metadata <- seurat@meta.data
+
+# Set up metadata as desired for aggregation and DE analysis
+metadata$cluster_id <- factor(seurat@active.ident)
+
+# Create single cell experiment object
+sce <- SingleCellExperiment(assays = list(counts = counts), 
+                           colData = metadata)
+
+# Identify groups for aggregation of counts
+groups <- colData(sce)[, c("cluster_id", "sample_id")]
+```
+
+
+数据探索
+```{r}
+# Explore the raw counts for the dataset
+
+## Check the assays present
+assays(sce)
+
+## Explore the raw counts for the dataset
+dim(counts(sce))
+
+counts(sce)[1:6, 1:6]
+
+
+## Explore the cellular metadata for the dataset
+dim(colData(sce))
+
+head(colData(sce))
+```
+
+
+整理成样本水平的counts矩阵
+```{r}
+# Named vector of cluster names
+kids <- purrr::set_names(levels(sce$cluster_id))
+kids
+
+# Total number of clusters
+nk <- length(kids)
+nk
+
+# Named vector of sample names
+sids <- purrr::set_names(levels(sce$sample_id))
+sids
+
+# Total number of samples 
+ns <- length(sids)
+ns
+
+# Generate sample level metadata
+
+## Determine the number of cells per sample
+table(sce$sample_id)
+
+## Turn named vector into a numeric vector of number of cells per sample
+n_cells <- as.numeric(table(sce$sample_id))
+
+## Determine how to reorder the samples (rows) of the metadata to match the order of sample names in sids vector
+m <- match(sids, sce$sample_id)
+
+## Create the sample level metadata by combining the reordered metadata with the number of cells corresponding to each sample.
+ei <- data.frame(colData(sce)[m, ], 
+                 n_cells, row.names = NULL) %>% 
+  select(-"cluster_id")
+ei
+```
+
+
+Count aggregation to sample level
+```{r}
+# Aggregate the counts per sample_id and cluster_id
+
+# Subset metadata to only include the cluster and sample IDs to aggregate across
+groups <- colData(sce)[, c("cluster_id", "sample_id")]
+
+# Aggregate across cluster-sample groups
+pb <- aggregate.Matrix(t(counts(sce)), 
+                       groupings = groups, fun = "sum") 
+
+class(pb)
+
+dim(pb)
+
+pb[1:6, 1:6]
+
+```
+
+
+```{r}
+# Not every cluster is present in all samples; create a vector that represents how to split samples
+splitf <- sapply(stringr::str_split(rownames(pb), 
+                                    pattern = "_",  
+                                    n = 2), 
+                 `[`, 1)
+
+# Turn into a list and split the list into components for each cluster and transform, so rows are genes and columns are samples and make rownames as the sample IDs
+pb <- split.data.frame(pb, 
+                       factor(splitf)) %>%
+  lapply(function(u) 
+    set_colnames(t(u), 
+                 stringr::str_extract(rownames(u), "(?<=_)[:alnum:]+")))
+
+class(pb)
+
+# Explore the different components of list
+str(pb)
+
+# Print out the table of cells in each cluster-sample group
+options(width = 100)
+table(sce$cluster_id, sce$sample_id)
+```
+
+
+*use DESeq2*
+
+Sample-level metadata
+```{r}
+# Get sample names for each of the cell type clusters
+
+# prep. data.frame for plotting
+get_sample_ids <- function(x){
+  pb[[x]] %>%
+    colnames()
+}
+
+de_samples <- map(1:length(kids), get_sample_ids) %>%
+  unlist()
+
+# Get cluster IDs for each of the samples
+
+samples_list <- map(1:length(kids), get_sample_ids)
+
+get_cluster_ids <- function(x){
+  rep(names(pb)[x], 
+      each = length(samples_list[[x]]))
+}
+
+de_cluster_ids <- map(1:length(kids), get_cluster_ids) %>%
+  unlist()
+
+
+# Create a data frame with the sample IDs, cluster IDs and condition
+
+gg_df <- data.frame(cluster_id = de_cluster_ids,
+                    sample_id = de_samples)
+
+gg_df <- left_join(gg_df, ei[, c("sample_id", "group_id")]) 
+
+
+metadata <- gg_df %>%
+  dplyr::select(cluster_id, sample_id, group_id) 
+
+metadata$cluster_id <- factor(metadata$cluster_id)
+
+head(metadata, n = 10)
+```
+
+
+Subsetting dataset to cluster(s) of interest
+```{r}
+# Generate vector of cluster IDs
+clusters <- levels(metadata$cluster_id)
+clusters
+
+# Subset the metadata to only the B cells
+cluster_metadata <- metadata[which(metadata$cluster_id == clusters[1]), ]
+head(cluster_metadata)
+
+# Assign the rownames of the metadata to be the sample IDs
+rownames(cluster_metadata) <- cluster_metadata$sample_id
+cluster_metadata
+
+# Subset the counts to only the B cells
+counts <- pb[[clusters[1]]]
+
+cluster_counts <- as.data.frame(as.matrix(counts[, which(colnames(counts) %in% rownames(cluster_metadata))]))
+
+# Check that all of the row names of the metadata are the same and in the same order as the column names of the counts in order to use as input to DESeq2
+all(rownames(cluster_metadata) == colnames(cluster_counts))  
+
+```
+
+
+Create DESeq2 object
+```{r}
+# Create DESeq2 object        
+dds <- DESeqDataSetFromMatrix(cluster_counts, 
+                              colData = cluster_metadata, 
+                              design = ~ group_id)
+```
+
+
+
+
+
+
+
