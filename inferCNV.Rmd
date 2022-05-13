@@ -1,0 +1,77 @@
+---
+title: "inferCNV"
+author: "liuc"
+date: '2022-04-02'
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## inferCNV
+
+运行inferCNV需要根据单细胞数据制备三个input文件，包括
+
+scRNA-seq表达量的count数据；
+表型注释文件，记录肿瘤和正常细胞；
+基因或染色体位置文件。
+
+CNV的分析一般还是在肿瘤研究中。
+
+
+```{r}
+library(inferCNV)
+
+```
+
+
+展现下自带数据集的用法
+```{r}
+##读取示例数据目录
+exprMatrix = system.file("extdata", "oligodendroglioma_expression_downsampled.counts.matrix.gz", package="infercnv")
+cellAnnota = system.file("extdata", "oligodendroglioma_annotations_downsampled.txt", package="infercnv")
+geneLocate = system.file("extdata", "gencode_downsampled.EXAMPLE_ONLY_DONT_REUSE.txt", package="infercnv")
+#创建inferCNV对象，直接给相应的文件路径即可
+infercnv_obj = CreateInfercnvObject(delim = '\t',
+                  raw_counts_matrix = exprMatrix,
+                  annotations_file = cellAnnota,
+                  gene_order_file = geneLocate,
+                  ref_group_names = c("Microglia/Macrophage","Oligodendrocytes (non-malignant)"))
+
+##分析细胞CNV
+#cutoff阈值，Smart-seq2数据选“1”, 10x Genomics数据选“0.1”
+infercnv_obj = infercnv::run(infercnv_obj,
+                             cutoff=1, 
+                             out_dir='inferCNV/test', 
+                             cluster_by_groups=TRUE, 
+                             denoise=TRUE,
+                             HMM=TRUE)
+```
+
+
+
+Read 10X
+```{r}
+cellAnnota <- subset(scRNAsclc@meta.data, select='celltype')
+exprMatrix <- as.matrix(GetAssayData(scRNAsclc, slot='counts'))
+
+
+
+#创建inferCNV对象
+#all_celltype: B_cell Monocyte  Neurons  NK_cell  T_cells
+infercnv_obj = CreateInfercnvObject(delim = '\t',
+                  raw_counts_matrix = 'inferCNV/exprMatrix.txt',
+                  annotations_file = 'inferCNV/cellAnnota.txt',
+                  gene_order_file = 'inferCNV/geneLocate.txt',
+                  ref_group_names = c("B_cell","Monocyte","NK_cell","T_cells"))
+dir.create("inferCNV/gse149180")
+#10x数据cutoff推荐使用0.1
+infercnv_obj = infercnv::run(infercnv_obj,
+                             cutoff=0.1, 
+                             out_dir='inferCNV/gse149180/',
+                             cluster_by_groups=TRUE, 
+                             denoise=TRUE,
+                             HMM=TRUE)
+```
+

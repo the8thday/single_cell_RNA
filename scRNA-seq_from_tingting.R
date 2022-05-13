@@ -1,10 +1,3 @@
-# options(repos="https://mirrors.tuna.tsinghua.edu.cn/CRAN/")
-
-
-library(SingleCellExperiment)
-library(AnnotationHub)
-library(ensembldb)
-
 
 #seurat结构
 #counts：主要是 counts或者TPKM的raw data，未经normalized  ###https://www.jianshu.com/p/8d9fcef27b05
@@ -22,8 +15,7 @@ suppressPackageStartupMessages(library(future))
 suppressPackageStartupMessages(library(future.apply)) 
 plan("multicore", workers = 10) #多线程
 options(future.globals.maxSize = 40000 * 1024^2)
-suppressMessages(library(Seurat))   ####suppressMessages()关闭加载包的过程信息
-suppressMessages(library(dplyr))
+suppressMessages(library(Seurat))
 suppressMessages(library(tidyverse))
 suppressMessages(library(Matrix))
 suppressMessages(library(RCurl))
@@ -32,21 +24,21 @@ suppressMessages(library(cowplot))
 #suppressMessages(library(SingleCellExperiment))
 #suppressMessages(library(AnnotationHub))
 #suppressMessages(library(ensembldb))
-suppressMessages(library(ggplot2))
-suppressMessages(library(reshape2))
-suppressMessages(library(purrr))
-suppressMessages(library(tibble))
+library("ggsci")
 
-list.files('./')
+
+setwd('/Users/congliu/Downloads/10X_Rawdata/')
 
 ### 9种 细胞的颜色
-my_colors=c("#E64B35FF","#4DBBD5FF","#00A087FF","#3C5488FF","#F39B7FFF","#8491B4FF","#91D1C2FF","#DC0000FF","#7E6148FF")
-library("ggsci")
+my_colors=c("#E64B35FF","#4DBBD5FF","#00A087FF","#3C5488FF",
+            "#F39B7FFF","#8491B4FF","#91D1C2FF","#DC0000FF","#7E6148FF")
+
 #sample_colors= pal_uchicago("light", alpha =1)(5)[2:6]
 sample_colors= c("#D6D6CEFF" ,"#FFB547FF", "#ADB17DFF" ,"#5B8FA8FF","#800000FF")
 group_colors=c("#7AA6DCCC","#003C67CC","#A73030CC" ) #分组颜色
 
-###### #### #####生信技能树的单细胞合并merge教程：使用seurat3的merge功能整合8个10X单细胞转录组样本 https://mp.weixin.qq.com/s/nHyijzvonEadXEiO9SCy8A
+###### #### #####生信技能树的单细胞合并merge教程：使用seurat3的merge功能整合8个10X单细胞转录组样本 
+## https://mp.weixin.qq.com/s/nHyijzvonEadXEiO9SCy8A
 
 ##读入GEO的矩阵
 #new_counts <- read.table(file="GSM4008624_Adult-Liver1-2_dge.txt",header = TRUE, stringsAsFactors = FALSE,check.names = FALSE, sep = "\t",row.names=1)
@@ -57,16 +49,20 @@ group_colors=c("#7AA6DCCC","#003C67CC","#A73030CC" ) #分组颜色
 #sce.big <- CreateSeuratObject(counts = B748, project = "B748", min.cells = 3, min.features = 200) 单独一个的读入
 
 ####多个文件读入合并
-folders=list.files('./')   #########当前路径下的文件
+folders=list.files('/Users/congliu/Downloads/10X_Rawdata/')   #########当前路径下的文件
 folders ########[] "N368" "N725" "T368" "T725" ######每个文件包含3个gz：barcodes.tsv.gz features.tsv.gz matrix.mtx.gz
-sceList = lapply(folders,function(folder){CreateSeuratObject(counts = Read10X(folders),min.cells = 3,min.features = 200 ,project = folder )})  ########创建Seurat对象#lapply函数,可以循环处理列表中的每一个元素,#lapply(参数)：lapply(列表,函数/函数名,其他参数)#总是返回一个列表
+sceList <- lapply(folders, function(folder) {
+  CreateSeuratObject(counts = Read10X(folders), min.cells = 3, min.features = 200, project = folder)
+}) ######## 创建Seurat对象#lapply函数,可以循环处理列表中的每一个元素,#lapply(参数)：lapply(列表,函数/函数名,其他参数)#总是返回一个列表
 ####在数据导入的时候，数据集中测到的少于200个基因的细胞（min.features = 200），和少于3个细胞覆盖的基因（min.cells = 3），就已经被过滤掉了。
 
-sce.big <- merge(sceList[[1]], y = c(sceList[[2]],sceList[[3]],sceList[[4]],sceList[[5]],sceList[[6]],sceList[[7]],sceList[[8]]),add.cell.ids = folders,project = "icc")       ########merge全合并
+sce.big <- merge(sceList[[1]], 
+                 y = c(sceList[[2]], sceList[[3]], sceList[[4]], sceList[[5]], sceList[[6]]), 
+                 add.cell.ids = folders, project = "icc") ######## merge全合并
 head(colnames(sce.big))
 tail(colnames(sce.big))
 unique(sapply(X = strsplit(colnames(sce.big), split = "_"), FUN = "[", 1))
-table(sce.big$orig.ident)  ##每个样本有多少个
+table(sce.big$orig.ident) ## 每个样本有多少个cells
 ##########merge  结束#################################################################################################################       
 
 #############################哈佛大学单细胞课程：笔记汇总前篇https://mp.weixin.qq.com/s/GTYMsgb_CzCV-K1X6MPfQw 质控，过滤，更全面
@@ -312,13 +308,19 @@ dev.off()
 ################## 如果最终不整合，就在这里对before_seurat_integrated进行 scale 标准化。如果整合成功，就不需要before_seurat_integrated 就不在这里对 all.genes scale.
 all.genes <- rownames(before_seurat_integrated)
 DefaultAssay(before_seurat_integrated) <- "RNA"  #原始RNA数据修改
-before_seurat_integrated <- ScaleData(before_seurat_integrated, features = VariableFeatures(before_seurat_integrated), vars.to.regress = c("mitoRatio","nUMI"))  ####features = all.genes，features =VariableFeatures(before_seurat_integrated)之前鉴定的HVGs进行标准化。#scale函数默认是只针对之前鉴定的HVGs进行标准化（版本3中默认得到2000个HVGs）#这样操作的结果中降维和聚类不会被影响，但是只对HVGs基因进行标准化，下面画的热图可能会受到全部基因中某些极值的影响。所以为了热图的结果，还是对所有基因进行归一化比较好
+before_seurat_integrated <- ScaleData(before_seurat_integrated, 
+                                      features = VariableFeatures(before_seurat_integrated), 
+                                      vars.to.regress = c("mitoRatio","nUMI")) 
+####features = all.genes，features =VariableFeatures(before_seurat_integrated)之前鉴定的HVGs进行标准化。
+#scale函数默认是只针对之前鉴定的HVGs进行标准化（版本3中默认得到2000个HVGs）#这样操作的结果中降维和聚类不会被影响，但是只对HVGs基因进行标准化，下面画的热图可能会受到全部基因中某些极值的影响。所以为了热图的结果，还是对所有基因进行归一化比较好
 before_seurat_integrated[["RNA"]]@scale.data[30:34,1:3]  ##Scale 后的结果在这里scale.data
 length(rownames(before_seurat_integrated))
 
 ###############对高变基因做PCA（scale后才能PCA）
 set.seed(123)
-before_seurat_integrated <- RunPCA(before_seurat_integrated, features = VariableFeatures(object = before_seurat_integrated),ndims.print = 1:5, nfeatures.print = 5)  ####### features = VariableFeatures(object = before_seurat_integrated)意思是对高变基因 run PCA
+before_seurat_integrated <- RunPCA(before_seurat_integrated, 
+                                   features = VariableFeatures(object = before_seurat_integrated),
+                                   ndims.print = 1:5, nfeatures.print = 5)  ####### features = VariableFeatures(object = before_seurat_integrated)意思是对高变基因 run PCA
 head(before_seurat_integrated@reductions$pca@feature.loadings) #### 高变基因 run PCA,这50个主成分的全部结果在这里
 
 ###############  plot PCA  按照批次检查PCA，期望是不同的批次batch不分开
@@ -406,7 +408,7 @@ dev.off()
 ############################Seurat可以使用VizDimReduction, DimPlot, 和DimHeatmap函数对PCA的结果进行可视化
 
 ###PCA主成分热图
-pdf(file="2.1.1.integrated.PCA.Heatmap.pdf",,width= 15, height = 20)
+pdf(file="2.1.1.integrated.PCA.Heatmap.pdf",width= 15, height = 20)
 DimHeatmap(seurat_integrated,dims = 1:50,cells = 500,balanced = TRUE,ncol = 4)
 dev.off()
 
@@ -423,7 +425,7 @@ head(seurat_integrated@reductions$pca@feature.loadings)##PC储存在这里
 seurat_integrated <- JackStraw(seurat_integrated,num.replicate = 100)# 重复一百次
 seurat_integrated <- ScoreJackStraw(seurat_integrated, dims = 1:20)##选择20个PC
 ## 可视化每个PC的P value分布
-pdf(file="2.1.3.JackStrawPlot.pdf",,width= 15, height = 10)
+pdf(file="2.1.3.JackStrawPlot.pdf",width= 15, height = 10)
 JackStrawPlot(seurat_integrated, dims = 1:20)
 dev.off()
 
@@ -541,10 +543,11 @@ markers = c("CD3D","KLRF1","CD79A","CD14","CD1C","TPSB2","ACTA2","VWF","KRT19","
 
 pdf(file="3.0.7.umap_marker.pdf", width = 16, height = 12)
 pp_temp = FeaturePlot(object = seurat_integrated, features = markers,cols = c("lightgrey","#ff0000"), sort.cell = TRUE, label = TRUE, min.cutoff = 'q10', combine = FALSE)
-plots <- lapply(X = pp_temp, FUN = function(p) p + theme(axis.title = element_text(size = 18),axis.text= element_text(size = 18),
-plot.title = element_text(family = 'sans',face='italic',size=20),
-legend.text = element_text(size = 20),legend.key.height = unit(1.8,"line"),
-legend.key.width = unit(1.2,"line") ))
+plots <- lapply(X = pp_temp, FUN = function(p) p + 
+                  theme(axis.title = element_text(size = 18),axis.text= element_text(size = 18),
+                        plot.title = element_text(family = 'sans',face='italic',size=20),
+                        legend.text = element_text(size = 20),legend.key.height = unit(1.8,"line"),
+                        legend.key.width = unit(1.2,"line") ))
 pp = CombinePlots(plots = plots,ncol = 3,legend = 'right')
 print(pp)
 dev.off()

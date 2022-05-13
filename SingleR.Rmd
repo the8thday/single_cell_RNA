@@ -119,6 +119,14 @@ pred.pbmc <- SingleR(test = sce_singleR,
 
 head(pred.pbmc)
 table(pred.pbmc$labels)
+table(pred.pbmc$pruned.labels)
+
+
+# 注释完后将注释后的细胞分信息加到metadata中
+pbmc@meta.data$monaco.fine <- monaco.fine$pruned.labels
+pbmc <- SetIdent(pbmc, value = "monaco.fine")
+DimPlot(pbmc, label = T , repel = T, label.size = 3) + NoLegend()
+
 ```
 
 ### 诊断

@@ -1,0 +1,52 @@
+---
+title: "hair follical"
+author: "liuc"
+date: '2022-03-29'
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## hair follical 细胞注释
+
+常用marker数据库：
+
+Cellmarker：
+
+http://bio-bigdata.hrbmu.edu.cn/CellMarker/
+
+PanglaoDB：
+
+https://panglaodb.se/index.html
+
+HCA：
+
+https://www.humancellatlas.org/
+
+MCA：
+
+http://bis.zju.edu.cn/MCA/atlas2.html
+
+CancerSEA：
+
+http://biocc.hrbmu.edu.cn/CancerSEA/
+
+KIT：
+
+http://humphreyslab.com/Single
+
+
+
+```{r}
+library(SingleR)
+
+
+
+```
+
+
+
+
+
