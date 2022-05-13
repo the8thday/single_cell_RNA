@@ -20,8 +20,8 @@ velocyto is a package for the analysis of expression dynamics in single cell RNA
 
 
 ```{r}
-library(devtools)
-install_github("velocyto-team/velocyto.R")
+# library(devtools)
+# install_github("velocyto-team/velocyto.R")
 ```
 
 

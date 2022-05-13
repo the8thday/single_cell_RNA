@@ -10,10 +10,11 @@ knitr::opts_chunk$set(echo = TRUE)
 ```
 
 https://www.singlecellcourse.org/index.html
-https://github.com/hbctraining/scRNA-seq
+https://github.com/hbctraining/scRNA-seq_online
+https://hbctraining.github.io/scRNA-seq_online/schedule/links-to-lessons.html
 
 完整而简略的单细胞转录组分析流程，对于多样本数据集。
-假设实验组和
+假设实验组和对照组各四例样本。
 
 
 ```{r}
@@ -21,6 +22,7 @@ library(SingleCellExperiment)
 library(tidyverse)
 library(patchwork)
 library(Seurat)
+library(sctransform)
 library(clustree)
 ```
 
@@ -33,9 +35,10 @@ library(clustree)
 不过对于doublet的检测，似乎也不是很着急
 
 此示例样本包括8个PBMC样本，其中4个为control组，四个为stim刺激过后的样本。
+NOTE: You should always work with non-pooled samples from the beginning of the scRNA-seq workflow, if possible.
 
 ```{r}
-# merge
+# 除merge函数外，还可以通过目录向量进行合并，此处选择merge函数
 for (file in c("ctrl_raw_feature_bc_matrix", "stim_raw_feature_bc_matrix")){
         seurat_data <- Read10X(data.dir = paste0("./datasets/", file))
         seurat_obj <- CreateSeuratObject(counts = seurat_data, 
@@ -113,6 +116,14 @@ metadata %>%
   	geom_vline(xintercept = 500) +
   	geom_hline(yintercept = 250) +
   	facet_wrap(~sample)
+
+# Visualize the overall complexity of the gene expression by visualizing the genes detected per UMI
+# 一般大于0.8为佳
+metadata %>%
+  	ggplot(aes(x=log10GenesPerUMI, color = sample, fill=sample)) +
+  	geom_density(alpha = 0.2) +
+  	theme_classic() +
+  	geom_vline(xintercept = 0.8)
 ```
 
 
@@ -124,8 +135,8 @@ QC质控在scRNA中应该结合多种metric的分布进行确定，有些细胞�
 # Cell-level filtering
 # Filter out low quality reads using selected thresholds - these will change with experiment
 filtered_seurat <- subset(x = merged_seurat, 
-                         subset= (nUMI >= 500) & 
-                           (nGene >= 250) & 
+                         subset= (nCount_RNA >= 500) & 
+                           (nFeature_RNA >= 250) & 
                            (log10GenesPerUMI > 0.80) & 
                            (mitoRatio < 0.20)
                          )
@@ -160,12 +171,6 @@ save(filtered_seurat, file="datasets/seurat_filtered.RData")
 # 此时的normalization还比较的粗糙
 seurat_phase <- NormalizeData(filtered_seurat)
 
-# Score cells for cell cycle
-seurat_phase <- CellCycleScoring(seurat_phase, 
-                                 g2m.features = g2m_genes, 
-                                 s.features = s_genes)
-
-
 # Identify the most variable genes
 seurat_phase <- FindVariableFeatures(seurat_phase, 
                      selection.method = "vst",
@@ -175,14 +180,55 @@ seurat_phase <- FindVariableFeatures(seurat_phase,
 # Scale the counts
 seurat_phase <- ScaleData(seurat_phase)
 
+# Score cells for cell cycle
+seurat_phase <- CellCycleScoring(seurat_phase, 
+                                 g2m.features = cc.genes.updated.2019$g2m.genes, 
+                                 s.features = cc.genes.updated.2019$s.genes)
+
 # Perform PCA
 seurat_phase <- RunPCA(seurat_phase)
+
+# perform TSNE, UMAP
+seurat_phase <- RunUMAP(seurat_phase, dims = 1:20)
+# seurat_phase <- RunTSNE(object = seurat_phase, dims = 1:20, do.fast = TRUE)
 
 # Plot the PCA colored by cell cycle phase
 DimPlot(seurat_phase,
         reduction = "pca",
-        group.by= "Phase",
+        group.by = "Phase",
         split.by = "Phase")
+```
+
+本例子不需要对细胞周期进行scale，但如果需要的话，Seurat推荐如下的方法，因为直接的回归所有的细胞周期效应也会模糊干细胞和祖细胞之间的区别。
+```{r}
+seurat_phase$CC.Difference <- seurat_phase$S.Score - seurat_phase$G2M.Score
+
+seurat_phase <- ScaleData(seurat_phase, 
+                          vars.to.regress = "CC.Difference", 
+                          features = rownames(seurat_phase))
+seurat_phase <- RunPCA(seurat_phase, features = VariableFeatures(marrow), 
+                       nfeatures.print = 10)
+```
+
+以下操作通过PCA确定线粒体基因是否需要在SCTransform中regress out。
+```{r}
+# Check quartile values
+summary(seurat_phase@meta.data$mitoRatio)
+
+# Turn mitoRatio into categorical factor vector based on quartile values
+seurat_phase@meta.data$mitoFr <- cut(seurat_phase@meta.data$mitoRatio, 
+                   breaks=c(-Inf, 
+                            summary(seurat_phase@meta.data$mitoRatio)[2],
+                            summary(seurat_phase@meta.data$mitoRatio)[3],
+                            summary(seurat_phase@meta.data$mitoRatio)[4], 
+                            Inf), 
+                   labels=c("Low","Medium","Medium high", "High"))
+
+# Plot the PCA colored by cell cycle phase
+DimPlot(seurat_phase,
+        reduction = "pca",
+        group.by= "mitoFr",
+        split.by = "mitoFr")
 ```
 
 
@@ -194,50 +240,112 @@ use the sctransform method as a more accurate method of normalizing, estimating 
 
 ```{r}
 # Split seurat object by condition to perform cell cycle scoring and SCT on all samples
-split_seurat <- SplitObject(filtered_seurat, split.by = "sample")
+split_seurat <- SplitObject(seurat_phase, split.by = "sample")
 
 split_seurat <- split_seurat[c("ctrl", "stim")]
 
+
 for (i in 1:length(split_seurat)) {
-    split_seurat[[i]] <- NormalizeData(split_seurat[[i]], verbose = TRUE)
-    split_seurat[[i]] <- CellCycleScoring(split_seurat[[i]], g2m.features=g2m_genes, s.features=s_genes)
-    split_seurat[[i]] <- SCTransform(split_seurat[[i]], vars.to.regress = c("mitoRatio"))
-}
+    split_seurat[[i]] <- SCTransform(split_seurat[[i]], 
+                                     vars.to.regress = c("mitoRatio"),
+                                     return.only.var.genes = TRUE,
+                                     method = "glmGamPoi"
+                                     )
+    }
 
 # Check which assays are stored in objects
 split_seurat$ctrl@assays
+
 ```
 
 
 7. integration
 
+在上一步的SCT后，有一些基因在assay SCT中相较RNA assay少了一些, 是矫正后的效果，split_seurat[[“SCT”]]@counts
+做integration的目的在于align same cell type across conditoins，同一群细胞不可以因为批次不同，来源不同而出现差异， 这要是规避的。
+
+decide wether we need the integration
+```{r}
+colnames(seurat_phase@meta.data)
+
+p1.compare <- wrap_plots(ncol = 3,
+                      DimPlot(seurat_phase, reduction = "pca", group.by = "orig.ident") +NoAxes() + ggtitle("Before_PCA"),
+                      DimPlot(seurat_phase, reduction = "tsne", group.by = "orig.ident")+NoAxes()+ggtitle("Before_tSNE"),
+                      DimPlot(seurat_phase, reduction = "umap", group.by = "orig.ident")+NoAxes()+ggtitle("Before_UMAP"),
+                      guides = "collect"
+)
+p1.compare
+```
+
+CCA/RPCA整合
 ```{r}
 # Select the most variable features to use for integration
 integ_features <- SelectIntegrationFeatures(object.list = split_seurat, 
-                                            nfeatures = 3000)
+                                            nfeatures = 3000 # default is 2000
+                                            )
 
 # Prepare the SCT list object for integration
 split_seurat <- PrepSCTIntegration(object.list = split_seurat, 
                                    anchor.features = integ_features)
 
 # Find best buddies - can take a while to run
+# 如果用CCA的话下一步可以不用跑
+split_seurat <- lapply(X = split_seurat, FUN = function(x) {
+    x <- RunPCA(x, features = integ_features, verbose = FALSE)
+    }
+    )
 integ_anchors <- FindIntegrationAnchors(object.list = split_seurat, 
                                         normalization.method = "SCT", 
-                                        anchor.features = integ_features)
+                                        anchor.features = integ_features,
+                                        reduction = 'rpca',
+                                        k.anchor = 5 # 越大整合力度越大
+                                        )
 
 # Integrate across conditions
 seurat_integrated <- IntegrateData(anchorset = integ_anchors, 
                                    normalization.method = "SCT")
 
+print(DefaultAssay(seurat_integrated))
+
 # Save integrated seurat object, 毕竟运行时间较久
-saveRDS(seurat_integrated, "results/integrated_seurat.rds")
+# saveRDS(seurat_integrated, "results/integrated_seurat.rds")
 ```
+
+harmony整合, SCT是推荐单独在每一个样本运行的，运行完后merge在一起,此处需要理清默认的assay是啥
+```{r}
+
+split_mergerd <- merge(split_seurat[[1]], y = pancreas.list[2:length(split_seurat)],merge.data = TRUE)
+
+VariableFeatures(split_mergerd) <- integ_features
+split_mergerd <- RunPCA(object = split_mergerd, assay = "SCT", npcs = 50,
+                        # features = integ_features
+                        )
+
+
+split_mergerd <- RunHarmony(split_mergerd, 
+                            group.by.vars = "group",
+                            assay.use = "SCT", 
+                            reduction = "pca",
+                            dims.use = 1:50,
+                            plot_convergence = TRUE
+                            ) # 后续进行RunUMAP等
+
+split_mergerd <- RunUMAP(split_mergerd, 
+                         assay = "SCT",
+                         reduction="harmony", 
+                         dims=1:50) %>%
+  FindNeighbors(reduction="harmony", assay = "SCT", dims=1:50) %>% 
+  FindClusters(resolution=0.8)
+```
+
 
 通过下面的PCA和UMAP检验数据整合的情况。
 
-PCA
+PCA, 以下的PCA等会在integrated的assay下运行
 ```{r}
 # Run PCA
+print(DefaultAssay(seurat_integrated))
+
 seurat_integrated <- RunPCA(object = seurat_integrated)
 
 # Plot PCA
@@ -245,12 +353,12 @@ PCAPlot(seurat_integrated,
         split.by = "sample")  
 ```
 
-
+通过UMAP查看数据整合的情况
 ```{r}
 # Run UMAP
 seurat_integrated <- RunUMAP(seurat_integrated, 
                              dims = 1:40,
-			     reduction = "pca")
+                             reduction = "pca")
 
 # Plot UMAP                             
 DimPlot(seurat_integrated)                             
@@ -280,6 +388,7 @@ ElbowPlot(object = seurat_integrated,
 The resolution is an important argument that sets the "granularity" of the downstream clustering and will need to be optimized for every individual experiment.
 ```{r}
 # Determine the K-nearest neighbor graph
+# 虽则ElbowPLot显示拐弯处在8，9个PC之间，但是考虑到所使用的SCT的方法，以下的dims可以适当的多一些，甚至是全部，不过 比较耗费时间
 seurat_integrated <- FindNeighbors(object = seurat_integrated, 
                                 dims = 1:40)
                                 
@@ -293,6 +402,12 @@ seurat_integrated <- FindClusters(object = seurat_integrated,
 Idents(object = seurat_integrated) <- "integrated_snn_res.0.8"
 ```
 
+此步骤可跑可不跑
+```{r}
+seurat_integrated <- RunUMAP(seurat_integrated, 
+                 reduction = "pca",
+                 dims = 1:40)
+```
 
 
 ```{r}
@@ -305,4 +420,143 @@ DimPlot(seurat_integrated,
 
 
 
+```{r}
+# Extract identity and sample information from seurat object to determine the number of cells per cluster per sample
+n_cells <- FetchData(seurat_integrated, 
+                     vars = c("ident", "orig.ident")) %>%
+        dplyr::count(ident, orig.ident) %>%
+        tidyr::spread(ident, n)
+
+# View table
+View(n_cells)
+
+# UMAP of cells in each cluster by sample
+# 分析不同样本间的细胞亚群间的分布，不同处理下样本的细胞组成是否相同。此处还应该对Phase、等继续进行质控分析
+DimPlot(seurat_integrated, 
+        label = TRUE, 
+        split.by = "sample")  + NoLegend()
+```
+
+
+查看在不同的metrics中细胞分布的是否均匀
+```{r}
+# Determine metrics to plot present in seurat_integrated@meta.data
+metrics <-  c("nCount_RNA", "nFeature_RNA", "S.Score", "G2M.Score", "mitoRatio")
+
+FeaturePlot(seurat_integrated, 
+            reduction = "umap", 
+            features = metrics,
+            pt.size = 0.4, 
+            sort.cell = TRUE,
+            min.cutoff = 'q10',
+            label = TRUE)
+```
+
+Seurat's FeaturePlot() function let's us easily explore the known markers on top of our UMAP visualizations. Let's go through and determine the identities of the clusters
+
+```{r}
+# Select the RNA counts slot to be the default assay
+# The SCTransform normalization was performed only on the 3000 most variable genes, so many of our genes of interest may not be present in this data.
+DefaultAssay(seurat_integrated) <- "RNA"
+
+# Normalize RNA data for visualization purposes
+seurat_integrated <- NormalizeData(seurat_integrated, verbose = FALSE)
+
+
+FeaturePlot(seurat_integrated, 
+            reduction = "umap", 
+            features = c("CD14", "LYZ"), 
+            sort.cell = TRUE,
+            min.cutoff = 'q10', 
+            label = TRUE)
+```
+
+
+9. marker identification analysis
+
+FindAllMarkers函数在计算差异时将所有细胞都当作重复。一般用于单一样本或组别时使用。
+
+
+Identification of conserved markers in all conditions:
+考虑不同分组信息求的cluster比之其他cluster的差异基因; FindConservedMarkers() accepts a single cluster at a time
+```{r}
+DefaultAssay(seurat_integrated) <- "RNA"
+
+cluster0_conserved_markers <- FindConservedMarkers(seurat_integrated,
+                              ident.1 = 0,
+                              grouping.var = "sample",
+                              only.pos = TRUE,
+                              logfc.threshold = 0.25
+                              )
+
+```
+
+
+考虑到FindConservedMarkers每次只能运行一个cluster
+```{r}
+# Create function to get conserved markers for any given cluster
+get_conserved <- function(cluster){
+  FindConservedMarkers(seurat_integrated,
+                       ident.1 = cluster,
+                       grouping.var = "sample",
+                       only.pos = TRUE) %>%
+    rownames_to_column(var = "gene") %>%
+    left_join(y = unique(annotations[, c("gene_name", "description")]),
+               by = c("gene" = "gene_name")) %>%
+    cbind(cluster_id = cluster, .)
+}
+
+
+# Iterate function across desired clusters
+conserved_markers <- map_dfr(c(7,20), get_conserved)
+```
+
+利用上述得到的Marker基因identify celltype
+```{r}
+# Extract top 10 markers per cluster
+top10 <- conserved_markers %>% 
+  mutate(avg_fc = (ctrl_avg_logFC + stim_avg_logFC) /2) %>% 
+  group_by(cluster_id) %>% 
+  top_n(n = 10, 
+        wt = avg_fc)
+
+# Visualize top 10 markers per cluster
+View(top10)
+
+
+
+```
+
+```{r}
+# Plot interesting marker gene expression for cluster 20
+FeaturePlot(object = seurat_integrated, 
+                        features = c("TPSAB1", "TPSB2", "FCER1A", "GATA1", "GATA2"),
+                         sort.cell = TRUE,
+                         min.cutoff = 'q10', 
+                         label = TRUE,
+			 repel = TRUE)
+
+# Vln plot - cluster 20
+VlnPlot(object = seurat_integrated, 
+        features = c("TPSAB1", "TPSB2", "FCER1A", "GATA1", "GATA2"))
+```
+
+
+在探索了不同的cluster的标记基因后，我们还对同一个cluster群中（同一种细胞亚群）在不同条件下的差异基因(pseudobulk differential expression analysis);
+Biological replicates are necessary to proceed with this analysis. 目前的测试数据集因不满足此分析条件，故
+```{r}
+# 详细内容见DE_analysis_scrnaseq.Rmd
+```
+
+最后的保存
+```{r}
+# Save final R object
+write_rds(seurat_integrated,
+          file = "./Results/seurat_labelled.rds")
+
+# Create and save a text file with sessionInfo
+sink(glue::glue("./Results/sessionInfo_scrnaseq_{lubridate::today()}.txt"))
+sessionInfo()
+sink()
+```
 

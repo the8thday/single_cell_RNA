@@ -1,0 +1,33 @@
+---
+title: "cellphonedb"
+author: "liuc"
+date: '2022-04-24'
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## CellPhoneDB
+
+细胞通讯肯定只能是样本内的，因此我们需要按样本提取数据子集。
+
+```{r}
+library(Seurat)
+library(tidyverse)
+
+```
+
+
+
+```{r}
+#提取HNSCC肿瘤样本HNC01TIL
+sp1 <- scRNA[,str_detect(colnames(scRNA),'HNC01TIL')]
+sp1_counts <- as.matrix(sp1@assays$RNA@data)
+sp1_counts <- data.frame(Gene=rownames(sp1_counts), sp1_counts)
+sp1_meta <- data.frame(Cell=rownames(sp1@meta.data), cell_type=sp1@meta.data$celltype_Monaco)
+write.table(sp1_counts, "CellTalk/sp1_counts.txt", row.names=F, sep='\t')
+write.table(sp1_meta, "CellTalk/sp1_meta.txt", row.names=F, sep='\t')
+```
+
