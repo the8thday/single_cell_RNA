@@ -9,18 +9,19 @@ output: pdf_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-https://www.singlecellcourse.org/index.html
-https://github.com/hbctraining/scRNA-seq_online
-https://hbctraining.github.io/scRNA-seq_online/schedule/links-to-lessons.html
+> https://www.singlecellcourse.org/index.html
+> https://github.com/hbctraining/scRNA-seq_online
+> https://hbctraining.github.io/scRNA-seq_online/schedule/links-to-lessons.html
 
 完整而简略的单细胞转录组分析流程，对于多样本数据集。
 假设实验组和对照组各四例样本。
 
 
-```{r}
-library(SingleCellExperiment)
+```{r, include=FALSE}
 library(tidyverse)
 library(patchwork)
+
+library(SingleCellExperiment)
 library(Seurat)
 library(sctransform)
 library(clustree)
@@ -32,9 +33,10 @@ library(clustree)
 1. 首先是对10X数据的整合
 
 在10X数据下机后，还需要·scrublet·进行doublet detection ·soupX·等进行ambient RNA correction等质控的过程。
-不过对于doublet的检测，似乎也不是很着急
+不过对于doublet的检测，似乎也不是很着急，以下笔记仅从测试数据开始。
 
 此示例样本包括8个PBMC样本，其中4个为control组，四个为stim刺激过后的样本。
+
 NOTE: You should always work with non-pooled samples from the beginning of the scRNA-seq workflow, if possible.
 
 ```{r}
@@ -199,6 +201,12 @@ DimPlot(seurat_phase,
         split.by = "Phase")
 ```
 
+
+```{r}
+DefaultAssay(seurat_phase)
+```
+
+
 本例子不需要对细胞周期进行scale，但如果需要的话，Seurat推荐如下的方法，因为直接的回归所有的细胞周期效应也会模糊干细胞和祖细胞之间的区别。
 ```{r}
 seurat_phase$CC.Difference <- seurat_phase$S.Score - seurat_phase$G2M.Score
@@ -240,6 +248,7 @@ use the sctransform method as a more accurate method of normalizing, estimating 
 
 ```{r}
 # Split seurat object by condition to perform cell cycle scoring and SCT on all samples
+# ?sctransform::vst
 split_seurat <- SplitObject(seurat_phase, split.by = "sample")
 
 split_seurat <- split_seurat[c("ctrl", "stim")]
@@ -257,6 +266,14 @@ for (i in 1:length(split_seurat)) {
 split_seurat$ctrl@assays
 
 ```
+
+
+```{r}
+class(split_seurat)
+
+class(split_seurat$ctrl)
+```
+
 
 
 7. integration
@@ -311,7 +328,9 @@ print(DefaultAssay(seurat_integrated))
 # saveRDS(seurat_integrated, "results/integrated_seurat.rds")
 ```
 
-harmony整合, SCT是推荐单独在每一个样本运行的，运行完后merge在一起,此处需要理清默认的assay是啥
+harmony整合, SCT是推荐单独在每一个样本运行的，运行完后merge在一起,此处需要理清默认的assay是啥.
+
+To perform integration, Harmony takes as input a merged Seurat object, containing data that has been appropriately normalized (i.e. here, normalized using SCTransform) and for which highly variable features and PCs are defined.
 ```{r}
 
 split_mergerd <- merge(split_seurat[[1]], y = pancreas.list[2:length(split_seurat)],merge.data = TRUE)
@@ -337,6 +356,13 @@ split_mergerd <- RunUMAP(split_mergerd,
   FindNeighbors(reduction="harmony", assay = "SCT", dims=1:50) %>% 
   FindClusters(resolution=0.8)
 ```
+
+
+```{r}
+harmony_embeddings <- Embeddings(split_mergerd, 'harmony')
+harmony_embeddings[1:5, 1:5]
+```
+
 
 
 通过下面的PCA和UMAP检验数据整合的情况。
@@ -367,10 +393,13 @@ DimPlot(seurat_integrated)
 
 8. cluster
 
-Seurat利用
+Seurat利用Seurat assigns cells to clusters based on their PCA scores derived from the expression of the integrated most variable genes.
 
+Determining how many PCs to include in the clustering step is therefore important to ensure that we are capturing the majority of the variation, or cell types, present in our dataset.
 
-确定后续所用的PC数:
+Seurat uses a graph-based clustering approach using a K-nearest neighbor approach, and then attempts to partition this graph into highly interconnected ‘quasi-cliques’ or ‘communities’.
+
+*确定后续所用的PC数:*
 不过对于采用了SCTransform方法的分析，PC数目的选择没有以前显的那么重要了。
 In theory, with SCTransform, the more PCs we choose the more variation is accounted for when performing the clustering。
 ```{r}
