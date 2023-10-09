@@ -1,0 +1,738 @@
+---
+title: "scRNA Analysis Reporter"
+format: 
+  html:
+    self-contained: true
+    theme: cerulean
+date: 2023-10-07
+author: DDS-liucong
+abstract: scRNA Analysis in SIBR
+toc: true
+toc-depth: 3
+toc-title: Contents
+number-sections: true
+---
+
+## Introduction
+
+本分析流程主要参考HBC training，以及Seurat文档，以及OSCA.
+
+主要适用于10X的下机数据。
+
+```{r, include=FALSE}
+# Load libraries
+library(tidyverse)
+library(SingleCellExperiment)
+library(Seurat)
+
+library(Matrix)
+library(scales)
+
+
+# options(future.globals.maxSize = 4000 * 1024^2)
+```
+
+
+
+## Quality Control Analysis
+
+
+```{r}
+# 除merge函数外，还可以通过目录向量进行合并，此处选择merge函数
+for (file in c("ctrl_raw_feature_bc_matrix", "stim_raw_feature_bc_matrix")) {
+  seurat_data <- Read10X(data.dir = paste0("./datasets/", file))
+  seurat_obj <- CreateSeuratObject(
+    counts = seurat_data,
+    min.features = 100,
+    project = file
+  )
+  assign(file, seurat_obj)
+}
+
+# Create a merged Seurat object
+merged_seurat <- merge(
+  x = ctrl_raw_feature_bc_matrix,
+  y = stim_raw_feature_bc_matrix,
+  add.cell.id = c("ctrl", "stim")
+)
+```
+
+
+```{r}
+# Add number of genes per UMI for each cell to metadata
+merged_seurat$log10GenesPerUMI <- log10(merged_seurat$nFeature_RNA) / log10(merged_seurat$nCount_RNA)
+```
+
+
+```{r}
+# Compute percent mito ratio
+# 只针对人的基因名称
+merged_seurat$mitoRatio <- PercentageFeatureSet(object = merged_seurat, pattern = "^MT-")
+merged_seurat$mitoRatio <- merged_seurat@meta.data$mitoRatio / 100
+
+# 核糖体基因、红血细胞基因、管家基因
+merged_seurat <- PercentageFeatureSet(merged_seurat, "^RP[SL]",col.name = "percent.ribo")
+merged_seurat <- PercentageFeatureSet(merged_seurat, "^HB[^(P)]", col.name = "percent.hb")
+```
+
+
+```{r}
+# Create metadata dataframe
+metadata <- merged_seurat@meta.data
+
+# Create sample column
+metadata$sample <- NA
+metadata$sample[which(str_detect(metadata$cells, "^ctrl_"))] <- "ctrl"
+metadata$sample[which(str_detect(metadata$cells, "^stim_"))] <- "stim"
+
+
+# Rename columns
+metadata <- metadata %>%
+  dplyr::rename(
+    seq_folder = orig.ident,
+    nUMI = nCount_RNA,
+    nGene = nFeature_RNA
+  )
+
+# Add metadata back to Seurat object
+merged_seurat@meta.data <- metadata
+```
+
+
+### Visualize the number of cell counts per sample
+
+```{r}
+# Visualize the number of cell counts per sample
+metadata %>%
+  ggplot(aes(x = sample, fill = sample)) +
+  geom_bar() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  ggtitle("NCells")
+```
+
+
+### Visualize the number UMIs/transcripts per cell
+
+The UMI counts per cell should generally be above 500, that is the low end of what we expect. If UMI counts are between 500-1000 counts, it is usable but the cells probably should have been sequenced more deeply.
+
+
+```{r}
+# Visualize the number UMIs/transcripts per cell
+metadata %>%
+  ggplot(aes(color = sample, x = nUMI, fill = sample)) +
+  geom_density(alpha = 0.2) +
+  scale_x_log10() +
+  theme_classic() +
+  ylab("Cell density") +
+  geom_vline(xintercept = 500)
+```
+
+### Genes detected per cell
+
+For high quality data, the proportional histogram should contain a single large peak that represents cells that were encapsulated.
+
+```{r}
+# Visualize the distribution of genes detected per cell via histogram
+metadata %>%
+  ggplot(aes(color = sample, x = nGene, fill = sample)) +
+  geom_density(alpha = 0.2) +
+  theme_classic() +
+  scale_x_log10() +
+  geom_vline(xintercept = 300)
+```
+
+
+### Complexity & Novelty score
+
+The novelty score is computed by taking the ratio of nGenes over nUMI. Generally, we expect the novelty score to be above 0.80 for good quality cells.
+
+```{r}
+# Visualize the overall complexity of the gene expression by visualizing the genes detected per UMI (novelty score)
+metadata %>%
+  ggplot(aes(x = log10GenesPerUMI, color = sample, fill = sample)) +
+  geom_density(alpha = 0.2) +
+  theme_classic() +
+  geom_vline(xintercept = 0.8)
+```
+
+### Mitochondrial counts ratio
+
+This metric can identify whether there is a large amount of mitochondrial contamination from dead or dying cells. We define poor quality samples for mitochondrial counts as cells which surpass the 0.2 mitochondrial ratio mark, unless of course you are expecting this in your sample.
+
+
+```{r}
+# Visualize the distribution of mitochondrial gene expression detected per cell
+metadata %>%
+  ggplot(aes(color = sample, x = mitoRatio, fill = sample)) +
+  geom_density(alpha = 0.2) +
+  scale_x_log10() +
+  theme_classic() +
+  geom_vline(xintercept = 0.2)
+```
+
+### Joint filtering effects
+
+Two metrics that are often evaluated together are the number of UMIs and the number of genes detected per cell. Here, we have plotted the number of genes versus the number of UMIs coloured by the fraction of mitochondrial reads. 
+Good cells will generally exhibit both higher number of genes per cell and higher numbers of UMIs (upper right quadrant of the plot). Cells that are poor quality are likely to have low genes and UMIs per cell, and correspond to the data points in the bottom left quadrant of the plot.
+
+```{r}
+# Visualize the correlation between genes detected and number of UMIs and determine whether strong presence of cells with low numbers of genes/UMIs
+metadata %>%
+  ggplot(aes(x = nUMI, y = nGene, color = mitoRatio)) +
+  geom_point() +
+  scale_colour_gradient(low = "gray90", high = "black") +
+  stat_smooth(method = lm) +
+  scale_x_log10() +
+  scale_y_log10() +
+  theme_classic() +
+  geom_vline(xintercept = 500) +
+  geom_hline(yintercept = 250) +
+  facet_wrap(~sample)
+```
+
+
+
+## Filtering
+
+QC质控在scRNA中应该结合多种metric的分布进行确定，有些细胞可能是质控不达标，也可能是生物学意义上本就如此的细胞亚群。不同的质控的理解会对下游分析有些许的影响，下面结合对QC的理解进行过滤。
+
+在过滤过后推荐将上面的QC分析步骤再运行一次，以检验是否达到预期的QC目的。
+
+
+### Cell-level filtering
+
+- nUMI > 500
+- nGene > 250
+- log10GenesPerUMI > 0.8
+- mitoRatio < 0.2
+
+
+```{r}
+# Filter out low quality cells using selected thresholds - these will change with experiment
+filtered_seurat <- subset(
+  x = merged_seurat,
+  subset = (nUMI >= 500) &
+    (nGene >= 250) &
+    (log10GenesPerUMI > 0.80) &
+    (mitoRatio < 0.20)
+)
+```
+
+
+### Gene-level filtering
+
+keep only genes which are expressed in 10 or more cells.
+
+```{r}
+# Extract counts
+counts <- GetAssayData(object = filtered_seurat, slot = "counts")
+# Output a logical vector for every gene on whether the more than zero counts per cell
+nonzero <- counts > 0
+# Sums all TRUE values and returns TRUE if more than 10 TRUE values per gene
+keep_genes <- Matrix::rowSums(nonzero) >= 10
+# Only keeping those genes expressed in more than 10 cells
+filtered_counts <- counts[keep_genes, ]
+# Reassign to filtered Seurat object
+filtered_seurat <- CreateSeuratObject(filtered_counts, meta.data = filtered_seurat@meta.data)
+```
+
+
+## Normalization and regressing out unwanted variation
+
+
+此处选择`SCTransform`方法进行normalization、scale等.
+
+
+### 通过PCA确定cell cycle是否需要在SCTransform中regress out
+
+```{r}
+# Normalize the counts
+# 此时的normalization还比较的粗糙，利用默认的log方式
+seurat_phase <- NormalizeData(filtered_seurat)
+
+# Identify the most variable genes
+seurat_phase <- FindVariableFeatures(seurat_phase,
+  selection.method = "vst",
+  nfeatures = 2000,
+  verbose = FALSE
+)
+
+# Scale the counts
+seurat_phase <- ScaleData(seurat_phase)
+
+# Score cells for cell cycle
+seurat_phase <- CellCycleScoring(seurat_phase,
+  g2m.features = cc.genes.updated.2019$g2m.genes,
+  s.features = cc.genes.updated.2019$s.genes
+)
+
+# Perform PCA
+seurat_phase <- RunPCA(seurat_phase)
+
+# perform TSNE, UMAP
+seurat_phase <- RunUMAP(seurat_phase, dims = 1:20)
+# seurat_phase <- RunTSNE(object = seurat_phase, dims = 1:20, do.fast = TRUE)
+
+# Plot the PCA colored by cell cycle phase
+DimPlot(seurat_phase,
+  reduction = "pca",
+  group.by = "Phase",
+  split.by = "Phase"
+)
+```
+*Interpret: *不同时期的分布甚为接近，所以推测细胞周期不存在影响。
+
+
+### 通过PCA确定线粒体基因是否需要在SCTransform中regress out
+
+
+```{r}
+# Check quartile values
+# summary(seurat_phase@meta.data$mitoRatio)
+
+# Turn mitoRatio into categorical factor vector based on quartile values
+seurat_phase@meta.data$mitoFr <- cut(seurat_phase@meta.data$mitoRatio,
+  breaks = c(
+    -Inf,
+    summary(seurat_phase@meta.data$mitoRatio)[2],
+    summary(seurat_phase@meta.data$mitoRatio)[3],
+    summary(seurat_phase@meta.data$mitoRatio)[4],
+    Inf
+  ),
+  labels = c("Low", "Medium", "Medium high", "High")
+)
+
+# Plot the PCA colored by cell cycle phase
+DimPlot(seurat_phase,
+  reduction = "pca",
+  group.by = "mitoFr",
+  split.by = "mitoFr"
+)
+```
+
+
+### SCTransform
+
+use the sctransform method as a more accurate method of normalizing, estimating the variance of the raw filtered data, and identifying the most variable genes.
+
+在进行SCTransform时，一般会对cell cycle和线粒体等会对聚类引入variation进行regress out，但如果线粒体本就在研究对象 中有意义的话，就不推荐regerss out了。当然还有其他在实验设计中引入的混淆变量、协变量等，具体情况具体分析。
+
+
+```{r}
+# Split seurat object by condition to perform cell cycle scoring and SCT on all samples
+# By default, after normalizing, SCTransform will rank the genes by residual variance and output the 3000 most variant genes.
+# The most variable features will be the only genes stored inside the SCT assay.
+split_seurat <- SplitObject(seurat_phase, split.by = "sample")
+
+split_seurat <- split_seurat[c("ctrl", "stim")]
+
+
+for (i in 1:length(split_seurat)) {
+  split_seurat[[i]] <- SCTransform(
+    split_seurat[[i]],
+    vars.to.regress = c("mitoRatio"),
+    return.only.var.genes = TRUE,
+    method = "glmGamPoi",
+    vst.flavor = "v2",
+    variable.features.n = 3000,
+    ncells = 5000,
+    verbose = FALSE
+  )
+}
+
+# Check which assays are stored in objects
+split_seurat$ctrl@assays
+```
+
+
+```{r}
+# Save the split seurat object
+# 运行时间很久的，注意保存中间步骤。
+# saveRDS(split_seurat, "./datasets/split_seurat.rds")
+
+# Load the split seurat object into the environment
+split_seurat <- readRDS("./datasets/split_seurat.rds")
+```
+
+
+```{r}
+# class(split_seurat)
+```
+
+
+
+## Integration
+
+在上一步的SCT后，有一些基因在assay SCT中相较RNA assay少了一些, 是矫正后的效果.
+
+做integration的目的在于align same cell type across conditoins，同一群细胞不可以因为批次不同，来源不同而出现差异， 这要是规避的。The goal of integration is to ensure that the cell types of one condition/dataset align with the same celltypes of the other conditions/datasets.
+
+
+### Explore the data to decide integrate or not
+
+Condition-specific clustering of the cells.
+
+```{r}
+p1.compare <- patchwork::wrap_plots(
+  ncol = 3,
+  DimPlot(seurat_phase, reduction = "pca", group.by = "orig.ident") + NoAxes() + ggtitle("Before_PCA"),
+  DimPlot(seurat_phase, reduction = "tsne", group.by = "orig.ident") + NoAxes() + ggtitle("Before_tSNE"),
+  DimPlot(seurat_phase, reduction = "umap", group.by = "orig.ident") + NoAxes() + ggtitle("Before_UMAP"),
+  guides = "collect"
+)
+
+p1.compare
+```
+
+
+### CCA or RPCA整合
+
+Now, using our SCTransform object as input, let’s perform the integration across conditions.
+
+```{r, eval=FALSE}
+# CCA的运行速度实在是慢, 在我的小mac足足跑了40分钟
+# Select the most variable features to use for integration
+integ_features <- SelectIntegrationFeatures(
+  object.list = split_seurat,
+  nfeatures = 3000 # default is 2000
+)
+
+# Prepare the SCT list object for integration
+split_seurat <- PrepSCTIntegration(
+  object.list = split_seurat,
+  anchor.features = integ_features
+)
+
+# Find best buddies - can take a while to run
+# 如果用CCA的话下一步可以不用跑
+# split_seurat <- lapply(X = split_seurat, FUN = function(x) {
+#     x <- RunPCA(x, features = integ_features, verbose = FALSE)
+#     }
+#     )
+
+
+# 极为费时的一步
+integ_anchors <- FindIntegrationAnchors(
+  object.list = split_seurat,
+  normalization.method = "SCT",
+  anchor.features = integ_features,
+  # reduction = 'rpca',
+  reduction = "cca",
+  k.anchor = 5 # 越大整合力度越大
+)
+
+# Integrate across conditions
+seurat_integrated <- IntegrateData(
+  anchorset = integ_anchors,
+  normalization.method = "SCT"
+)
+
+print(DefaultAssay(seurat_integrated))
+```
+
+```{r}
+# Save integrated seurat object, 毕竟运行时间较久
+saveRDS(seurat_integrated, "./datasets/integrated_seurat.rds")
+```
+
+
+```{r}
+# Run PCA
+seurat_integrated <- RunPCA(object = seurat_integrated)
+
+# Plot PCA
+PCAPlot(seurat_integrated,
+  split.by = "sample"
+)
+```
+
+
+```{r}
+# Set seed
+set.seed(123456)
+
+# Run UMAP
+seurat_integrated <- RunUMAP(seurat_integrated,
+  dims = 1:40,
+  reduction = "pca"
+)
+
+# Plot UMAP
+DimPlot(seurat_integrated)
+```
+
+
+```{r}
+# Plot UMAP split by sample
+DimPlot(seurat_integrated,
+  split.by = "sample"
+)
+```
+
+
+
+### harmony整合
+
+In downstream analyses, use the Harmony embeddings instead of PCA.
+
+```{r, include=FALSE}
+library(harmony)
+```
+
+
+```{r}
+# Find most variable features across samples to integrate
+integ_features <- SelectIntegrationFeatures(object.list = split_seurat, nfeatures = 3000)
+
+# Merge normalized samples
+merged_seurat <- merge(
+  x = split_seurat[[1]],
+  y = split_seurat[2:length(split_seurat)],
+  merge.data = TRUE
+)
+
+DefaultAssay(merged_seurat) <- "SCT"
+
+# Manually set variable features of merged Seurat object
+VariableFeatures(merged_seurat) <- integ_features
+
+# Calculate PCs using manually set variable features
+merged_seurat <- RunPCA(merged_seurat, assay = "SCT", npcs = 50, verbose = FALSE)
+```
+
+
+```{r}
+# 注意设置想integrate的存在于metadata中的列名
+# 本例中sample列为样本分组信息
+harmonized_seurat <- harmony::RunHarmony(merged_seurat,
+  group.by.vars = c("sample"),
+  reduction.use = "pca",
+  assay.use = "SCT",
+  reduction.save = "harmony",
+  plot_convergence = TRUE
+)
+```
+
+
+```{r}
+harmonized_seurat <- RunUMAP(harmonized_seurat,
+  reduction = "harmony",
+  assay = "SCT",
+  dims = 1:40
+)
+
+harmonized_seurat <- RunTSNE(harmonized_seurat,
+  reduction = "harmony",
+  assay = "SCT",
+  dims = 1:40,
+  verbose = FALSE
+)
+
+DefaultAssay(harmonized_seurat)
+```
+
+
+```{r}
+DimPlot(harmonized_seurat,
+  reduction = "harmony",
+  split.by = "sample"
+)
+```
+
+```{r}
+UMAPPlot(harmonized_seurat)
+```
+
+
+
+## Clustering
+
+Seurat uses a graph-based clustering approach using a K-nearest neighbor approach, and then attempts to partition this graph into highly interconnected 'quasi-cliques' or 'communities'.
+
+
+```{r}
+harmonized_seurat <- FindNeighbors(
+  object = harmonized_seurat,
+  reduction = "harmony",
+  dims = 1:40
+)
+
+# Determine the clusters for various resolutions
+harmonized_seurat <- FindClusters(
+  object = harmonized_seurat,
+  resolution = c(0.4, 0.6, 0.8, 1.0, 1.4)
+)
+```
+
+
+```{r}
+# Assign identity of clusters
+# 具体到这里的选择：
+Idents(object = harmonized_seurat) <- "SCT_snn_res.0.8"
+```
+
+
+```{r}
+# harmonized_seurat <- RunUMAP(harmonized_seurat,
+#   reduction = "harmony",
+#   dims = 1:40
+# )
+```
+
+```{r}
+# Plot the UMAP
+DimPlot(harmonized_seurat,
+  reduction = "umap",
+  label = TRUE,
+  label.size = 6
+)
+```
+
+### QC for clustering
+
+To determine whether clusters represent true cell types or cluster due to biological or technical variation.
+
+
+To use known cell type marker genes to determine the identities of the clusters.
+
+```{r}
+# Extract identity and sample information from seurat object to determine the number of cells per cluster per sample
+n_cells <- FetchData(harmonized_seurat, 
+                     vars = c("ident", "orig.ident")) %>%
+        dplyr::count(ident, orig.ident) %>%
+        tidyr::spread(ident, n)
+
+# View table
+View(n_cells)
+```
+
+
+Generally, we expect to see the majority of the cell type clusters to be present in all conditions; however, depending on the experiment we might expect to see some condition-specific cell types present. 
+```{r}
+# UMAP of cells in each cluster by sample
+# 分析不同样本间的细胞亚群间的分布，不同处理下样本的细胞组成是否相同。此处还应该对Phase、等继续进行质控分析
+DimPlot(harmonized_seurat, 
+        label = TRUE, 
+        split.by = "sample")  + NoLegend()
+```
+
+
+```{r}
+DimPlot(harmonized_seurat, 
+        label = TRUE, 
+        split.by = "Phase")  + NoLegend()
+```
+
+
+
+## Marker identification
+
+Since we have samples representing different conditions in our dataset, our best option is to find conserved markers.
+
+
+```{r}
+# 用RNA还是SCT？
+DefaultAssay(harmonized_seurat) <- "RNA"
+
+annotations <- read.csv("./datasets/annotation.csv")
+
+# Create function to get conserved markers for any given cluster
+get_conserved <- function(cluster){
+  FindConservedMarkers(harmonized_seurat,
+                       ident.1 = cluster,
+                       grouping.var = "sample",
+                       only.pos = TRUE
+                       ) %>%
+    rownames_to_column(var = "gene") %>%
+    left_join(y = unique(annotations[, c("gene_name", "description")]),
+               by = c("gene" = "gene_name")) %>%
+    cbind(cluster_id = cluster, .)
+  }
+```
+
+
+```{r}
+# 某个聚类的Conserved Marker
+cluster0_conserved_markers <- FindConservedMarkers(
+  harmonized_seurat,
+  ident.1 = 0,
+  grouping.var = "sample",
+  only.pos = FALSE,
+  logfc.threshold = 1,
+  assay = 'SCT',
+  slot = 'data'
+)
+```
+
+```{r}
+# Iterate function across desired clusters
+# 举例得到某个cluster的Marker
+conserved_markers <- map_dfr(c(1, 7), get_conserved)
+```
+
+
+To see if we can identify which celltypes these clusters identify with.
+```{r}
+# Extract top 10 markers per cluster
+top10 <- conserved_markers %>% 
+  mutate(avg_fc = (ctrl_avg_log2FC + stim_avg_log2FC) /2) %>% 
+  group_by(cluster_id) %>% 
+  top_n(n = 10, 
+        wt = avg_fc)
+
+# Visualize top 10 markers per cluster
+top10
+```
+
+
+如果某些基因作为Marker是你所感兴趣的，可以查看这些基因在cluster的分布。
+```{r}
+# Plot interesting marker gene expression for cluster 4
+FeaturePlot(object = harmonized_seurat, 
+                        features = c("HSPH1", "HSPE1", "DNAJB1"),
+                         order = TRUE,
+                         min.cutoff = 'q10', 
+                         label = TRUE,
+			 repel = TRUE)
+```
+
+目的同上。
+```{r}
+# Vln plot - cluster 4
+VlnPlot(object = harmonized_seurat, 
+        features = c("HSPH1", "HSPE1", "DNAJB1"))
+```
+
+
+
+
+## Differential expression between conditions
+
+
+```{r}
+# 通过FindMarkers计算同一种细胞在不同条件下的差异
+harmonized_seurat <- PrepSCTFindMarkers(harmonized_seurat)
+
+harmonized_seurat$celltype.sample <- paste(Idents(harmonized_seurat), seurat_integrated$sample, 
+                                       sep = "_")
+seurat_integrated$celltype <- Idents(seurat_integrated)
+Idents(seurat_integrated) <- "celltype.sample"
+
+
+b.interferon.response <- FindMarkers(seurat_integrated, 
+                                     assay = 'SCT',
+                                     ident.1 = "2_ctrl", 
+                                     ident.2 = "2_stim", 
+                                     verbose = FALSE)
+print(dim(b.interferon.response))
+head(b.interferon.response, n = 5)
+```
+
+
+
+
+
+
+
