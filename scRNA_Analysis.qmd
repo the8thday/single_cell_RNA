@@ -61,6 +61,8 @@ merged_seurat <- merge(
 ```{r}
 # Add number of genes per UMI for each cell to metadata
 merged_seurat$log10GenesPerUMI <- log10(merged_seurat$nFeature_RNA) / log10(merged_seurat$nCount_RNA)
+
+merged_seurat$cells <- rownames()
 ```
 
 
@@ -79,6 +81,8 @@ merged_seurat <- PercentageFeatureSet(merged_seurat, "^HB[^(P)]", col.name = "pe
 ```{r}
 # Create metadata dataframe
 metadata <- merged_seurat@meta.data
+
+metadata$cells <- rownames(metadata)
 
 # Create sample column
 metadata$sample <- NA
@@ -319,6 +323,11 @@ use the sctransform method as a more accurate method of normalizing, estimating 
 
 在进行SCTransform时，一般会对cell cycle和线粒体等会对聚类引入variation进行regress out，但如果线粒体本就在研究对象 中有意义的话，就不推荐regerss out了。当然还有其他在实验设计中引入的混淆变量、协变量等，具体情况具体分析。
 
+```{r}
+# SCTranform
+# 为何不可以这样跑呢？
+# seurat_phase <- SCTransform(seurat_phase, vars.to.regress = c("mitoRatio"))
+```
 
 ```{r}
 # Split seurat object by condition to perform cell cycle scoring and SCT on all samples
@@ -434,6 +443,7 @@ print(DefaultAssay(seurat_integrated))
 
 ```{r}
 # Save integrated seurat object, 毕竟运行时间较久
+# 为什么整合之后的文件大了那么多。。
 saveRDS(seurat_integrated, "./datasets/integrated_seurat.rds")
 ```
 
@@ -546,6 +556,13 @@ UMAPPlot(harmonized_seurat)
 ```
 
 
+```{r}
+VlnPlot(object = pbmc_harmony, features = "harmony_1",  
+group.by = "orig.ident", pt.size = .1) + 
+NoLegend()
+```
+
+
 
 ## Clustering
 
@@ -636,6 +653,9 @@ Since we have samples representing different conditions in our dataset, our best
 # 用RNA还是SCT？
 DefaultAssay(harmonized_seurat) <- "RNA"
 
+# Normalize RNA data for visualization purposes
+seurat_integrated <- NormalizeData(seurat_integrated, verbose = FALSE)
+
 annotations <- read.csv("./datasets/annotation.csv")
 
 # Create function to get conserved markers for any given cluster
@@ -710,6 +730,7 @@ VlnPlot(object = harmonized_seurat,
 
 ## Differential expression between conditions
 
+`FindMarkers()` function to determine the genes that are differentially expressed between two specific clusters.
 
 ```{r}
 # 通过FindMarkers计算同一种细胞在不同条件下的差异
