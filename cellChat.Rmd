@@ -15,7 +15,7 @@ knitr::opts_chunk$set(echo = TRUE)
 CellChatDB in human contains 1,939 validated molecular interactions, including 61.8% of paracrine/autocrine signaling interactions, 21.7% of extracellular matrix (ECM)-receptor interactions and 16.5% of cell-cell contact interactions.
 
 
-```{r}
+```{r, include=FALSE}
 # devtools::install_github("sqjin/CellChat")
 library(Seurat)
 library(CellChat)
@@ -115,7 +115,7 @@ cellchat@netP$pathways             #查看富集到的信号通路
 pathways.show <- c("MIF")           #指定需要展示的通路
 
 # Hierarchy plot
-png(filename = "sig_pathway_hierarchy.png", width = 1000, height = 650)
+pdf(file = "sig_pathway_hierarchy.pdf", width = 10, height = 10)
 netVisual_aggregate(cellchat, 
                     signaling = pathways.show,
                     vertex.receiver = vertex.receiver, 

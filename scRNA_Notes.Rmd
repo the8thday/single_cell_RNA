@@ -29,6 +29,7 @@ time fastq-dump --gzip --split-files -A $i ${i}.sra && echo "** ${i}.sra to fast
 ```
 
 ### cellranger 的具体使用
+
 cellrange 包装的较好
 
 cellranger mkfastq ： 它借鉴了Illumina的bcl2fastq ，可以将一个或多个lane中的混样测序样本按照index标签生成样本对应的fastq文件

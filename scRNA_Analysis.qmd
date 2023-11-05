@@ -325,7 +325,8 @@ use the sctransform method as a more accurate method of normalizing, estimating 
 
 ```{r}
 # SCTranform
-# 为何不可以这样跑呢？
+# 为何教程里没有选择这样跑呢？
+# 这样跑自然是可以的，counts数据列为每个样本的细胞
 # seurat_phase <- SCTransform(seurat_phase, vars.to.regress = c("mitoRatio"))
 ```
 
@@ -337,6 +338,8 @@ split_seurat <- SplitObject(seurat_phase, split.by = "sample")
 
 split_seurat <- split_seurat[c("ctrl", "stim")]
 
+# split_seurat <- lapply(split_seurat, FUN = SCTransform, 
+                      # method = 'glmGamPoi', vst.flavor = "v2", vars.to.regress = c("mitoRatio"))
 
 for (i in 1:length(split_seurat)) {
   split_seurat[[i]] <- SCTransform(
@@ -376,7 +379,7 @@ split_seurat <- readRDS("./datasets/split_seurat.rds")
 
 在上一步的SCT后，有一些基因在assay SCT中相较RNA assay少了一些, 是矫正后的效果.
 
-做integration的目的在于align same cell type across conditoins，同一群细胞不可以因为批次不同，来源不同而出现差异， 这要是规避的。The goal of integration is to ensure that the cell types of one condition/dataset align with the same celltypes of the other conditions/datasets.
+做integration的目的在于align same cell type across conditions，同一群细胞不可以因为批次不同，来源不同而出现差异， 这要是规避的。The goal of integration is to ensure that the cell types of one condition/dataset align with the same celltypes of the other conditions/datasets.
 
 
 ### Explore the data to decide integrate or not
@@ -752,6 +755,7 @@ head(b.interferon.response, n = 5)
 ```
 
 
+### Pseudobulk DE by DESeq2
 
 
 

@@ -18,6 +18,8 @@ knitr::opts_chunk$set(echo = TRUE)
 
 
 ```{r}
+library(tidyverse)
+library(patchwork)
 library(monocle3)
 
 seurat_integrated <- readRDS('./Results/seurat_labelled.rds')
@@ -76,7 +78,7 @@ cds <- cluster_cells(cds)
 pp1 <- plot_cells(cds, show_trajectory_graph = FALSE) + ggtitle("label by clusterID")
 pp2 <- plot_cells(cds, color_cells_by = "partition", show_trajectory_graph = FALSE) + 
         ggtitle("label by partitionID")
-p = wrap_plots(pp1, pp2)
+p = patchwork::wrap_plots(pp1, pp2)
 p
 ```
 
@@ -144,9 +146,10 @@ plot_cells(cds, genes=Track_genes_sig, show_trajectory_graph=FALSE,
 
 ##寻找共表达模块
 genelist <- pull(Track_genes, gene_short_name) %>% as.character()
-gene_module <- find_gene_modules(cds[genelist,], resolution=1e-2, cores = 10)
+gene_module <- find_gene_modules(cds[genelist,], resolution=1e-2, cores = 6)
 cell_group <- tibble::tibble(cell=row.names(colData(cds)), 
-                             cell_group=colData(cds)$predicted.id)
+                             cell_group=colData(cds)$integrated_snn_res.0.8)
+
 agg_mat <- aggregate_gene_expression(cds, gene_module, cell_group)
 row.names(agg_mat) <- stringr::str_c("Module ", row.names(agg_mat))
 pheatmap::pheatmap(agg_mat, scale="column", clustering_method="ward.D2")

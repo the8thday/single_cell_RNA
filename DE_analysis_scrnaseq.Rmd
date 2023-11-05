@@ -58,6 +58,12 @@ head(b.interferon.response, n = 5)
 
 ## Single-cell RNA-seq analysis - Pseudobulk DE analysis with DESeq2.
 
+1. ubsetting to the cells for the cell type(s) of interest to perform the DE analysis;
+2. xtracting the raw counts after QC filtering of cells to be used for the DE analysis;
+3. Aggregating the counts and metadata to the sample level;
+4. Performing the DE analysis (Need at least two biological replicates per condition to perform the analysis, 
+5. but more replicates are recommended).
+
 对某一细胞亚群cluster做sample-level的差异表达分析。
 
 
@@ -92,6 +98,8 @@ sce <- readRDS("datasets/scRNA-seq_input_data_for_DE.rds")
 
 从Seurat对象中提取所需要的文件, 不过此处用测试数据
 ```{r}
+# 一些教程里的代码
+
 # Bring in Seurat object
 seurat <- readRDS("path/to/seurat.rds")
 
@@ -101,6 +109,7 @@ counts <- seurat@assays$RNA@counts
 metadata <- seurat@meta.data
 
 # Set up metadata as desired for aggregation and DE analysis
+# 提取对应的细胞亚群
 metadata$cluster_id <- factor(seurat@active.ident)
 
 # Create single cell experiment object

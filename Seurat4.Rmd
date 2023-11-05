@@ -37,6 +37,8 @@ library(clustree)
 
 此示例样本包括8个PBMC样本，其中4个为control组，四个为stim刺激过后的样本。
 
+本示例中没有按照每个样本进行分析，而是将每个分组的样本pool在一起，注意这只是一个测试。
+
 NOTE: You should always work with non-pooled samples from the beginning of the scRNA-seq workflow, if possible.
 
 ```{r}
@@ -507,7 +509,13 @@ FindAllMarkers函数在计算差异时将所有细胞都当作重复。一般用
 
 
 Identification of conserved markers in all conditions:
-考虑不同分组信息求的cluster比之其他cluster的差异基因; FindConservedMarkers() accepts a single cluster at a time
+考虑不同分组信息求的cluster比之其他cluster的差异基因; FindConservedMarkers() accepts a single cluster at a time.
+
+在Seurat文档中，是用到SCT做差异分析的，此处应该选择啥呢？
+
+we suggest looking for markers with large differences in expression between pct.1 and pct.2 and larger fold changes.
+
+
 ```{r}
 DefaultAssay(seurat_integrated) <- "RNA"
 
@@ -576,6 +584,39 @@ Biological replicates are necessary to proceed with this analysis. 目前的测�
 ```{r}
 # 详细内容见DE_analysis_scrnaseq.Rmd
 ```
+
+
+```{r}
+
+# Rename all identities
+seurat_integrated <- RenameIdents(object = seurat_integrated, 
+                               "0" = "Naive or memory CD4+ T cells",
+                               "1" = "CD14+ monocytes",
+                               "2" = "Activated T cells",
+                               "3" = "CD14+ monocytes",
+                               "4" = "Stressed cells / Unknown",
+                               "5" = "CD8+ T cells",
+                               "6" = "Naive or memory CD4+ T cells",
+                               "7" = "B cells",
+                               "8" = "NK cells",
+                               "9" = "CD8+ T cells",
+                               "10" = "FCGR3A+ monocytes",
+                               "11" = "B cells",
+                               "12" = "NK cells",
+                               "13" = "B cells",
+                               "14" = "Conventional dendritic cells",
+                               "15" = "Megakaryocytes",
+			       "16" = "Plasmacytoid dendritic cells")
+
+
+# Plot the UMAP
+DimPlot(object = seurat_integrated, 
+        reduction = "umap", 
+        label = TRUE,
+        label.size = 3,
+        repel = TRUE)
+```
+
 
 最后的保存
 ```{r}

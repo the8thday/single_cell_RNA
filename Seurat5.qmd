@@ -6,6 +6,7 @@ format: html
 
 ## Seurat
 
+Seurat5即将发布，折柳记录下其的一些新的特性。
 
 ```{r}
 #| message: false

@@ -27,7 +27,7 @@ MouseRNAseqData a collection of mouse data sets downloaded from GEO (Benayoun et
 这5个数据集间可以联合使用吗？
 
 
-```{r}
+```{r, include=FALSE}
 library(SingleR)
 library(SingleCellExperiment)
 library(SeuratDisk)
