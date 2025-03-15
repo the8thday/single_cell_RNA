@@ -35,10 +35,19 @@ seurat_sub <- seurat_integrated[, target_cells]
 
 
 从Seurat对象开始整理成monocle所需的输入文件
+
+```{r}
+# seurat_integrated <- harmonized_seurat
+
+seurat_integrated <- subset(harmonized_seurat, 
+                       subset = orig.ident %in% c("E3_young", "E3_old"))
+```
+
+
 ```{r}
 ##创建CDS对象并预处理数据
 data <- GetAssayData(seurat_integrated, 
-                     assay = 'RNA', slot = 'counts')
+                     assay = 'RNA', layer = 'counts')
 cell_metadata <- seurat_integrated@meta.data
 gene_annotation <- data.frame(gene_short_name = rownames(data))
 rownames(gene_annotation) <- rownames(data)
@@ -50,13 +59,19 @@ cds <- new_cell_data_set(data,
 
 #preprocess_cds函数相当于seurat中NormalizeData+ScaleData+RunPCA
 cds <- preprocess_cds(cds, num_dim = 50, method = 'PCA', norm_method = 'log')
+
+plot_pc_variance_explained(cds)
+
+# 去批次，按照需求来
+# cds <- align_cds(cds, alignment_group = 'batch')
+
 #umap降维
 cds <- reduce_dimension(cds, 
                         preprocess_method = "PCA",
                         reduction_method = 'UMAP'
                         )
 
-p1 <- plot_cells(cds, reduction_method="UMAP", color_cells_by="integrated_snn_res.0.8") + 
+p1 <- plot_cells(cds, reduction_method="UMAP", color_cells_by="cell_type") + 
   ggtitle('cds.umap')
 
 ##从seurat导入整合过的umap坐标
@@ -64,17 +79,33 @@ cds.embed <- cds@int_colData$reducedDims$UMAP
 int.embed <- Embeddings(seurat_integrated, reduction = "umap")
 int.embed <- int.embed[rownames(cds.embed),]
 cds@int_colData$reducedDims$UMAP <- int.embed
-p2 <- plot_cells(cds, reduction_method="UMAP", color_cells_by="integrated_snn_res.0.8") + 
+
+# 将Seurat的UMAP坐标转移到Monocle对象
+# cds@reducedDims$UMAP <- seurat_obj@reductions$umap@cell.embeddings
+
+
+p2 <- plot_cells(cds, reduction_method="UMAP", 
+                 color_cells_by="cell_type") + 
   ggtitle('int.umap')
 
 p1 + p2
 ```
 
+```{r}
+#| eval: false
+
+# 开发者建议在colData中增加批次信息
+plot_cells(cds, color_cells_by="orig.ident", label_cell_groups=FALSE)
+cds <- align_cds(cds, num_dim = 100, alignment_group = "orig.ident")
+cds <- reduce_dimension(cds)
+plot_cells(cds, color_cells_by="orig.ident", label_cell_groups=FALSE)
+```
 
 
 ```{r}
 ## Monocle3聚类分区
 cds <- cluster_cells(cds)
+
 pp1 <- plot_cells(cds, show_trajectory_graph = FALSE) + ggtitle("label by clusterID")
 pp2 <- plot_cells(cds, color_cells_by = "partition", show_trajectory_graph = FALSE) + 
         ggtitle("label by partitionID")
@@ -82,14 +113,44 @@ p = patchwork::wrap_plots(pp1, pp2)
 p
 ```
 
+```{r}
+# 
+
+# 找出每个簇表达的标记基因
+marker_test_res <- top_markers(cds, group_cells_by="partition", 
+                               reference_cells=1000, cores=8)
+top_specific_markers <- marker_test_res %>%
+                            filter(fraction_expressing >= 0.10) %>%
+                            group_by(cell_group) %>%
+                            top_n(3, pseudo_R2) #pseudo_R2是一种排序方法
+top_specific_marker_ids <- unique(top_specific_markers %>%
+                                    pull(gene_id))
+plot_genes_by_group(cds,
+                    top_specific_marker_ids,
+                    group_cells_by="partition",
+                    ordering_type="maximal_on_diag",
+                    max.size=3)
+```
+
+
+
+```{r}
+# 若有细胞群分的不明显
+# 不过上面用了Seurat的数据，这些都可以先不考虑
+
+cds_subset <- choose_cells(cds)
+```
 
 
 
 ```{r}
 ## 识别轨迹
 cds <- learn_graph(cds)
-plot_cells(cds, label_groups_by_cluster = FALSE, label_leaves = FALSE, 
+
+p <- plot_cells(cds, label_groups_by_cluster = FALSE, label_leaves = FALSE, 
                label_branch_points = FALSE)
+
+p
 ```
 
 
@@ -107,36 +168,194 @@ get_earliest_principal_node <- function(cds, time_bin="130-170"){
   
   root_pr_nodes
 }
+
+
+# 以下是官网给的代码
+# time_bin 官网设定是130-170
+get_earliest_principal_node <- function(cds, time_bin="2"){
+  cell_ids <- which(colData(cds)[, "seurat_clusters"] == time_bin)
+  
+  closest_vertex <-cds@principal_graph_aux[["UMAP"]]$pr_graph_cell_proj_closest_vertex
+  closest_vertex <- as.matrix(closest_vertex[colnames(cds), ])
+  root_pr_nodes <- igraph::V(principal_graph(cds)[["UMAP"]])$name[as.numeric(names(which.max(table(closest_vertex[cell_ids,]))))]
+  root_pr_nodes
+}
+# cds <- order_cells(cds, 
+#                    root_pr_nodes=get_earliest_principal_node(cds))
+# 
+# plot_cells(cds, color_cells_by = "pseudotime",
+#            label_cell_groups=FALSE,label_leaves=FALSE,
+#            label_branch_points=FALSE,graph_label_size=1.5)
 ```
 
+
+root cell的选择
 ```{r}
 ##细胞按拟时排序
 cds <- order_cells(cds) # 选择root细胞也不能太主观。。
 # p + geom_vline(xintercept = seq(-7,-6,0.25)) + geom_hline(yintercept = seq(0,1,0.25))
 embed <- data.frame(Embeddings(seurat_integrated, reduction = "umap"))
-embed <- subset(embed, UMAP_1 > -6.75 & UMAP_1 < -6.5 & UMAP_2 > 0.24 & UMAP_2 < 0.25)
+
+embed <- subset(embed, umap_1 > -10 & umap_1 < -5 & umap_2 > 2 & umap_2 < 6)
 root.cell <- rownames(embed)
 
+
+```
+
+```{r}
 cds <- order_cells(cds, root_cells = root.cell)
 plot_cells(cds, color_cells_by = "pseudotime", label_cell_groups = FALSE, 
            label_leaves = FALSE,  label_branch_points = FALSE)
 ```
 
+```{r}
+# 这种方法的关键在于在同一轨迹中用不同颜色标记年龄组，直观展示年龄差异在分化轨迹中的分布。如果发现某些分支或状态有明显的年龄偏好，那可能就是老化影响的关键点。
+p2 <- plot_cells(cds,
+             color_cells_by = "pseudotime",
+             label_cell_groups = FALSE,
+             label_leaves = FALSE,
+             label_branch_points = FALSE)
+
+p1 <- plot_cells(cds,
+             color_cells_by = "age",
+             label_groups_by_cluster = FALSE,
+             label_leaves = FALSE,
+             label_branch_points = TRUE)
+# 确保元数据列是因子类型
+cds$age <- as.factor(cds$age)
+
+# 动态颜色映射
+color_palette <- c("young" = "#1F77B4", "old" = "#FF7F0E")
+
+
+# 高级图例控制
+p1 <- p + 
+  scale_color_manual(
+    name = "Age",          # 图例标题
+    values = color_palette,
+    breaks = levels(cds$age)  # 确保所有分组显示
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = c(0.85, 0.2),  # 精确控制图例位置 (x,y 坐标)
+    legend.key.size = unit(0.5, "cm")
+  )
+
+# 按细胞群可视化
+  p3 <- plot_cells(cds,
+             color_cells_by = "cluster",
+             label_groups_by_cluster = TRUE,
+             label_leaves = FALSE,
+             label_branch_points = FALSE)
+  
+p1 + p2 + p3 + plot_layout(ncol = 3)
+```
+
+
+```{r}
+# 分析年龄差异
+
+# ============= 5. 年龄分布分析 =============
+analyze_age_distribution <- function(cds) {
+  # 通过partition自动划分轨迹
+  cds <- cluster_cells(cds)
+  part_assignments <- partitions(cds)
+  
+  # 查看每个分区中young和old细胞的数量和比例
+  part_by_age <- table(part_assignments, cds$age)
+  part_age_prop <- prop.table(part_by_age, margin = 1)
+  
+  # 轨迹上每个节点的年龄组成
+  # 提取主图
+  # prin_graph <- principal_graph(cds)[[1]]
+  prin_graph <- principal_graph(cds)[["UMAP"]]
+  
+  # 计算每个细胞离图中最近的点
+  # closest_vertex <- cds@principal_graph_aux$UMAP$pr_graph_cell_proj_closest_vertex
+  closest_vertex <- as.character(cds@principal_graph_aux$UMAP$pr_graph_cell_proj_closest_vertex[,1])
+  
+  # 统计每个顶点附近的年龄分布
+  vertex_age_counts <- table(closest_vertex, cds$age)
+  vertex_age_prop <- prop.table(vertex_age_counts, margin = 1)
+  
+  # 可视化 - 创建一个数据框用于ggplot
+  vertex_df <- as.data.frame(vertex_age_prop)
+  colnames(vertex_df) <- c("vertex", "age", "proportion")
+  vertex_df$vertex <- as.numeric(as.character(vertex_df$vertex))
+  
+  # 为每个顶点获取坐标
+  # vertex_coords <- igraph::V(prin_graph)$coordinates
+  vertex_coords <- t(cds@principal_graph_aux$UMAP$dp_mst)  # 这是包含所有顶点坐标的矩阵
+  colnames(vertex_coords) <- c("x", "y")
+  
+  vertex_coords_df <- data.frame(
+    vertex = as.character(1:nrow(vertex_coords)),  # 生成顶点ID
+    x = vertex_coords[,1],
+    y = vertex_coords[,2]
+  )
+  
+  
+  vertex_df$x <- vertex_coords[vertex_df$vertex, 1]
+  vertex_df$y <- vertex_coords[vertex_df$vertex, 2]
+  
+  # 按年龄比例为顶点着色的散点图
+  vertex_plot <- ggplot(vertex_df %>% filter(age == "old"), 
+                      aes(x = x, y = y, size = proportion, color = proportion)) +
+    geom_point() +
+    scale_color_gradient(low = "yellow", high = "red") +
+    ggtitle("Proportion of old cells at each trajectory point") +
+    theme_classic()
+  
+  # 用于基于伪时间的年龄分布
+  pseudotime_df <- data.frame(
+    pseudotime = pseudotime(cds),
+    age = cds$age
+  )
+  
+  # 伪时间密度图
+  density_plot <- ggplot(pseudotime_df, aes(x = pseudotime, fill = age)) +
+    geom_density(alpha = 0.5) +
+    scale_fill_manual(values = c("young" = "cornflowerblue", "old" = "firebrick")) +
+    ggtitle("Pseudotime distribution by age") +
+    theme_classic()
+  
+  return(list(
+    partition_table = part_by_age,
+    partition_proportions = part_age_prop,
+    vertex_age_counts = vertex_age_counts,
+    vertex_age_proportions = vertex_age_prop,
+    vertex_plot = vertex_plot,
+    density_plot = density_plot
+  ))
+}
+
+
+age_res <- analyze_age_distribution(cds)
+```
+
+
 
 
 寻找拟时轨迹差异基因
+超级需要资源，注意⚠️
 ```{r}
 ##寻找拟时轨迹差异基因
 #graph_test分析最重要的结果是莫兰指数（morans_I），其值在-1至1之间，0代表此基因没有
 #空间共表达效应，1代表此基因在空间距离相近的细胞中表达值高度相似。
 Track_genes <- graph_test(cds, neighbor_graph="principal_graph", cores=4)
+
+
+```
+
+
+```{r}
 #挑选top10画图展示
 # 对于基因的挑选可以按照具体的研究问题
 Track_genes_sig <- Track_genes %>% top_n(n=10, morans_I) %>%
                    pull(gene_short_name) %>% as.character()
 #基因表达趋势图
 plot_genes_in_pseudotime(cds[Track_genes_sig,], 
-                         color_cells_by="integrated_snn_res.0.8", 
+                         color_cells_by="cell_type", 
                          min_expr=0.5, ncol = 2)
 
 #FeaturePlot图
@@ -144,17 +363,32 @@ plot_cells(cds, genes=Track_genes_sig, show_trajectory_graph=FALSE,
                label_cell_groups=FALSE,  label_leaves=FALSE)
 
 
-##寻找共表达模块
-genelist <- pull(Track_genes, gene_short_name) %>% as.character()
-gene_module <- find_gene_modules(cds[genelist,], resolution=1e-2, cores = 6)
-cell_group <- tibble::tibble(cell=row.names(colData(cds)), 
-                             cell_group=colData(cds)$integrated_snn_res.0.8)
-
-agg_mat <- aggregate_gene_expression(cds, gene_module, cell_group)
-row.names(agg_mat) <- stringr::str_c("Module ", row.names(agg_mat))
-pheatmap::pheatmap(agg_mat, scale="column", clustering_method="ward.D2")
 
 ```
+
+```{r}
+##寻找共表达模块
+## 如果只关注某些细胞亚群的话
+cds_test <- cds[,grepl("B", colData(cds)$assigned_cell_type, ignore.case=TRUE)]
+
+deg_ids <- subset(Track_genes, q_value < 0.05)
+genelist <- pull(deg_ids, gene_short_name) %>% as.character()
+gene_module <- find_gene_modules(cds[genelist,], resolution=1e-2, cores = 6)
+cell_group <- tibble::tibble(cell=row.names(colData(cds)), 
+                             cell_group=colData(cds)$cell_type)
+
+
+agg_mat <- aggregate_gene_expression(cds, gene_module, cell_group)
+
+row.names(agg_mat) <- stringr::str_c("Module ", row.names(agg_mat))
+
+pheatmap::pheatmap(agg_mat, 
+                   scale="column", 
+                   fontsize_row = 4, 
+                   clustering_method="ward.D2")
+```
+
+
 
 
 一个小报错：

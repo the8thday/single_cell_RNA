@@ -16,11 +16,611 @@ library(Seurat)
 
 
 
+```{r}
+# 皮层类器官单细胞RNA测序数据分析流程 (使用Seurat V5)
+# 五个分组: E3_young，E3_old，E4_young，E4_old，Ctrl_young
+
+# 加载必要的包
+library(Seurat) # v5.0.0或更高版本
+library(SeuratObject)
+library(SeuratWrappers)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(scater)
+library(scDblFinder) # 用于双细胞检测
+library(glmGamPoi) # 用于更快的差异表达分析
+library(harmony) # 用于批次效应校正
+library(scCATCH) # 用于细胞注释
+library(SingleR) # 用于细胞注释的替代方法
+library(celldex) # 提供参考数据集
+library(enrichR) # 富集分析
+library(MAST) # 另一种差异表达分析方法
+library(future) # 并行计算
+
+# 设置并行计算
+plan("multicore", workers = 8) # 根据您的计算资源调整
+options(future.globals.maxSize = 100 * 1024^3) # 增加内存限制
+
+# 假设数据路径
+data_dirs <- c(
+  "E3_young" = "path/to/E3_young/",
+  "E3_old" = "path/to/E3_old/",
+  "E4_young" = "path/to/E4_young/",
+  "E4_old" = "path/to/E4_old/",
+  "Ctrl_young" = "path/to/Ctrl_young/"
+)
+
+#-----------------------------------------------------------------------------
+# 1. 数据读取与初步处理
+#-----------------------------------------------------------------------------
+# 创建一个空列表存储Seurat对象
+seurat_objects <- list()
+
+# 读取每个样本的数据并创建Seurat对象
+for (sample_name in names(data_dirs)) {
+  # 假设使用10x Genomics格式
+  data <- Read10X(data.dir = data_dirs[[sample_name]])
+  
+  # 创建Seurat对象
+  seurat_obj <- CreateSeuratObject(
+    counts = data,
+    project = sample_name,
+    min.cells = 3, # 至少被3个细胞表达的基因
+    min.features = 200 # 至少表达200个基因的细胞
+  )
+  
+  # 添加样本信息到元数据
+  seurat_obj$sample <- sample_name
+  
+  # 提取分组信息
+  seurat_obj$condition <- ifelse(grepl("old", sample_name), "old", "young")
+  seurat_obj$genotype <- ifelse(grepl("E3", sample_name), "E3",
+                          ifelse(grepl("E4", sample_name), "E4", "Ctrl"))
+  
+  # 计算线粒体基因比例
+  seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^MT-")
+  
+  # 计算核糖体基因比例
+  seurat_obj[["percent.rb"]] <- PercentageFeatureSet(seurat_obj, pattern = "^RP[SL]")
+  
+  # 存储到列表
+  seurat_objects[[sample_name]] <- seurat_obj
+}
+
+# 查看每个样本的细胞数
+cell_counts <- sapply(seurat_objects, ncol)
+print(cell_counts)
+
+#-----------------------------------------------------------------------------
+# 2. 质量控制
+#-----------------------------------------------------------------------------
+# 查看质控指标的分布
+for (sample_name in names(seurat_objects)) {
+  p1 <- VlnPlot(seurat_objects[[sample_name]], 
+                features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.rb"),
+                ncol = 4, pt.size = 0)
+  print(p1 + ggtitle(sample_name))
+}
+
+# 根据质控指标筛选细胞
+for (sample_name in names(seurat_objects)) {
+  seurat_objects[[sample_name]] <- subset(
+    seurat_objects[[sample_name]],
+    subset = nFeature_RNA > 500 & 
+             nFeature_RNA < 6000 & 
+             percent.mt < 20
+  )
+}
+
+# 双细胞检测（可选）
+for (sample_name in names(seurat_objects)) {
+  # 将Seurat对象转换为SingleCellExperiment
+  sce <- as.SingleCellExperiment(seurat_objects[[sample_name]])
+  
+  # 识别可能的双细胞
+  dbl_results <- scDblFinder(sce)
+  
+  # 将结果添加到Seurat对象
+  seurat_objects[[sample_name]]$doublet_score <- dbl_results$scDblFinder.score
+  seurat_objects[[sample_name]]$doublet_class <- dbl_results$scDblFinder.class
+  
+  # 剔除预测为双细胞的细胞
+  seurat_objects[[sample_name]] <- subset(
+    seurat_objects[[sample_name]],
+    subset = doublet_class == "singlet"
+  )
+}
+
+#-----------------------------------------------------------------------------
+# 3. 整合所有样本
+#-----------------------------------------------------------------------------
+# 合并所有Seurat对象
+merged_seurat <- merge(
+  x = seurat_objects[[1]],
+  y = seurat_objects[-1],
+  add.cell.ids = names(seurat_objects),
+  project = "cortical_organoid"
+)
+
+# 检查合并后的对象
+print(merged_seurat)
+
+#-----------------------------------------------------------------------------
+# 4. 标准化和特征选择
+#-----------------------------------------------------------------------------
+# 使用SCTransform进行标准化（最新的推荐方法）
+merged_seurat <- SCTransform(
+  merged_seurat,
+  method = "glmGamPoi", # 更快的算法
+  vars.to.regress = c("percent.mt"), # 回归掉线粒体基因的影响
+  variable.features.n = 3000, # 可变基因数量
+  verbose = TRUE
+)
+
+# 选择高可变基因（如果使用NormalizeData而不是SCTransform）
+# merged_seurat <- NormalizeData(merged_seurat)
+# merged_seurat <- FindVariableFeatures(merged_seurat, nfeatures = 3000)
+
+#-----------------------------------------------------------------------------
+# 5. 批次效应校正
+#-----------------------------------------------------------------------------
+# 使用Harmony进行批次效应校正
+merged_seurat <- RunPCA(merged_seurat, verbose = FALSE)
+merged_seurat <- RunHarmony(
+  merged_seurat,
+  group.by.vars = c("sample"), # 按样本进行批次校正
+  reduction = "pca",
+  assay.use = "SCT",
+  project.dim = FALSE
+)
+
+# 查看批次校正效果
+p1 <- DimPlot(merged_seurat, reduction = "pca", group.by = "sample") + ggtitle("PCA")
+p2 <- DimPlot(merged_seurat, reduction = "harmony", group.by = "sample") + ggtitle("Harmony")
+p1 + p2
+
+#-----------------------------------------------------------------------------
+# 6. 降维、聚类和可视化
+#-----------------------------------------------------------------------------
+# 使用校正后的Harmony结果进行下游分析
+merged_seurat <- RunUMAP(merged_seurat, reduction = "harmony", dims = 1:30)
+merged_seurat <- FindNeighbors(merged_seurat, reduction = "harmony", dims = 1:30)
+
+# 尝试不同的分辨率进行聚类
+resolutions <- c(0.2, 0.4, 0.6, 0.8, 1.0, 1.2)
+for (res in resolutions) {
+  merged_seurat <- FindClusters(merged_seurat, resolution = res)
+}
+
+# 默认使用0.8的分辨率
+Idents(merged_seurat) <- "SCT_snn_res.0.8"
+
+# 可视化聚类结果
+p1 <- DimPlot(merged_seurat, reduction = "umap", label = TRUE) + ggtitle("Clusters")
+p2 <- DimPlot(merged_seurat, reduction = "umap", group.by = "sample") + ggtitle("Sample")
+p3 <- DimPlot(merged_seurat, reduction = "umap", group.by = "condition") + ggtitle("Condition")
+p4 <- DimPlot(merged_seurat, reduction = "umap", group.by = "genotype") + ggtitle("Genotype")
+
+p1 + p2
+p3 + p4
+
+#-----------------------------------------------------------------------------
+# 7. 细胞类型注释
+#-----------------------------------------------------------------------------
+# 方法1: 使用已知的标记基因（手动注释）
+# 定义神经细胞类型的标记基因
+neural_markers <- list(
+  # 神经干细胞和祖细胞
+  "Neural stem cells" = c("SOX2", "PAX6", "NES", "VIM", "HES1", "NOTCH1"),
+  "Radial glia" = c("FABP7", "GFAP", "SOX2", "PAX6", "VIM", "HOPX", "PTPRZ1"),
+  "Intermediate progenitors" = c("EOMES", "NEUROG1", "NEUROG2", "NHLH1", "ASCL1"),
+  
+  # 神经元
+  "Excitatory neurons" = c("SLC17A7", "GRIN1", "NEUROD2", "NEUROD6", "NRGN", "SATB2"),
+  "Inhibitory neurons" = c("GAD1", "GAD2", "DLX1", "DLX2", "DLX5", "DLX6", "LHX6"),
+  "Immature neurons" = c("DCX", "STMN2", "TUBB3", "MAP2", "NEUROD1"),
+  "Cajal-Retzius cells" = c("RELN", "CALB2", "LHX5", "NDNF"),
+  
+  # 胶质细胞
+  "Astrocytes" = c("GFAP", "AQP4", "S100B", "ALDH1L1", "APOE", "GJA1"),
+  "Oligodendrocytes" = c("OLIG1", "OLIG2", "MBP", "MOG", "MAG", "PLP1"),
+  "OPCs" = c("PDGFRA", "CSPG4", "OLIG2", "OLIG1"),
+  "Microglia" = c("CX3CR1", "P2RY12", "C1QA", "C1QB", "PTPRC", "AIF1"),
+  
+  # 皮层层特异性标记
+  "Layer I" = c("RELN", "LHX5", "NDNF"),
+  "Layer II/III" = c("CUX1", "CUX2", "LAMP5", "CALB1", "UNC5D"),
+  "Layer IV" = c("RORB", "RSPO1", "CARTPT"),
+  "Layer V" = c("BCL11B", "ETV1", "FEZF2", "FOXP2", "PCP4"),
+  "Layer VI" = c("FOXP2", "TLE4", "DARPP32", "CTGF", "NR4A2"),
+  "Subplate" = c("CTGF", "NR4A2", "NURR1"),
+  
+  # 皮层区域特定标记
+  "Dorsal cortex" = c("EMX1", "EMX2", "PAX6", "LHX2"),
+  "Ventral cortex" = c("GSX2", "DLX1", "DLX2"),
+  
+  # 其他脑区细胞
+  "Choroid plexus" = c("TTR", "HTR2C", "AQP1", "CLIC6", "FOXJ1"),
+  "Ependymal cells" = c("FOXJ1", "PIFO", "AQP4", "S100B"),
+  "Meningeal cells" = c("DCN", "LUM", "COL1A1", "COL1A2"),
+  "Endothelial cells" = c("CLDN5", "PECAM1", "VWF", "FLT1"),
+  "Pericytes" = c("PDGFRB", "ACTA2", "MCAM", "RGS5"),
+  "Microglia" = c("CX3CR1", "P2RY12", "C1QA", "AIF1", "PTPRC")
+)
+
+# 查看标记基因在UMAP上的表达
+for (cell_type in names(neural_markers)) {
+  # 过滤掉不在数据集中的基因
+  valid_markers <- intersect(neural_markers[[cell_type]], rownames(merged_seurat))
+  
+  if (length(valid_markers) > 0) {
+    print(paste("Plotting markers for:", cell_type))
+    p <- FeaturePlot(
+      merged_seurat,
+      features = valid_markers,
+      ncol = 3,
+      reduction = "umap"
+    )
+    print(p + plot_annotation(title = cell_type))
+  }
+}
+
+# 计算每个聚类中标记基因的平均表达
+avg_exp <- AverageExpression(
+  merged_seurat,
+  assays = "SCT",
+  features = unique(unlist(neural_markers)),
+  return.seurat = TRUE
+)
+
+# 绘制热图
+DoHeatmap(
+  avg_exp,
+  features = unique(unlist(neural_markers)),
+  size = 3,
+  draw.lines = TRUE
+)
+
+# 方法2: 使用scCATCH进行自动细胞类型注释
+# 准备scCATCH输入数据
+cluster_markers <- FindAllMarkers(
+  merged_seurat,
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+
+# 使用scCATCH进行注释
+sccatch_results <- scCATCH(
+  object = cluster_markers,
+  species = "Human",
+  tissue = "Brain",
+  cancer = FALSE,
+  use_method = "rank"
+)
+
+# 打印注释结果
+print(sccatch_results$anno)
+
+# 方法3: 使用SingleR进行注释
+# 准备参考数据集
+ref_data <- celldex::HumanPrimaryCellAtlasData()
+
+# 获取表达矩阵
+expr_matrix <- GetAssayData(merged_seurat, slot = "data", assay = "SCT")
+
+# 使用SingleR进行注释
+singler_results <- SingleR(
+  test = expr_matrix,
+  ref = ref_data,
+  labels = ref_data$label.main,
+  method = "cluster",
+  clusters = Idents(merged_seurat)
+)
+
+# 打印SingleR注释结果
+print(singler_results)
+
+# 将SingleR结果添加到Seurat对象
+merged_seurat$singler_labels <- singler_results$labels[match(Idents(merged_seurat), rownames(singler_results))]
+
+# 可视化SingleR注释结果
+DimPlot(merged_seurat, reduction = "umap", group.by = "singler_labels", label = TRUE) + 
+  ggtitle("SingleR Cell Type Annotation")
+
+# 整合多种注释方法并手动确认
+# 根据标记基因表达、scCATCH和SingleR结果，手动为每个聚类分配最终的细胞类型
+# 这需要专业知识和对结果的仔细检查
+
+# 创建一个最终的注释向量 (这里只是示例，需要根据实际结果调整)
+cell_type_final <- c(
+  "0" = "Radial glia",
+  "1" = "Excitatory neurons",
+  "2" = "Neural progenitors",
+  "3" = "Immature neurons",
+  "4" = "Inhibitory neurons",
+  "5" = "Astrocytes",
+  "6" = "Intermediate progenitors",
+  "7" = "OPCs",
+  "8" = "Endothelial cells",
+  "9" = "Microglia"
+  # 根据聚类数量继续添加
+)
+
+# 将最终注释添加到Seurat对象
+merged_seurat$cell_type <- cell_type_final[as.character(Idents(merged_seurat))]
+
+# 可视化最终的细胞类型注释
+DimPlot(merged_seurat, reduction = "umap", group.by = "cell_type", label = TRUE) + 
+  ggtitle("Final Cell Type Annotation")
+
+#-----------------------------------------------------------------------------
+# 8. 差异表达分析
+#-----------------------------------------------------------------------------
+# 设置细胞类型为默认标识
+Idents(merged_seurat) <- "cell_type"
+
+# 每个细胞类型中老年vs年轻的差异
+de_results <- list()
+
+for (cell_type in unique(merged_seurat$cell_type)) {
+  # 提取特定细胞类型
+  cell_subset <- subset(merged_seurat, idents = cell_type)
+  
+  # 设置条件为标识
+  Idents(cell_subset) <- "condition"
+  
+  # 进行差异表达分析 (old vs young)
+  if (length(unique(cell_subset$condition)) > 1) {
+    de <- FindMarkers(
+      cell_subset,
+      ident.1 = "old",
+      ident.2 = "young",
+      test.use = "MAST", # 使用MAST作为测试方法
+      assay = "SCT",
+      min.pct = 0.1,
+      logfc.threshold = 0.25
+    )
+    
+    # 添加细胞类型信息
+    de$cell_type <- cell_type
+    
+    # 存储结果
+    de_results[[cell_type]] <- de
+  }
+}
+
+# 合并所有差异表达结果
+all_de <- do.call(rbind, de_results)
+
+# 每个基因型中的差异表达
+genotypes <- unique(merged_seurat$genotype)
+de_genotype <- list()
+
+for (cell_type in unique(merged_seurat$cell_type)) {
+  # 提取特定细胞类型
+  cell_subset <- subset(merged_seurat, idents = cell_type)
+  
+  # 设置基因型为标识
+  Idents(cell_subset) <- "genotype"
+  
+  # 进行成对比较
+  for (i in 1:(length(genotypes)-1)) {
+    for (j in (i+1):length(genotypes)) {
+      # 检查两种基因型是否都存在
+      if (genotypes[i] %in% unique(cell_subset$genotype) && 
+          genotypes[j] %in% unique(cell_subset$genotype)) {
+        
+        comparison_name <- paste(genotypes[i], "vs", genotypes[j], "in", cell_type)
+        
+        de <- FindMarkers(
+          cell_subset,
+          ident.1 = genotypes[i],
+          ident.2 = genotypes[j],
+          test.use = "MAST",
+          assay = "SCT",
+          min.pct = 0.1,
+          logfc.threshold = 0.25
+        )
+        
+        # 添加比较信息
+        de$comparison <- comparison_name
+        de$cell_type <- cell_type
+        
+        # 存储结果
+        de_genotype[[comparison_name]] <- de
+      }
+    }
+  }
+}
+
+# 合并所有基因型比较结果
+all_de_genotype <- do.call(rbind, de_genotype)
+
+#-----------------------------------------------------------------------------
+# 9. 功能富集分析
+#-----------------------------------------------------------------------------
+# 为每个差异表达分析结果进行富集分析
+# 首先设置enrichr数据库
+enrichr_dbs <- c(
+  "GO_Biological_Process_2021",
+  "GO_Molecular_Function_2021",
+  "GO_Cellular_Component_2021",
+  "KEGG_2021_Human",
+  "Reactome_2022",
+  "WikiPathways_2019_Human"
+)
+
+# 对老年vs年轻的差异表达进行富集分析
+enrichment_results <- list()
+
+for (cell_type in names(de_results)) {
+  # 获取上调基因 (logFC > 0, p_val_adj < 0.05)
+  upregulated <- rownames(subset(de_results[[cell_type]], avg_log2FC > 0 & p_val_adj < 0.05))
+  
+  # 获取下调基因 (logFC < 0, p_val_adj < 0.05)
+  downregulated <- rownames(subset(de_results[[cell_type]], avg_log2FC < 0 & p_val_adj < 0.05))
+  
+  # 对上调基因进行富集分析
+  if (length(upregulated) > 0) {
+    up_enriched <- enrichr(upregulated, enrichr_dbs)
+    up_enriched <- lapply(up_enriched, function(x) {
+      x$direction <- "upregulated"
+      x$cell_type <- cell_type
+      return(x)
+    })
+    enrichment_results[[paste0(cell_type, "_up")]] <- up_enriched
+  }
+  
+  # 对下调基因进行富集分析
+  if (length(downregulated) > 0) {
+    down_enriched <- enrichr(downregulated, enrichr_dbs)
+    down_enriched <- lapply(down_enriched, function(x) {
+      x$direction <- "downregulated"
+      x$cell_type <- cell_type
+      return(x)
+    })
+    enrichment_results[[paste0(cell_type, "_down")]] <- down_enriched
+  }
+}
+
+# 同样对基因型比较也进行富集分析
+# (代码类似，此处省略)
+
+#-----------------------------------------------------------------------------
+# 10. 轨迹分析（可选）
+#-----------------------------------------------------------------------------
+# 如果想研究细胞发育轨迹，可以使用Monocle3或Slingshot
+# 这里使用Monocle3进行轨迹分析
+
+library(monocle3)
+library(SeuratWrappers)
+
+# 转换为CellDataSet对象
+cds <- as.cell_data_set(merged_seurat)
+cds <- cluster_cells(cds, resolution = 0.001)
+
+# 学习轨迹
+cds <- learn_graph(cds, use_partition = TRUE)
+
+# 排序细胞（需要指定起始点，这里假设用神经干细胞作为起点）
+# 首先找到富含神经干细胞的聚类
+cds <- order_cells(cds, root_cells = colnames(cds)[cds@colData$cell_type == "Neural stem cells"])
+
+# 可视化轨迹
+plot_cells(
+  cds,
+  color_cells_by = "pseudotime",
+  label_cell_groups = FALSE,
+  label_leaves = FALSE,
+  label_branch_points = FALSE
+)
+
+#-----------------------------------------------------------------------------
+# 11. 保存结果
+#-----------------------------------------------------------------------------
+# 保存Seurat对象
+saveRDS(merged_seurat, "cortical_organoid_analysis.rds")
+
+# 保存差异表达结果
+write.csv(all_de, "de_age_all_cell_types.csv")
+write.csv(all_de_genotype, "de_genotype_all_cell_types.csv")
+
+# 为主要结果创建可视化图
+# 创建包含所有重要图形的PDF
+pdf("cortical_organoid_analysis_figures.pdf", width = 12, height = 10)
+
+# UMAP聚类
+print(DimPlot(merged_seurat, reduction = "umap", label = TRUE) + ggtitle("Clusters"))
+
+# 各种分组的UMAP
+print(DimPlot(merged_seurat, reduction = "umap", group.by = "sample") + ggtitle("Sample"))
+print(DimPlot(merged_seurat, reduction = "umap", group.by = "condition") + ggtitle("Condition"))
+print(DimPlot(merged_seurat, reduction = "umap", group.by = "genotype") + ggtitle("Genotype"))
+
+# 细胞类型注释
+print(DimPlot(merged_seurat, reduction = "umap", group.by = "cell_type", label = TRUE) + 
+      ggtitle("Cell Type Annotation"))
+
+# 主要细胞标记基因
+for (cell_type in unique(merged_seurat$cell_type)) {
+  markers <- FindMarkers(merged_seurat, ident.1 = cell_type, only.pos = TRUE, min.pct = 0.25)
+  top_markers <- rownames(markers)[1:min(5, nrow(markers))]
+  
+  if (length(top_markers) > 0) {
+    p <- FeaturePlot(merged_seurat, features = top_markers, ncol = 3)
+    print(p + plot_annotation(title = paste0("Top markers for ", cell_type)))
+  }
+}
+
+# 关闭PDF
+dev.off()
+
+# 创建一个HTML报告（可选）
+# 可以使用R Markdown创建一个包含分析结果的详细报告
+```
 
 
 
 
 
+Seurat V5 中的 TransferData 用于在单细胞 RNA-seq 数据集之间进行细胞类型注释、数据整合、交叉数据集分析，以及其他多模态数据集之间的信息转移。它的核心原理是通过找到参考数据集和目标数据集之间的共同特征或结构（锚点，anchors），将参考数据集中的信息（如细胞类型、基因表达等）转移到目标数据集中。TransferData 通常与 FindTransferAnchors 配合使用。FindTransferAnchors 负责识别两个数据集之间的锚点，TransferData 则负责通过这些锚点将参考数据中的信息传递到目标数据集。选择参考数据集：首先，你需要一个带有已知注释（例如细胞类型）的参考数据集。目标数据集：这是你希望注释或整合的目标数据集。找到锚点：使用 FindTransferAnchors 函数找到两个数据集之间的共同结构。转移注释：使用 TransferData 函数将参考数据中的注释信息（如细胞类型或其他特征）传递到目标数据集中。
+
+
+```{r}
+# 准备待注释数据,确保数据只有一个 layers。
+seob <- JoinLayers(seob, assay ="RNA")
+
+# 准备参考数据集
+## 1. 查看可用数据集
+library(SeuratData)
+AvailableData() -> temp
+
+## 2. 安装数据集
+## InstallData("pbmc3k")
+## install.packages("pbmc3k.SeuratData_3.1.4.tar.gz", repos = NULL, type = "source")
+
+## 3. 加载数据集
+pbmc3k <- LoadData("pbmc3k")
+
+## 4. 更新到 V5 格式
+pbmc3k <- UpdateSeuratObject(pbmc3k)
+
+# 处理参考数据集
+library(tidyverse)
+pbmc3k <- SCTransform(object = pbmc3k) %>%
+RunPCA(verbose = FALSE) %>%
+RunUMAP(dims = 1:30, verbose = FALSE)
+
+# 自动注释
+## 找到锚点：是在两个数据集中找到相似的细胞，计算它们的相似性锚点。
+anchors <- FindTransferAnchors(
+reference = pbmc3k, # 参考数据集
+query = seob,# 目标数据集
+normalization.method ="SCT", # SCTransform 标准化
+reference.reduction ="pca",
+dims = 1:30# 使用 PCA 的前 30 个主成分
+)
+
+## 传递注释：将参考数据集中的细胞类型注释转移到目标数据集中
+transfer <- TransferData(
+ anchorset = anchors,
+ refdata = pbmc3k$seurat_annotations,# 参考数据集中的细胞类型注释
+ dims = 1:30)
+
+## 添加注释
+seob <- AddMetaData(
+ seob,
+ metadata = transfer,
+col.name ="predicted.id")
+
+# 可视化
+DimPlot(seob, 
+        reduction = "umap", 
+        group.by  = c("seurat_clusters", "predicted.id"),
+        label = T) 
+```
 
 
 

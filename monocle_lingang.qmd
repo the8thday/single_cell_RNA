@@ -1,0 +1,388 @@
+---
+title: "monocle3"
+format: html
+---
+
+## 
+
+
+```{r}
+# 类器官单细胞轨迹分析 (E3/E4 Young vs Old)
+# 本脚本分析同一基因型(E3和E4)在不同年龄阶段的类器官细胞分化轨迹
+
+# ============= 1. 环境准备与数据加载 =============
+library(Seurat)
+library(monocle3)
+library(slingshot)
+library(ggplot2)
+library(dplyr)
+library(SingleCellExperiment)
+library(RColorBrewer)
+library(patchwork)
+
+# 设置随机种子确保结果可重复
+set.seed(42)
+
+# 假设您已经有了预处理过的Seurat对象
+# 如果没有，请先完成以下步骤：数据读取、质控、标准化、批次校正等
+# seurat_obj <- readRDS("path/to/your/seurat_object.rds")
+
+# 也可以从原始数据开始处理
+# 读取E3和E4两种基因型的年轻和老年类器官数据
+load_data <- function() {
+  # 替换为您的实际数据路径
+  data_dirs <- c(
+    "E3_young" = "path/to/E3_young",
+    "E3_old" = "path/to/E3_old",
+    "E4_young" = "path/to/E4_young",
+    "E4_old" = "path/to/E4_old"
+  )
+  
+  # 创建空列表存储数据
+  data_list <- list()
+  
+  # 读取数据并添加元数据
+  for (name in names(data_dirs)) {
+    # 读取数据（以10X格式为例）
+    data <- Read10X(data.dir = data_dirs[name])
+    
+    # 创建Seurat对象
+    seurat_obj <- CreateSeuratObject(counts = data, project = name)
+    
+    # 添加元数据
+    genotype <- ifelse(grepl("E3", name), "E3", "E4")
+    age <- ifelse(grepl("young", name), "young", "old")
+    seurat_obj$genotype <- genotype
+    seurat_obj$age <- age
+    seurat_obj$condition <- name
+    
+    # 保存到列表
+    data_list[[name]] <- seurat_obj
+  }
+  
+  # 合并所有数据
+  merged_data <- merge(data_list[[1]], 
+                      y = data_list[2:length(data_list)], 
+                      add.cell.ids = names(data_list))
+  
+  return(merged_data)
+}
+
+# 加载数据
+# seurat_obj <- load_data()
+# 这里假设已经有处理好的seurat_obj
+
+# ============= 2. 数据预处理与质控 =============
+preprocess_data <- function(seurat_obj) {
+  # 标准的Seurat预处理工作流
+  seurat_obj <- NormalizeData(seurat_obj)
+  seurat_obj <- FindVariableFeatures(seurat_obj)
+  seurat_obj <- ScaleData(seurat_obj)
+  seurat_obj <- RunPCA(seurat_obj)
+  
+  # 确定使用的PC数量
+  ElbowPlot(seurat_obj, ndims = 50)
+  # 根据Elbow plot结果选择PC数量，这里假设选择30个PC
+  n_pcs <- 30
+  
+  # 降维和聚类
+  seurat_obj <- RunUMAP(seurat_obj, dims = 1:n_pcs)
+  seurat_obj <- FindNeighbors(seurat_obj, dims = 1:n_pcs)
+  seurat_obj <- FindClusters(seurat_obj, resolution = 0.5)
+  
+  return(seurat_obj)
+}
+
+# 假设Seurat对象已经经过预处理
+# seurat_obj <- preprocess_data(seurat_obj)
+```
+
+
+
+```{r}
+
+
+# ============= 3. Monocle3轨迹分析 =============
+run_monocle3 <- function(seurat_obj) {
+  # 转换Seurat对象为cell_data_set对象
+  gene_metadata <- data.frame(
+    gene_short_name = rownames(seurat_obj),
+    row.names = rownames(seurat_obj)
+  )
+  
+  cds <- new_cell_data_set(
+    expression_data = GetAssayData(seurat_obj, assay = 'RNA', layer = "counts"),
+    cell_metadata = seurat_obj@meta.data,
+    gene_metadata = gene_metadata
+  )
+  
+  # 预处理
+  cds <- preprocess_cds(cds, num_dim = 30)
+  
+  # 降维
+  cds <- reduce_dimension(cds, 
+                          reduction_method = "UMAP",
+                          preprocess_method = "PCA")
+  
+  # 将Seurat的UMAP坐标转移到Monocle对象
+  cds@reducedDims$UMAP <- seurat_obj@reductions$umap@cell.embeddings
+  
+  # 聚类
+  cds <- cluster_cells(cds)
+  
+  # 学习轨迹
+  cds <- learn_graph(cds)
+  
+  # 假设您已经通过marker基因或其他先验知识确定了起始细胞群体
+  # 这里假设cluster 1是起始点，根据您的数据调整
+  cds <- order_cells(cds, root_cells = colnames(cds)[clusters(cds) %in% c(10, 11)])
+  
+  return(cds)
+}
+
+# ============= 4. 分别分析E3和E4基因型 =============
+analyze_by_genotype <- function(seurat_obj) {
+  results <- list()
+  
+  # 分别处理E3和E4基因型
+  for (genotype in c("E3", "E4")) {
+    # 提取特定基因型的数据
+    genotype_obj <- subset(seurat_obj, subset = genotype == genotype)
+    
+    # 分开young和old样本
+    young_obj <- subset(genotype_obj, subset = age == "young")
+    old_obj <- subset(genotype_obj, subset = age == "old")
+    
+    # 对young样本进行轨迹分析
+    young_cds <- run_monocle3(young_obj)
+    
+    # 对old样本进行轨迹分析
+    old_cds <- run_monocle3(old_obj)
+    
+    # 保存结果
+    results[[paste0(genotype, "_young")]] <- young_cds
+    results[[paste0(genotype, "_old")]] <- old_cds
+  }
+  
+  return(results)
+}
+
+# ============= 5. 轨迹可视化 =============
+plot_trajectories <- function(trajectory_results) {
+  plots <- list()
+  
+  # 可视化每个条件的轨迹
+  for (name in names(trajectory_results)) {
+    cds <- trajectory_results[[name]]
+    
+    # 轨迹图
+    p1 <- plot_cells(cds,
+               color_cells_by = "cluster",
+               label_groups_by_cluster = TRUE,
+               label_leaves = TRUE,
+               label_branch_points = TRUE,
+               graph_label_size = 3)
+    
+    # 按拟时序显示
+    p2 <- plot_cells(cds,
+               color_cells_by = "pseudotime",
+               label_cell_groups = FALSE,
+               label_leaves = FALSE,
+               label_branch_points = FALSE)
+    
+    combined_plot <- p1 + p2 + plot_layout(ncol = 2)
+    plots[[name]] <- combined_plot
+  }
+  
+  # 合并所有图表
+  final_plot <- wrap_plots(plots, ncol = 2)
+  return(final_plot)
+}
+
+# ============= 6. 差异基因分析 =============
+find_trajectory_deg <- function(cds, condition_name) {
+  # 按拟时序模式寻找差异表达基因
+  time_pr_test_res <- graph_test(cds, neighbor_graph = "principal_graph", 
+                                cores = 4)
+  
+  # 根据q值排序
+  time_pr_test_res <- time_pr_test_res %>% 
+    arrange(q_value)
+  
+  # 提取前500个基因进行可视化
+  top_genes <- time_pr_test_res %>% 
+    filter(q_value < 0.05) %>% 
+    arrange(q_value) %>% 
+    head(50)
+  
+  # 生成热图
+  plot_genes_in_pseudotime(cds[top_genes$id, ], 
+                          color_cells_by = "cluster",
+                          min_expr = 0.5)
+  
+  # 提取前100个基因进行拟时序可视化
+  top_specific_genes <- top_genes %>% head(10)
+  
+  # 保存基因列表
+  write.csv(time_pr_test_res, 
+            file = paste0("trajectory_DEG_", condition_name, ".csv"))
+  
+  return(top_specific_genes$id)
+}
+
+# ============= 7. 轨迹对比分析 =============
+compare_trajectories <- function(young_cds, old_cds, genotype) {
+  # 找出在young和old样本中都高表达的基因
+  young_genes <- find_trajectory_deg(young_cds, paste0(genotype, "_young"))
+  old_genes <- find_trajectory_deg(old_cds, paste0(genotype, "_old"))
+  
+  # 共有基因
+  common_genes <- intersect(young_genes, old_genes)
+  
+  # 特有基因
+  young_specific <- setdiff(young_genes, old_genes)
+  old_specific <- setdiff(old_genes, young_genes)
+  
+  # 功能分析 (需要clusterProfiler包)
+  # 这里仅提供示例代码框架
+  # if (require(clusterProfiler)) {
+  #   young_go <- enrichGO(gene = young_specific, 
+  #                        OrgDb = org.Hs.eg.db,
+  #                        keyType = "SYMBOL",
+  #                        ont = "BP")
+  #   old_go <- enrichGO(gene = old_specific, 
+  #                      OrgDb = org.Hs.eg.db,
+  #                      keyType = "SYMBOL",
+  #                      ont = "BP")
+  # }
+  
+  # 返回对比结果
+  return(list(
+    common_genes = common_genes,
+    young_specific = young_specific,
+    old_specific = old_specific
+  ))
+}
+
+# ============= 8. 细胞分化速率分析 =============
+analyze_differentiation_rate <- function(young_cds, old_cds) {
+  # 计算young轨迹中每个细胞的拟时间平均值和标准差
+  young_pseudotime <- pseudotime(young_cds)
+  young_mean <- mean(young_pseudotime, na.rm = TRUE)
+  young_sd <- sd(young_pseudotime, na.rm = TRUE)
+  
+  # 计算old轨迹中每个细胞的拟时间平均值和标准差
+  old_pseudotime <- pseudotime(old_cds)
+  old_mean <- mean(old_pseudotime, na.rm = TRUE)
+  old_sd <- sd(old_pseudotime, na.rm = TRUE)
+  
+  # 密度图比较
+  combined_data <- data.frame(
+    pseudotime = c(young_pseudotime, old_pseudotime),
+    condition = c(rep("young", length(young_pseudotime)), 
+                 rep("old", length(old_pseudotime)))
+  )
+  
+  p <- ggplot(combined_data, aes(x = pseudotime, fill = condition)) +
+    geom_density(alpha = 0.5) +
+    theme_classic() +
+    labs(title = "Pseudotime Distribution Comparison")
+  
+  return(list(
+    plot = p,
+    young_mean = young_mean,
+    young_sd = young_sd,
+    old_mean = old_mean,
+    old_sd = old_sd
+  ))
+}
+
+# ============= 9. Slingshot轨迹分析（替代方法）=============
+run_slingshot <- function(seurat_obj) {
+  # 转换为SingleCellExperiment对象
+  sce <- as.SingleCellExperiment(seurat_obj)
+  
+  # 运行slingshot
+  sce <- slingshot(sce, clusterLabels = "seurat_clusters", 
+                  reducedDim = "UMAP")
+  
+  # 可视化轨迹
+  colors <- colorRampPalette(brewer.pal(11, "Spectral"))(100)
+  plot(reducedDims(sce)$UMAP, col = colors[cut(sce$slingPseudotime_1, 
+                                               breaks = 100)], 
+       pch = 16, cex = 0.5)
+  lines(SlingshotDataSet(sce), lwd = 2, col = "black")
+  
+  return(sce)
+}
+
+
+```
+
+
+```{r}
+# ============= 10. 整合工作流 =============
+main <- function() {
+  # 1. 加载数据
+  # seurat_obj <- load_data()
+  
+  # 2. 预处理
+  # seurat_obj <- preprocess_data(seurat_obj)
+  
+  seurat_obj <- harmonized_seurat
+  
+  # 3. 执行轨迹分析（分别为不同基因型和年龄组）
+  trajectory_results <- analyze_by_genotype(seurat_obj)
+  
+  # 4. 可视化
+  plots <- plot_trajectories(trajectory_results)
+  ggsave("trajectory_comparison.pdf", plots, width = 16, height = 12)
+  
+  # 5. 对比分析E3基因型
+  e3_comparison <- compare_trajectories(
+    trajectory_results$E3_young,
+    trajectory_results$E3_old,
+    "E3"
+  )
+  
+  # 6. 对比分析E4基因型
+  e4_comparison <- compare_trajectories(
+    trajectory_results$E4_young,
+    trajectory_results$E4_old,
+    "E4"
+  )
+  
+  # 7. 分化速率分析
+  e3_rate <- analyze_differentiation_rate(
+    trajectory_results$E3_young,
+    trajectory_results$E3_old
+  )
+  
+  e4_rate <- analyze_differentiation_rate(
+    trajectory_results$E4_young,
+    trajectory_results$E4_old
+  )
+  
+  # 8. 保存结果
+  saveRDS(list(
+    seurat_obj = seurat_obj,
+    trajectory_results = trajectory_results,
+    e3_comparison = e3_comparison,
+    e4_comparison = e4_comparison,
+    e3_rate = e3_rate,
+    e4_rate = e4_rate
+  ), file = "trajectory_analysis_results.rds")
+  
+  # 返回最终结果
+  return(list(
+    plots = plots,
+    e3_comparison = e3_comparison,
+    e4_comparison = e4_comparison
+  ))
+}
+
+# 执行主函数
+# result <- main()
+```
+
+

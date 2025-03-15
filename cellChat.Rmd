@@ -21,7 +21,7 @@ library(Seurat)
 library(CellChat)
 # library(nichenetr)
 library(patchwork)
-library(SeuratData)
+# library(SeuratData)
 library(ggalluvial)
 library(NMF)
 
@@ -37,23 +37,44 @@ library(NMF)
 # scRNA <- LoadData("pbmc3k", type = "pbmc3k.final")
 
 # scRNA <- readRDS('~/Downloads/seuratObj.rds')
-load('~/Downloads/pbmc3k.final.rda')
-scRNA <- pbmc3k.final
+# load('~/Downloads/pbmc3k.final.rda')
+# scRNA <- pbmc3k.final
+# 
+# scRNA <- Seurat::UpdateSeuratObject(scRNA)
 
-scRNA <- Seurat::UpdateSeuratObject(scRNA)
+
+scRNA <- subset(harmonized_seurat, orig.ident == "E3_young")
+
 # CellChat要求输入标准化后的表达数据
-data.input <- GetAssayData(scRNA, assay = "RNA", slot = "data")
-identity <- subset(scRNA@meta.data, select = "seurat_annotations") # 以及细胞标签
+data.input <- GetAssayData(scRNA, assay = "RNA", layer = "data")
+identity <- subset(scRNA@meta.data, select = "cell_type") # 以及细胞标签
 
+```
+
+
+```{r}
 
 ##创建cellchat对象
 cellchat <- createCellChat(object = data.input)
 cellchat <- addMeta(cellchat, meta = identity, meta.name = "labels")
-cellchat <- setIdent(cellchat, ident.use = "labels") 
+cellchat <- setIdent(cellchat, ident.use = "labels")
+
+
+# meta<-scRNA@meta.data[,c("orig.ident","celltype")]
+# colnames(meta)<-c("group","celltypes")
+# table(meta$celltypes)
+# # 建议提前对celltype进行排序~
+# cellchat <- createCellChat(data.input, 
+#                            meta = meta, 
+#                            group.by = "cell_type"
+#                            )
+
+# cellchat <- createCellChat(object = scRNA, group.by = "ident", assay = "RNA")
+
 groupSize <- as.numeric(table(cellchat@idents)) # 后面有用
 levels(cellchat@idents)
-
 ```
+
 
 CellChat提供了人和小鼠的配受体数据库，分别可以用CellChatDB.human,CellChatDB.mouse来导入
 
@@ -61,44 +82,96 @@ CellChat提供了人和小鼠的配受体数据库，分别可以用CellChatDB.h
 # 导入配体受体数据库
 CellChatDB <- CellChatDB.human 
 
-str(CellChatDB)
+# str(CellChatDB)
 showDatabaseCategory(CellChatDB)
 dplyr::glimpse(CellChatDB$interaction)
 
 # 使用"Secreted Signaling"用于细胞通讯分析
 # CellChat中可以选择特定的信息描述细胞间的相互作用，当然也可以用整个大的配体库
 unique(CellChatDB$interaction$annotation)
-CellChatDB.use <- subsetDB(CellChatDB, search = "Secreted Signaling")
+
+
+# CellChatDB.use <- subsetDB(CellChatDB, search = "Secreted Signaling")
+
+# We do not suggest to use it in this way because CellChatDB v2 includes "Non-protein Signaling" 
 # CellChatDB.use <- CellChatDB # simply use the default CellChatDB
+
+# use all CellChatDB except for "Non-protein Signaling" for cell-cell communication analysis
+CellChatDB.use <- subsetDB(CellChatDB)
+
+
 # 将数据库传递给cellchat对象
 cellchat@DB <- CellChatDB.use
 
 
+
+
+```
+
+
+```{r}
 ##配体-受体分析
 # 提取数据库支持的数据子集
+# This step is necessary even if using the whole database
 cellchat <- subsetData(cellchat)
+
+future::plan("multisession", workers = 4) # do parallel
+
 # 识别过表达基因
 cellchat <- identifyOverExpressedGenes(cellchat)
 # 识别配体-受体对
 cellchat <- identifyOverExpressedInteractions(cellchat)
-# 将配体、受体投射到PPI网络
-cellchat <- projectData(cellchat, PPI.human)
 
+
+
+# 将配体、受体投射到PPI网络
+# cellchat <- projectData(cellchat, PPI.human)
+# 运行的也太慢了
+cellchat <- smoothData(cellchat, adj = PPI.human) # 新版用的
+
+
+
+```
+
+
+```{r}
+ptm = Sys.time()
 
 ##推测细胞通讯网络
+## 最最费时的一步
 cellchat <- computeCommunProb(cellchat, type = 'triMean')
+
+
 # Filter out the cell-cell communication if there are only few number of cells in certain cell groups
-cellchat <- filterCommunication(cellchat, min.cells = 5)
+cellchat <- filterCommunication(cellchat, min.cells = 10)
+
 # 推测细胞间在信号通路水平上的通讯
 cellchat <- computeCommunProbPathway(cellchat)
+
+# 聚合细胞通讯网络
 cellchat <- aggregateNet(cellchat, sources.use = NULL,
                          targets.use = NULL)
 
+execution.time = Sys.time() - ptm
+print(as.numeric(execution.time, units = "secs"))
+
+```
+
+```{r}
+# qs::qsave(cellchat,"./datasets/cellchat.qs")
+
+cellchat <- qs::qread("./datasets/cellchat.qs")
+```
+
+
+```{r}
 # 提取细胞通讯网络，有各种提取方式
 df.net <- subsetCommunication(cellchat, signaling = c("WNT", "TGFb"))
 # df.net <- subsetCommunication(cellchat, slot.name = 'net')
-
 ```
+
+
+
 
 #### 细胞通讯网络系统分析及可视化
 
@@ -110,27 +183,78 @@ df.net <- subsetCommunication(cellchat, signaling = c("WNT", "TGFb"))
 
 ```{r}
 levels(cellchat@idents)            #查看细胞顺序
+
+# he index of the cell groups as targets in the first hierarchy plot
 vertex.receiver = c(3, 6)          #指定靶细胞的索引
 cellchat@netP$pathways             #查看富集到的信号通路
-pathways.show <- c("MIF")           #指定需要展示的通路
+
+
+
+pathways.show <- c("NEGR")           #指定需要展示的通路
 
 # Hierarchy plot
-pdf(file = "sig_pathway_hierarchy.pdf", width = 10, height = 10)
+# pdf(file = "sig_pathway_hierarchy.pdf", width = 10, height = 10)
+# 不同颜色代表不同细胞类型，结合箭头代表作用方向，粗细代表互作的强度
 netVisual_aggregate(cellchat, 
                     signaling = pathways.show,
-                    vertex.receiver = vertex.receiver, 
-                    vertex.weight = groupSize)
-dev.off()
-# Circle plot
-png(filename = "sig_pathway_cricle.png", width = 650, height = 600)
-netVisual_circle(cellchat@net$count, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Number of interactions")
-dev.off()
-png(filename = "sig_pathway_cricle_weight.png", width = 650, height = 600)
-netVisual_circle(cellchat@net$weight, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Interaction weights/strength")
-dev.off()
-# heatmap
-netVisual_heatmap(cellchat, signaling = pathways.show, color.heatmap = "Reds")
+                    vertex.receiver = vertex.receiver,
+                    vertex.weight = groupSize,
+                    layout = 'circle'
+                    )
+# dev.off()
 
+```
+
+
+```{r}
+groupSize <- as.numeric(table(cellchat@idents))
+```
+
+```{r}
+# Circle plot
+# png(filename = "sig_pathway_cricle.png", width = 650, height = 600)
+netVisual_circle(cellchat@net$count, 
+                 vertex.weight = groupSize, 
+                 weight.scale = T, 
+                 label.edge = F, 
+                 title.name = "Number of interactions")
+# dev.off()
+```
+
+```{r}
+# png(filename = "sig_pathway_cricle_weight.png", width = 650, height = 600)
+netVisual_circle(cellchat@net$weight, 
+                 vertex.weight = groupSize, weight.scale = T, 
+                 label.edge= F,
+                 title.name = "Interaction weights/strength")
+# dev.off()
+```
+
+这两张图分别展示了互作的数量和互作的权重。其中每个颜色代表了不同的细胞，箭头代表了顺序，线的粗细代表了数量/权重。
+```{r}
+ptm = Sys.time()
+groupSize <- as.numeric(table(cellchat@idents))
+par(mfrow = c(1,2), xpd=TRUE)
+netVisual_circle(cellchat@net$count, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Number of interactions")
+netVisual_circle(cellchat@net$weight, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Interaction weights/strength")
+```
+
+
+
+```{r}
+# heatmap
+# 行（Sources - 发送方）： 热图的行代表了不同的细胞类型，这些细胞作为信号的发送者（Source）。
+# 列（Targets - 接收方）： 热图的列代表了不同的细胞类型，这些细胞作为信号的接收者（Target）。
+# 颜色深浅： 热图中的颜色深浅表示了通讯概率的大小。颜色越深，表示通讯概率越高，这意味着发送方细胞和接收方细胞之间的信号传递越强。
+# 通信概率（Communication Prob.）： 右侧的颜色条是颜色映射的参考。图中的深红色表示较高的通讯概率（靠近1.5），浅色表示较低的通讯概率（靠近0或更低）。
+# 顶部数值范围 (0 - 1.5)： 顶部红框中显示的数值范围是 Communication Probability（通信概率），即不同颜色对应的通信概率。这个数值表示在不同细胞类型之间，某个信号通路的通信概率大小。0表示没有通信，1.5表示相对较高的通信概率。
+# 右侧部分的数值范围 (0 - 4)： 右侧红框中显示的数值范围则表示的是通信路径的数量（Number of Communications）。0表示没有通信路径，4表示有多个通信路径被计算出来并显示在热图中。
+netVisual_heatmap(cellchat, signaling = pathways.show, 
+                  color.heatmap = "Reds")
+```
+
+展示每一个celltype作为source与其他celltype的权重互作情况
+```{r}
 # 每一个细胞的网络图
 mat <- cellchat@net$weight
 par(mfrow = c(3,4), xpd=TRUE)
@@ -139,28 +263,79 @@ for (i in 1:nrow(mat)) {
   mat2[i, ] <- mat[i, ]
   netVisual_circle(mat2, vertex.weight = groupSize, weight.scale = T, edge.weight.max = max(mat), title.name = rownames(mat)[i])
 }
-dev.off()
+# dev.off()
 # netVisual_aggregate和netVisual_individual一个是在pathway的层面一个是在L-R的层面
-
 ```
+
+```{r}
+ # Hierarchy plot
+# 该图有两个部分组成，左边部分显示对研究者感兴趣的细胞组(vertex.receiver)的自分泌/旁分泌信号传导，右边则显示数据集中其他次要感兴趣细胞的自分泌和旁分泌信号传导。
+# vertex.receiver设定了source的细胞类型(实心圆圈)，空心圆圈代表target。左半边图片先把代表vertex.receiver的圆圈放在了中间，显示了不同细胞类型对这CD4+T，CD8+T和B细胞的作用情况，右半边图片把代表一起细胞的源泉放在了中间，显示了不同细胞类型对其余细胞的作用情况，线的粗细代表互作的强度。
+netVisual_aggregate(cellchat, 
+                    signaling = pathways.show,
+                    vertex.receiver = vertex.receiver,
+                    layout= "hierarchy")
+                    # vertex.size = groupSize)
+```
+
 
 
 ```{r}
 
-# 计算每个配体-受体对信号网络的贡献度
-gg <- netAnalysis_contribution(cellchat, signaling = pathways.show)
-ggsave(plot = gg, filename = '_L-R_contribution.pdf')
-
-# show all the significant interactions (L-R pairs) from some cell groups (defined by 'sources.use') to other cell groups (defined by 'targets.use')
-netVisual_bubble(cellchat, sources.use = 4, targets.use = c(5:11), remove.isolate = FALSE)
-
-# show all the interactions received by Inflam.DC
-netVisual_chord_gene(cellchat, sources.use = c(1,2,3,4), targets.use = 8, legend.pos.x = 15)
-
-# plot the gene expression distribution of signaling genes related to L-R pairs
-plotGeneExpression(cellchat, signaling = "MIF")
-
+# 计算每个配体-受体对信号通路的贡献度
+gg <- netAnalysis_contribution(cellchat, 
+                               signaling = pathways.show
+                               )
+# ggsave(plot = gg, filename = '_L-R_contribution.pdf')
+gg
 ```
+
+```{r}
+# 可视化由单个配体-受体对介导的细胞间通讯
+pairLR <- extractEnrichedLR(cellchat, signaling = pathways.show,
+                                 geneLR.return = FALSE)
+LR.show <- pairLR[1,] # show one ligand-receptor pair
+
+# Hierarchy plot
+vertex.receiver = seq(1,3) # a numeric vector
+netVisual_individual(cellchat, signaling = pathways.show,  
+                     pairLR.use = LR.show, 
+                     vertex.receiver = vertex.receiver,
+                     layout = "hierarchy")
+```
+
+Bubble plot和netVisual_bubble显示一些单元组与其他单元组之间的所有重要相互作用
+```{r}
+# show all the significant interactions (L-R pairs) from some cell groups (defined by 'sources.use') to other cell groups (defined by 'targets.use')
+# # 需要指定source和target
+# sources.use是发出信号的细胞系,target.use是接受信号的细胞系
+netVisual_bubble(cellchat, sources.use = 4, 
+                 targets.use = c(5:11), 
+                 remove.isolate = FALSE)
+
+# 横轴代表不同细胞之间的互作方向。纵轴代表特定的配-受体对。圆点的不同颜色代表通讯概率。点的大小代表通讯显著性的P值。
+```
+
+
+```{r}
+# show all the interactions received by Inflam.DC
+# 提供了netVisual_chord_cell 和 netVisual_chord_gene 两个功能。netVisual_chord_cell 用于可视化不同细胞组之间的细胞间通讯；etVisual_chord_gene 用于可视化由多个配体受体或信号通路介导的细胞间通讯。
+# # 这里进行绘制时建议设定singaling或者减少互作的细胞
+netVisual_chord_gene(cellchat, sources.use = c(1,2,3,4), targets.use = 8, legend.pos.x = 15)
+```
+
+
+```{r}
+# plot the gene expression distribution of signaling genes related to L-R pairs
+# 使用小提琴/点图绘制信号通路的基因表达情况
+# CellChat可以使用Seurat包装函数plotGeneExpression绘制与 L-R 对或信号通路相关的信号转导基因的基因表达分布。
+# 该功能提供 “violin”、“dot”、“bar” 三种类型的可视化。
+# 或用户可以使用 extractEnrichedLR 提取与推断的 L-R 对或信号通路相关的信号转导基因，然后使用Seurat或其他软件包绘制基因表达。
+plotGeneExpression(cellchat, signaling = "NOTCH")
+```
+
+
+
 
 *Systems analysis of cell-cell communication network*
 
@@ -169,7 +344,17 @@ plotGeneExpression(cellchat, signaling = "MIF")
 # Compute the network centrality scores
 cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "netP") # the slot 'netP' means the inferred intercellular communication network of signaling pathways
 # Visualize the computed centrality scores using heatmap, allowing ready identification of major signaling roles of cell groups
-netAnalysis_signalingRole_network(cellchat, signaling = pathways.show, width = 8, height = 2.5, font.size = 10)
+
+# 行（Sender, Receiver, Mediator, Influencer）：行表示在信号通路网络中，不同细胞类型扮演的角色：
+# ● Sender：信号的发送者，即哪些细胞类型是主要的信号发出者。
+# ● Receiver：信号的接收者，即哪些细胞类型是主要的信号接收者。
+# ● Mediator：中介者，即在信号传递过程中起到中介作用的细胞类型。
+# ● Influencer：影响者，即在整个信号通路网络中对通信过程产生显著影响的细胞类型。
+# 列（不同的细胞类型）：列表示具体的细胞类型，如 CD4+ T 细胞、B 细胞、成纤维细胞（Fibroblasts）等。
+# 颜色深浅（Importance）：颜色的深浅表示每个细胞类型在特定角色中的重要性。颜色越深，表示该细胞类型在这个角色中的重要性越高（例如信号传递的强度或频率越大）；颜色越浅，表示该细胞类型在这个角色中的重要性较低。
+
+netAnalysis_signalingRole_network(cellchat, signaling = pathways.show, 
+                                  width = 8, height = 2.5, font.size = 10)
 
 # Visualize the dominant senders (sources) and receivers (targets) in a 2D space
 gg1 <- netAnalysis_signalingRole_scatter(cellchat)

@@ -71,6 +71,740 @@ ggsave('GSVA/featureplot_demo.png', plotc, width = 10, height = 8)
 ```
 
 
+### 最新的整理20250308
+
+```{r}
+# 单细胞RNA-seq数据使用GSVA包进行富集分析的完整流程
+# 此脚本假设您已经完成了细胞类型注释，并有5个实验组
+
+# 1. 加载必要的R包
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(GSVA)
+  library(GSEABase)
+  library(limma)
+  library(msigdbr)
+  library(pheatmap)
+  library(dplyr)
+  library(ggplot2)
+  library(RColorBrewer)
+  library(SingleCellExperiment)
+})
+
+# 2. 读取已注释的Seurat对象（此处假设您的Seurat对象名为seurat_obj）
+# 如果您的Seurat对象存储在RDS文件中，可以使用以下命令加载
+# seurat_obj <- readRDS("path/to/your/annotated_seurat_object.rds")
+
+# 3. 查看数据情况
+print("数据概览：")
+print(seurat_obj)
+
+# 查看注释的细胞类型和实验组
+table(Idents(seurat_obj))
+table(seurat_obj$group) # 假设实验组信息存储在group列中
+
+# 4. 准备基因集
+# 从MSigDB获取基因集（以hallmark基因集为例）
+h_gene_sets <- msigdbr(species = "Homo sapiens", category = "H") # 如果是小鼠，请将"Homo sapiens"改为"Mus musculus"
+
+# 转换为GSVA需要的列表格式
+h_list <- split(h_gene_sets$gene_symbol, h_gene_sets$gs_name)
+
+# 也可以加载其他通路数据库，例如KEGG
+c2_gene_sets <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG")
+kegg_list <- split(c2_gene_sets$gene_symbol, c2_gene_sets$gs_name)
+
+# 5. 为每个细胞类型进行GSVA分析
+# 获取所有细胞类型
+cell_types <- unique(Idents(seurat_obj))
+
+# 创建一个列表存储每个细胞类型的GSVA结果
+gsva_results <- list()
+
+# 对每个细胞类型分别进行GSVA分析
+for (cell_type in cell_types) {
+  # 提取当前细胞类型的细胞
+  cells_subset <- subset(seurat_obj, idents = cell_type)
+  
+  # 获取表达矩阵
+  expr_matrix <- as.matrix(GetAssayData(cells_subset, slot = "data"))
+  
+  # 运行GSVA
+  print(paste0("正在对", cell_type, "细胞类型进行GSVA分析..."))
+  gsva_res <- gsva(expr_matrix, h_list, method = "gsva", 
+                  min.sz = 10, max.sz = 500, verbose = TRUE, parallel.sz = 4)
+  
+  # 存储结果
+  gsva_results[[as.character(cell_type)]] <- gsva_res
+}
+
+# 6. 差异富集分析（针对每个细胞类型比较不同组之间的差异）
+# 创建列表存储差异分析结果
+diff_results <- list()
+
+for (cell_type in cell_types) {
+  # 提取当前细胞类型的GSVA结果
+  gsva_mat <- gsva_results[[as.character(cell_type)]]
+  
+  # 提取当前细胞类型的细胞
+  cells_subset <- subset(seurat_obj, idents = cell_type)
+  
+  # 确保GSVA结果和细胞顺序匹配
+  gsva_mat <- gsva_mat[, colnames(cells_subset)]
+  
+  # 获取组信息作为设计矩阵
+  group_info <- cells_subset$group
+  design <- model.matrix(~0 + factor(group_info))
+  colnames(design) <- levels(factor(group_info))
+  
+  # 使用limma进行差异分析
+  fit <- lmFit(gsva_mat, design)
+  
+  # 针对五个组可能的所有比较组合创建对比矩阵
+  # 以下是一个例子，假设五个组为A, B, C, D, E
+  # 您可以根据实际需要修改这些对比
+  groups <- levels(factor(group_info))
+  contrasts_matrix <- makeContrasts(
+    B_vs_A = groups[2] - groups[1],
+    C_vs_A = groups[3] - groups[1],
+    D_vs_A = groups[4] - groups[1],
+    E_vs_A = groups[5] - groups[1],
+    C_vs_B = groups[3] - groups[2],
+    D_vs_B = groups[4] - groups[2],
+    E_vs_B = groups[5] - groups[2],
+    D_vs_C = groups[4] - groups[3],
+    E_vs_C = groups[5] - groups[3],
+    E_vs_D = groups[5] - groups[4],
+    levels = design
+  )
+  
+  # 执行对比分析
+  fit2 <- contrasts.fit(fit, contrasts_matrix)
+  fit2 <- eBayes(fit2)
+  
+  # 存储所有对比的结果
+  diff_results[[as.character(cell_type)]] <- list()
+  
+  for (contrast in colnames(contrasts_matrix)) {
+    top_table <- topTable(fit2, coef = contrast, number = Inf, p.value = 0.05)
+    diff_results[[as.character(cell_type)]][[contrast]] <- top_table
+  }
+}
+
+# 7. 可视化结果
+# 针对每个细胞类型和对比，生成差异富集的热图
+for (cell_type in names(diff_results)) {
+  for (contrast in names(diff_results[[cell_type]])) {
+    top_table <- diff_results[[cell_type]][[contrast]]
+    
+    # 检查是否有显著差异的通路
+    if (nrow(top_table) > 0) {
+      # 提取前30个显著差异的通路
+      top_n_pathways <- rownames(top_table)[1:min(30, nrow(top_table))]
+      
+      # 获取对应的GSVA得分矩阵
+      gsva_mat <- gsva_results[[cell_type]][top_n_pathways, ]
+      
+      # 提取当前细胞类型的细胞
+      cells_subset <- subset(seurat_obj, idents = cell_type)
+      
+      # 确保GSVA结果和细胞顺序匹配
+      gsva_mat <- gsva_mat[, colnames(cells_subset)]
+      
+      # 准备热图注释
+      group_info <- cells_subset$group
+      anno_col <- data.frame(Group = group_info)
+      rownames(anno_col) <- colnames(gsva_mat)
+      
+      # 生成热图
+      heatmap_file <- paste0("GSVA_heatmap_", cell_type, "_", contrast, ".pdf")
+      pdf(heatmap_file, width = 12, height = 10)
+      pheatmap(gsva_mat, 
+               annotation_col = anno_col,
+               show_colnames = FALSE,
+               cluster_cols = TRUE,
+               cluster_rows = TRUE,
+               scale = "row",
+               main = paste0("GSVA Enrichment Score - ", cell_type, " - ", contrast))
+      dev.off()
+      
+      # 生成箱线图比较组间差异
+      # 将GSVA得分和组信息合并为数据框
+      for (pathway in top_n_pathways[1:min(5, length(top_n_pathways))]) {
+        plot_data <- data.frame(
+          GSVA_score = gsva_mat[pathway, ],
+          Group = group_info
+        )
+        
+        # 生成箱线图
+        p <- ggplot(plot_data, aes(x = Group, y = GSVA_score, fill = Group)) +
+          geom_boxplot() +
+          theme_classic() +
+          labs(title = paste0(pathway, " - ", cell_type),
+               x = "Group", y = "GSVA Enrichment Score") +
+          theme(plot.title = element_text(size = 10, hjust = 0.5),
+                axis.text.x = element_text(angle = 45, hjust = 1))
+        
+        # 保存图形
+        box_file <- paste0("GSVA_boxplot_", cell_type, "_", contrast, "_", gsub("/", "_", pathway), ".pdf")
+        ggsave(box_file, plot = p, width = 8, height = 6)
+      }
+    }
+  }
+}
+
+# 8. 进行聚类分析，基于GSVA得分
+# 对每个细胞类型，合并所有细胞的GSVA得分
+for (cell_type in names(gsva_results)) {
+  # 获取GSVA结果
+  gsva_mat <- gsva_results[[cell_type]]
+  
+  # 进行层次聚类
+  pathway_dist <- dist(gsva_mat)
+  pathway_hclust <- hclust(pathway_dist, method = "ward.D2")
+  
+  # 生成聚类热图
+  pdf(paste0("GSVA_pathway_clustering_", cell_type, ".pdf"), width = 14, height = 12)
+  plot(pathway_hclust, main = paste0("Pathway Clustering - ", cell_type), 
+       xlab = "", sub = "")
+  dev.off()
+  
+  # 选择前50个变异最大的通路进行热图展示
+  var_paths <- apply(gsva_mat, 1, var)
+  top_var_paths <- names(sort(var_paths, decreasing = TRUE))[1:min(50, length(var_paths))]
+  
+  # 提取当前细胞类型的细胞
+  cells_subset <- subset(seurat_obj, idents = cell_type)
+  
+  # 确保GSVA结果和细胞顺序匹配
+  gsva_top_var <- gsva_mat[top_var_paths, colnames(cells_subset)]
+  
+  # 准备热图注释
+  group_info <- cells_subset$group
+  anno_col <- data.frame(Group = group_info)
+  rownames(anno_col) <- colnames(gsva_top_var)
+  
+  # 生成热图
+  pdf(paste0("GSVA_top_variable_pathways_", cell_type, ".pdf"), width = 14, height = 12)
+  pheatmap(gsva_top_var, 
+           annotation_col = anno_col,
+           show_colnames = FALSE,
+           cluster_cols = TRUE,
+           cluster_rows = TRUE,
+           scale = "row",
+           main = paste0("Top Variable Pathways - ", cell_type))
+  dev.off()
+}
+
+# 9. 组间富集通路的共性与差异分析
+# 针对每个对比，找出在不同细胞类型中共同富集或特异富集的通路
+for (contrast in names(diff_results[[1]])) {
+  # 创建一个列表，存储每个细胞类型中显著富集的通路
+  sig_pathways <- list()
+  
+  for (cell_type in names(diff_results)) {
+    top_table <- diff_results[[cell_type]][[contrast]]
+    if (nrow(top_table) > 0) {
+      sig_pathways[[cell_type]] <- rownames(top_table)
+    } else {
+      sig_pathways[[cell_type]] <- character(0)
+    }
+  }
+  
+  # 如果至少有两个细胞类型有显著富集的通路，则进行共性与差异分析
+  if (sum(sapply(sig_pathways, length) > 0) >= 2) {
+    # 创建韦恩图或upset图
+    # 这里简单地使用交集和并集分析
+    all_pathways <- unique(unlist(sig_pathways))
+    
+    # 创建一个矩阵，显示每个通路在每个细胞类型中是否显著富集
+    pathway_matrix <- matrix(0, nrow = length(all_pathways), ncol = length(sig_pathways))
+    rownames(pathway_matrix) <- all_pathways
+    colnames(pathway_matrix) <- names(sig_pathways)
+    
+    for (i in 1:length(sig_pathways)) {
+      cell_type <- names(sig_pathways)[i]
+      pathway_matrix[sig_pathways[[cell_type]], cell_type] <- 1
+    }
+    
+    # 保存结果
+    write.csv(pathway_matrix, paste0("Shared_specific_pathways_", contrast, ".csv"))
+    
+    # 计算共有通路
+    shared_pathways <- all_pathways[rowSums(pathway_matrix) == ncol(pathway_matrix)]
+    
+    # 保存共有通路列表
+    if (length(shared_pathways) > 0) {
+      write.table(shared_pathways, paste0("Shared_pathways_", contrast, ".txt"), 
+                  row.names = FALSE, col.names = FALSE, quote = FALSE)
+    }
+  }
+}
+
+# 10. 将所有GSVA得分结果整合到Seurat对象中（可选）
+# 这样可以在UMAP或tSNE上可视化特定通路的富集情况
+for (cell_type in names(gsva_results)) {
+  gsva_mat <- gsva_results[[cell_type]]
+  
+  # 提取当前细胞类型的细胞
+  cells_subset <- subset(seurat_obj, idents = cell_type)
+  
+  # 确保GSVA结果和细胞顺序匹配
+  gsva_mat <- gsva_mat[, colnames(cells_subset)]
+  
+  # 为这些细胞添加GSVA得分
+  for (pathway in rownames(gsva_mat)) {
+    seurat_obj[[paste0("GSVA_", gsub("/", "_", pathway))]] <- NA
+    seurat_obj[[paste0("GSVA_", gsub("/", "_", pathway))]][colnames(cells_subset)] <- gsva_mat[pathway, ]
+  }
+}
+
+# 保存带有GSVA得分的Seurat对象
+saveRDS(seurat_obj, "seurat_with_gsva_scores.rds")
+
+# 在UMAP上可视化前五个变异最大的通路
+# 计算所有通路的方差
+all_gsva_vars <- c()
+for (cell_type in names(gsva_results)) {
+  gsva_mat <- gsva_results[[cell_type]]
+  pathway_vars <- apply(gsva_mat, 1, var)
+  all_gsva_vars <- c(all_gsva_vars, pathway_vars)
+}
+
+# 获取前5个变异最大的通路
+top5_var_pathways <- names(sort(all_gsva_vars, decreasing = TRUE)[1:5])
+
+# 在UMAP上可视化
+pdf("Top5_variable_pathways_UMAP.pdf", width = 15, height = 12)
+for (pathway in top5_var_pathways) {
+  p <- FeaturePlot(seurat_obj, features = paste0("GSVA_", gsub("/", "_", pathway)), 
+                  reduction = "umap")
+  print(p + ggtitle(pathway))
+}
+dev.off()
+
+# 11. 总结输出所有差异富集通路的汇总表
+all_diff_pathways <- data.frame()
+
+for (cell_type in names(diff_results)) {
+  for (contrast in names(diff_results[[cell_type]])) {
+    top_table <- diff_results[[cell_type]][[contrast]]
+    
+    if (nrow(top_table) > 0) {
+      # 添加细胞类型和对比信息
+      top_table$cell_type <- cell_type
+      top_table$contrast <- contrast
+      
+      # 添加通路名称
+      top_table$pathway <- rownames(top_table)
+      
+      # 合并结果
+      all_diff_pathways <- rbind(all_diff_pathways, top_table)
+    }
+  }
+}
+
+# 保存汇总表
+write.csv(all_diff_pathways, "All_differential_pathways_summary.csv", row.names = FALSE)
+
+print("GSVA分析完成！")
+```
+
+
+
+#### 提取对应的细胞亚群后的分析
+
+这个跑起来更快速一些。
+
+```{r}
+# 单细胞RNA-seq GSVA富集分析脚本
+# 针对一种特定细胞类型比较两个实验组
+
+# 1. 加载必要的R包
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(GSVA)
+  library(GSEABase)
+  library(limma)
+  library(msigdbr)
+  library(pheatmap)
+  library(dplyr)
+  library(ggplot2)
+  library(RColorBrewer)
+})
+
+# 2. 读取已注释的Seurat对象
+# seurat_obj <- readRDS("path/to/your/annotated_seurat_object.rds")
+
+# 3. 设置分析参数
+# 指定要分析的细胞类型
+target_cell_type <- "请替换为目标细胞类型" # 例如："CD8+ T cells"
+
+# 指定要比较的两个组
+group1 <- "请替换为第一组名称" # 例如："Control"
+group2 <- "请替换为第二组名称" # 例如："Treatment"
+
+# 4. 提取目标细胞类型
+print(paste0("正在提取细胞类型: ", target_cell_type))
+target_cells <- subset(seurat_obj, idents = target_cell_type)
+
+# 检查是否成功提取到细胞
+if(ncol(target_cells) == 0) {
+  stop("未找到指定的细胞类型，请检查细胞类型名称是否正确")
+}
+
+print(paste0("成功提取到 ", ncol(target_cells), " 个 ", target_cell_type, " 细胞"))
+
+# 5. 筛选属于目标组的细胞
+target_cells$selected_group <- ifelse(target_cells$group %in% c(group1, group2), target_cells$group, "Other")
+target_cells <- subset(target_cells, selected_group %in% c(group1, group2))
+
+# 检查筛选后的细胞数量
+group_counts <- table(target_cells$selected_group)
+print("比较组的细胞数量:")
+print(group_counts)
+
+if(length(group_counts) < 2 || any(group_counts < 3)) {
+  stop("组别筛选后细胞数量不足，无法进行有效比较")
+}
+
+# 6. 准备基因集 - 使用多个基因集数据库
+# 6.1 Hallmark基因集
+h_gene_sets <- msigdbr(species = "Homo sapiens", category = "H") # 如果是小鼠，改为"Mus musculus"
+h_list <- split(h_gene_sets$gene_symbol, h_gene_sets$gs_name)
+print(paste0("加载了 ", length(h_list), " 个Hallmark基因集"))
+
+# 6.2 KEGG通路
+c2_kegg <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG")
+kegg_list <- split(c2_kegg$gene_symbol, c2_kegg$gs_name)
+print(paste0("加载了 ", length(kegg_list), " 个KEGG通路基因集"))
+
+# 6.3 GO生物过程
+c5_bp <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "BP")
+bp_list <- split(c5_bp$gene_symbol, c5_bp$gs_name)
+print(paste0("加载了 ", length(bp_list), " 个GO生物过程基因集"))
+
+# 7. 提取表达矩阵 - 可选择平均表达或原始表达
+
+# 7.1 基于单个细胞的原始表达矩阵方法
+print("获取表达矩阵...")
+expr_matrix <- as.matrix(GetAssayData(target_cells, slot = "data"))
+print(paste0("表达矩阵维度: ", nrow(expr_matrix), " 基因 x ", ncol(expr_matrix), " 细胞"))
+
+# 7.2 基于AverageExpression的方法（可选择取消注释使用）
+# 按组计算平均表达
+# avg_expr <- AverageExpression(target_cells, 
+#                             group.by = "selected_group", 
+#                             assays = "RNA")$RNA
+# print("平均表达矩阵维度:")
+# print(dim(avg_expr))
+
+# 8. 运行GSVA分析 - 以下提供两种方法，选择一种使用
+
+# 8.1 对原始单细胞表达矩阵运行GSVA
+print("开始运行GSVA分析 (单细胞水平)...")
+system.time({
+  # 使用Hallmark基因集
+  gsva_results_h <- gsva(expr_matrix, h_list, method = "gsva", 
+                       min.sz = 10, max.sz = 500, verbose = TRUE, parallel.sz = 4)
+  
+  # 使用KEGG通路基因集
+  gsva_results_kegg <- gsva(expr_matrix, kegg_list, method = "gsva", 
+                          min.sz = 10, max.sz = 500, verbose = TRUE, parallel.sz = 4)
+  
+  # 使用GO生物过程基因集（可选，运行时间较长）
+  # 可以根据需要调整或注释掉
+  gsva_results_bp <- gsva(expr_matrix, bp_list, method = "gsva", 
+                        min.sz = 10, max.sz = 500, verbose = TRUE, parallel.sz = 4)
+})
+
+# 8.2 对平均表达矩阵运行GSVA（可选择取消注释使用）
+# print("开始运行GSVA分析 (平均表达)...")
+# system.time({
+#   # 使用Hallmark基因集
+#   avg_gsva_results_h <- gsva(avg_expr, h_list, method = "gsva", 
+#                            min.sz = 10, max.sz = 500, verbose = TRUE)
+#   
+#   # 使用KEGG通路基因集
+#   avg_gsva_results_kegg <- gsva(avg_expr, kegg_list, method = "gsva", 
+#                               min.sz = 10, max.sz = 500, verbose = TRUE)
+# })
+
+# 9. 使用limma进行差异富集分析
+
+# 9.1 单细胞水平的差异分析
+print("进行组间差异富集分析...")
+
+# 为limma创建设计矩阵
+group_factor <- factor(target_cells$selected_group)
+design <- model.matrix(~0 + group_factor)
+colnames(design) <- levels(group_factor)
+
+# 确保GSVA结果和细胞顺序匹配
+gsva_results_h <- gsva_results_h[, colnames(target_cells)]
+gsva_results_kegg <- gsva_results_kegg[, colnames(target_cells)]
+gsva_results_bp <- gsva_results_bp[, colnames(target_cells)]
+
+# 对Hallmark基因集进行差异分析
+fit_h <- lmFit(gsva_results_h, design)
+contrast_matrix <- makeContrasts(contrasts = paste0(group2, "-", group1), levels = design)
+fit2_h <- contrasts.fit(fit_h, contrast_matrix)
+fit2_h <- eBayes(fit2_h)
+results_h <- topTable(fit2_h, number = Inf)
+print(paste0("Hallmark差异富集通路数量: ", sum(results_h$adj.P.Val < 0.05)))
+
+# 对KEGG通路进行差异分析
+fit_kegg <- lmFit(gsva_results_kegg, design)
+fit2_kegg <- contrasts.fit(fit_kegg, contrast_matrix)
+fit2_kegg <- eBayes(fit2_kegg)
+results_kegg <- topTable(fit2_kegg, number = Inf)
+print(paste0("KEGG差异富集通路数量: ", sum(results_kegg$adj.P.Val < 0.05)))
+
+# 对GO生物过程进行差异分析
+fit_bp <- lmFit(gsva_results_bp, design)
+fit2_bp <- contrasts.fit(fit_bp, contrast_matrix)
+fit2_bp <- eBayes(fit2_bp)
+results_bp <- topTable(fit2_bp, number = Inf)
+print(paste0("GO生物过程差异富集通路数量: ", sum(results_bp$adj.P.Val < 0.05)))
+
+# 9.2 平均表达水平的差异分析（如果使用了AverageExpression，取消注释使用）
+# # 不需要设计矩阵和limma，直接计算差异
+# avg_diff_h <- data.frame(
+#   pathway = rownames(avg_gsva_results_h),
+#   score_group1 = avg_gsva_results_h[, group1],
+#   score_group2 = avg_gsva_results_h[, group2],
+#   diff = avg_gsva_results_h[, group2] - avg_gsva_results_h[, group1]
+# )
+# avg_diff_h <- avg_diff_h[order(abs(avg_diff_h$diff), decreasing = TRUE), ]
+
+# 10. 结果可视化
+
+# 10.1 创建结果目录
+output_dir <- paste0(target_cell_type, "_", group1, "_vs_", group2, "_GSVA")
+dir.create(output_dir, showWarnings = FALSE)
+setwd(output_dir)
+
+# 10.2 保存差异分析结果
+write.csv(results_h, "Hallmark_differential_pathways.csv", row.names = TRUE)
+write.csv(results_kegg, "KEGG_differential_pathways.csv", row.names = TRUE)
+write.csv(results_bp, "GO_BP_differential_pathways.csv", row.names = TRUE)
+
+# 10.3 创建显著差异通路的热图
+
+# Hallmark通路热图
+if(sum(results_h$adj.P.Val < 0.05) > 0) {
+  sig_pathways_h <- rownames(results_h)[results_h$adj.P.Val < 0.05]
+  sig_pathways_h <- sig_pathways_h[1:min(30, length(sig_pathways_h))]
+  
+  # 提取显著通路的GSVA得分
+  gsva_sig_h <- gsva_results_h[sig_pathways_h, ]
+  
+  # 创建注释数据框
+  anno_col <- data.frame(Group = target_cells$selected_group)
+  rownames(anno_col) <- colnames(gsva_sig_h)
+  anno_colors <- list(Group = c(Control = "blue", Treatment = "red"))
+  names(anno_colors$Group) <- c(group1, group2)
+  
+  # 生成热图
+  pdf("Hallmark_significant_pathways_heatmap.pdf", width = 10, height = min(12, 6 + length(sig_pathways_h) * 0.3))
+  pheatmap(gsva_sig_h,
+           annotation_col = anno_col,
+           annotation_colors = anno_colors,
+           show_colnames = FALSE,
+           cluster_rows = TRUE,
+           cluster_cols = TRUE,
+           scale = "row",
+           fontsize_row = 10,
+           main = paste0("Hallmark Gene Sets - ", target_cell_type, "\n", group1, " vs ", group2))
+  dev.off()
+}
+
+# KEGG通路热图
+if(sum(results_kegg$adj.P.Val < 0.05) > 0) {
+  sig_pathways_kegg <- rownames(results_kegg)[results_kegg$adj.P.Val < 0.05]
+  sig_pathways_kegg <- sig_pathways_kegg[1:min(30, length(sig_pathways_kegg))]
+  
+  gsva_sig_kegg <- gsva_results_kegg[sig_pathways_kegg, ]
+  
+  anno_col <- data.frame(Group = target_cells$selected_group)
+  rownames(anno_col) <- colnames(gsva_sig_kegg)
+  anno_colors <- list(Group = c(Control = "blue", Treatment = "red"))
+  names(anno_colors$Group) <- c(group1, group2)
+  
+  pdf("KEGG_significant_pathways_heatmap.pdf", width = 12, height = min(14, 6 + length(sig_pathways_kegg) * 0.3))
+  pheatmap(gsva_sig_kegg,
+           annotation_col = anno_col,
+           annotation_colors = anno_colors,
+           show_colnames = FALSE,
+           cluster_rows = TRUE,
+           cluster_cols = TRUE,
+           scale = "row",
+           fontsize_row = 10,
+           main = paste0("KEGG Pathways - ", target_cell_type, "\n", group1, " vs ", group2))
+  dev.off()
+}
+
+# GO生物过程热图 (限制为前20个显著通路，避免图形过大)
+if(sum(results_bp$adj.P.Val < 0.05) > 0) {
+  sig_pathways_bp <- rownames(results_bp)[results_bp$adj.P.Val < 0.05]
+  sig_pathways_bp <- sig_pathways_bp[1:min(20, length(sig_pathways_bp))]
+  
+  gsva_sig_bp <- gsva_results_bp[sig_pathways_bp, ]
+  
+  anno_col <- data.frame(Group = target_cells$selected_group)
+  rownames(anno_col) <- colnames(gsva_sig_bp)
+  anno_colors <- list(Group = c(Control = "blue", Treatment = "red"))
+  names(anno_colors$Group) <- c(group1, group2)
+  
+  pdf("GO_BP_significant_pathways_heatmap.pdf", width = 14, height = min(16, 6 + length(sig_pathways_bp) * 0.3))
+  pheatmap(gsva_sig_bp,
+           annotation_col = anno_col,
+           annotation_colors = anno_colors,
+           show_colnames = FALSE,
+           cluster_rows = TRUE,
+           cluster_cols = TRUE,
+           scale = "row",
+           fontsize_row = 9,
+           main = paste0("GO Biological Process - ", target_cell_type, "\n", group1, " vs ", group2))
+  dev.off()
+}
+
+# 10.4 显著通路的箱线图
+plot_boxplots <- function(gsva_results, results_table, result_type, max_plots = 10) {
+  sig_pathways <- rownames(results_table)[results_table$adj.P.Val < 0.05]
+  
+  if(length(sig_pathways) == 0) {
+    return()
+  }
+  
+  # 按照统计显著性排序
+  sig_pathways <- sig_pathways[order(results_table[sig_pathways, "adj.P.Val"])]
+  # 限制图形数量
+  sig_pathways <- sig_pathways[1:min(max_plots, length(sig_pathways))]
+  
+  # 创建一个目录保存箱线图
+  box_dir <- paste0(result_type, "_boxplots")
+  dir.create(box_dir, showWarnings = FALSE)
+  
+  # 为每个通路创建箱线图
+  for(pathway in sig_pathways) {
+    # 准备数据
+    plot_data <- data.frame(
+      GSVA_score = gsva_results[pathway, ],
+      Group = target_cells$selected_group
+    )
+    
+    # 格式化通路名称用于标题
+    pathway_title <- gsub("_", " ", pathway)
+    if(nchar(pathway_title) > 50) {
+      pathway_title <- paste0(substr(pathway_title, 1, 47), "...")
+    }
+    
+    # 创建箱线图
+    p <- ggplot(plot_data, aes(x = Group, y = GSVA_score, fill = Group)) +
+      geom_boxplot(alpha = 0.8, outlier.shape = 21) +
+      geom_jitter(width = 0.2, size = 0.5, alpha = 0.5) +
+      theme_classic() +
+      scale_fill_manual(values = c(group1 = "blue", group2 = "red")) +
+      labs(title = pathway_title,
+           subtitle = paste0("Adj. P-value = ", signif(results_table[pathway, "adj.P.Val"], 3),
+                            ", LogFC = ", signif(results_table[pathway, "logFC"], 3)),
+           x = "", y = "GSVA Enrichment Score") +
+      theme(plot.title = element_text(size = 11, hjust = 0.5),
+            plot.subtitle = element_text(size = 9, hjust = 0.5),
+            legend.position = "none")
+    
+    # 保存图形
+    ggsave(paste0(box_dir, "/", gsub("/", "_", pathway), ".pdf"), 
+           plot = p, width = 5, height = 6)
+  }
+}
+
+# 为所有三种基因集创建箱线图
+plot_boxplots(gsva_results_h, results_h, "Hallmark")
+plot_boxplots(gsva_results_kegg, results_kegg, "KEGG")
+plot_boxplots(gsva_results_bp, results_bp, "GO_BP", max_plots = 15)
+
+# 11. 富集通路结果汇总
+print("创建富集通路汇总表...")
+
+# 将各数据库的结果标记并合并
+results_h$Database <- "Hallmark"
+results_h$Pathway <- rownames(results_h)
+results_kegg$Database <- "KEGG"
+results_kegg$Pathway <- rownames(results_kegg)
+results_bp$Database <- "GO_BP"
+results_bp$Pathway <- rownames(results_bp)
+
+# 创建一个综合数据框
+all_results <- rbind(
+  results_h[, c("Pathway", "Database", "logFC", "AveExpr", "t", "P.Value", "adj.P.Val", "B")],
+  results_kegg[, c("Pathway", "Database", "logFC", "AveExpr", "t", "P.Value", "adj.P.Val", "B")],
+  results_bp[, c("Pathway", "Database", "logFC", "AveExpr", "t", "P.Value", "adj.P.Val", "B")]
+)
+
+# 添加方向信息
+all_results$Direction <- ifelse(all_results$logFC > 0, paste0("Up in ", group2), paste0("Up in ", group1))
+
+# 按照P值排序
+all_results <- all_results[order(all_results$adj.P.Val), ]
+
+# 保存综合结果
+write.csv(all_results, "All_pathways_combined_results.csv", row.names = FALSE)
+
+# 创建显著结果的子集
+sig_results <- all_results[all_results$adj.P.Val < 0.05, ]
+write.csv(sig_results, "Significant_pathways_combined_results.csv", row.names = FALSE)
+
+# 12. 创建富集通路汇总图
+if(nrow(sig_results) > 0) {
+  # 为每个数据库选择前15个显著通路
+  top_pathways <- NULL
+  for(db in unique(sig_results$Database)) {
+    db_results <- sig_results[sig_results$Database == db, ]
+    if(nrow(db_results) > 0) {
+      db_top <- db_results[order(abs(db_results$logFC), decreasing = TRUE), ][1:min(15, nrow(db_results)), ]
+      top_pathways <- rbind(top_pathways, db_top)
+    }
+  }
+  
+  # 创建通路富集点图
+  if(!is.null(top_pathways) && nrow(top_pathways) > 0) {
+    # 格式化通路名称以适应绘图
+    top_pathways$Pathway_short <- gsub("_", " ", top_pathways$Pathway)
+    top_pathways$Pathway_short <- ifelse(nchar(top_pathways$Pathway_short) > 40, 
+                                      paste0(substr(top_pathways$Pathway_short, 1, 37), "..."), 
+                                      top_pathways$Pathway_short)
+    
+    # 按方向和数据库排序
+    top_pathways$Pathway_short <- factor(top_pathways$Pathway_short, 
+                                      levels = top_pathways$Pathway_short[order(top_pathways$Database, top_pathways$logFC)])
+    
+    # 创建点图
+    p <- ggplot(top_pathways, aes(x = logFC, y = Pathway_short, color = -log10(adj.P.Val), size = abs(logFC))) +
+      geom_point() +
+      scale_color_gradient(low = "blue", high = "red") +
+      facet_grid(Database ~ ., scales = "free_y", space = "free") +
+      labs(x = paste0("Log2 Fold Change (", group2, " vs ", group1, ")"),
+           y = "",
+           color = "-log10(adj.P.Val)",
+           size = "abs(logFC)",
+           title = paste0("Enriched Pathways in ", target_cell_type),
+           subtitle = paste0(group2, " vs ", group1)) +
+      theme_bw() +
+      theme(axis.text.y = element_text(size = 8),
+            strip.text = element_text(size = 10, face = "bold"),
+            plot.title = element_text(size = 12, hjust = 0.5),
+            plot.subtitle = element_text(size = 10, hjust = 0.5))
+    
+    # 保存图形
+    ggsave("Top_enriched_pathways_dotplot.pdf", plot = p, width = 10, height = min(14, 6 + nrow(top_pathways) * 0.25))
+  }
+}
+
+print(paste0("分析完成！结果保存在 ", output_dir, " 目录下"))
+```
+
 
 
 

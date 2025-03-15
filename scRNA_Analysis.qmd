@@ -28,6 +28,7 @@ library(Seurat)
 library(Matrix)
 library(scales)
 
+library(BiocParallel)
 
 # options(future.globals.maxSize = 4000 * 1024^2)
 ```
@@ -76,6 +77,87 @@ merged_seurat$mitoRatio <- merged_seurat@meta.data$mitoRatio / 100
 merged_seurat <- PercentageFeatureSet(merged_seurat, "^RP[SL]",col.name = "percent.ribo")
 merged_seurat <- PercentageFeatureSet(merged_seurat, "^HB[^(P)]", col.name = "percent.hb")
 ```
+
+
+```{r}
+# Doublet 检测 (使用scDblFinder)
+# 对于dbr参数，10X其的数值为1000个细胞0.8%
+# dbr.per1k参数会自动设置
+
+for (i in names(seurat_objects)) {
+  seu <- seurat_objects[[i]]
+  seu <- NormalizeData(seu)
+  seu <- FindVariableFeatures(seu)
+  seu <- ScaleData(seu)
+  seu <- RunPCA(seu)
+  seu <- RunUMAP(seu, dims = 1:20) # 可以先用UMAP辅助doublet检测
+  
+  sce =  as.SingleCellExperiment(seu)
+
+  if (is.null(counts(sce))) {
+    counts(sce) <- GetAssayData(seu, layer = "counts")
+  }
+
+  sce <- scDblFinder::scDblFinder(sce,
+    samples = "sample",
+    BPPARAM = MulticoreParam(4),
+    verbose = TRUE
+  )
+  
+  # 将结果添加回 Seurat 对象（可选）
+  seu$scDblFinder.score <- sce$scDblFinder.score
+  seu$scDblFinder.class <- sce$scDblFinder.class
+  
+  DimPlot(seu, group.by = "scDblFinder.class")
+  
+  table(sce$scDblFinder.class)
+
+  seu <- subset(seu, subset = scDblFinder.class == "singlet")
+}
+```
+
+
+```{r}
+#| eval: false
+
+# Assuming 'seurat_obj' is your Seurat object
+seurat_obj <- NormalizeData(seurat_obj)
+seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000)
+seurat_obj <- ScaleData(seurat_obj)
+seurat_obj <- RunPCA(seurat_obj, npcs = 20)
+seurat_obj <- FindNeighbors(seurat_obj, dims = 1:10)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.5)
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:10)
+
+# The pK parameter represents the neighborhood size used to compute the proportion of artificial nearest neighbors (pANN). Determining the optimal pK is crucial for accurate doublet detection.
+
+
+sweep.res.list <- paramSweep_v3(seurat_obj, PCs = 1:10, sct = FALSE)
+sweep.stats <- summarizeSweep(sweep.res.list, GT = FALSE)
+bcmvn <- find.pK(sweep.stats)
+
+nExp_poi <- round(0.05 * ncol(seurat_obj))
+
+pK_value <- as.numeric(as.vector(bcmvn[bcmvn$MeanBC == max(bcmvn$MeanBC), "pK"]))
+seurat_obj <- doubletFinder_v3(seurat_obj, PCs = 1:10, 
+                               pN = 0.25, pK = pK_value, 
+                               nExp = nExp_poi, reuse.pANN = FALSE, 
+                               sct = FALSE)
+
+
+# Rename the classification column for clarity
+colnames(seurat_obj@meta.data)[ncol(seurat_obj@meta.data)] <- "doublet_class"
+
+# View the classification counts
+table(seurat_obj$doublet_class)
+
+# Visualize doublets on a UMAP plot
+DimPlot(seurat_obj, group.by = "doublet_class")
+
+seurat_obj_filtered <- subset(seurat_obj, subset = doublet_class == "Singlet")
+```
+
+
 
 
 ```{r}
@@ -729,6 +811,57 @@ VlnPlot(object = harmonized_seurat,
 ```
 
 
+如果你有可以对细胞进行分群的marker基因，你还可以手动注释，
+首先把所有的marker基因都在你所选择的cluster俩民展示出来，然后一一对应的进行注释：
+```{r}
+# 比如说你有20个分组，类似的操作如下，虽然代码有些蠢
+
+
+genes_to_check = c('Siglech', 'Clec10a',  'Clec12a','CLEC4C ', #pDC
+                   'Xcr1', 'Flt3',  'Ccr7','CD1E ',#cDC
+                   'CD3D', 'CD3E', 'CD8A', 'CD4','CD2', #T
+                   'AIF1', 'C1QC','C1QB','LYZ','CD68','CD163',  #巨噬
+                   'Ly6c2' , 'Spn','CD14','CD300E', #单核
+                   'CDH5', 'PECAM1', 'VWF','CLDN5',  #内皮
+                   'LUM' , 'FGF7', 'MME', 'DCN' ,#成纤维
+                   'CPA3' ,'CST3', 'KIT', 'TPSAB1','TPSB2','MS4A2',#肥大
+                   'GOS2', 'S100A9','S100A8','CXCL8','CXCR1','CMTM2', #中性粒Neutrophil
+                   'KLRD1', 'GNLY', 'KLRF1','AREG', 'XCL2','HSPA6', #NK
+                   'MS4A1','CD19', 'CD79A',#B
+                   'IGKC','MZB1', 'SLAMF7',  #plasma 
+                   'ACTA2','PDGFRA',#SMC
+                   'CSF1R', 'CSF3R', 'CD68') #髓系
+
+
+#####细胞生物学命名
+celltype=data.frame(ClusterID=0:20,
+                    celltype= 0:20) 
+
+# 这里强烈依赖于生物学背景，看dotplot的基因表达量情况来人工审查单细胞亚群名字
+celltype[celltype$ClusterID %in% c(6 ),2]='Macrophage'
+celltype[celltype$ClusterID %in% c( 7 ),2]='pDCs'
+celltype[celltype$ClusterID %in% c( 14 ),2]='cDC'
+celltype[celltype$ClusterID %in% c( 18 ),2]='Monocyte'
+celltype[celltype$ClusterID %in% c(0,3),2]='T'
+celltype[celltype$ClusterID %in% c( 2,5,13 ),2]='Fibro'
+celltype[celltype$ClusterID %in% c( 15 ),2]='Mast'
+celltype[celltype$ClusterID %in% c( 10 ),2]='NK'
+celltype[celltype$ClusterID %in% c( 1),2]='B'
+celltype[celltype$ClusterID %in% c( 8,9,16,20 ),2]='Endothelial'
+celltype[celltype$ClusterID %in% c( 4,17,19),2]='Neutrophil'
+celltype[celltype$ClusterID %in% c( 11),2]='SMC'
+celltype[celltype$ClusterID %in% c( 12),2]='plasma'
+
+table(scRNA@meta.data$RNA_snn_res.0.5)
+table(celltype$celltype)
+
+scRNA@meta.data$celltype = "NA"
+for(i in 1:nrow(celltype)){
+  scRNA@meta.data[which(scRNA@meta.data$RNA_snn_res.0.5 == celltype$ClusterID[i]),'celltype'] <- celltype$celltype[i]}
+table(scRNA@meta.data$celltype)
+```
+
+
 
 
 ## Differential expression between conditions
@@ -756,6 +889,208 @@ head(b.interferon.response, n = 5)
 
 
 ### Pseudobulk DE by DESeq2
+
+```{r}
+#相关性分析
+av <-AggregateExpression(harmonized_seurat,
+                         group.by = c("orig.ident","celltype"),
+                         assays = "RNA",
+                         #layer = "counts",
+                         return.seurat = FALSE)  # 返回总的计数 
+av=as.data.frame(av[[1]])
+head(av)[1:3,1:3] 
+```
+
+
+```{r}
+# pseudobulks + 差异分析
+
+av <-AggregateExpression(sce.all,
+                         group.by = c("orig.ident","location"),
+                         assays = "RNA",
+                         slot = "counts",
+                         return.seurat = FALSE)  # 返回总的计数 
+av=as.data.frame(av[[1]])
+head(av)[1:3,1:3]
+```
+
+
+```{r}
+library(tibble)
+library(DESeq2)
+# 1. Get counts matrix
+counts_res <- av
+head(counts_res)
+```
+
+```{r}
+# 2. generate sample level metadata
+colData <- data.frame(samples = colnames(counts_res))
+colData <- colData %>%
+ mutate(condition = ifelse(grepl('left', samples), 'left', 'right')) %>%
+ column_to_rownames(var = 'samples')
+
+# 3. perform DESeq2 --------
+# Create DESeq2 object  
+dds <- DESeqDataSetFromMatrix(countData = counts_res,
+            colData = colData,
+            design = ~ condition) # condition 表示差异分析将基于colData的condition 变量进行
+
+# filter
+keep <- rowSums(counts(dds)) >=10
+dds <- dds[keep,]
+# run DESeq2
+dds <- DESeq(dds)
+# Check the coefficients for the comparison
+resultsNames(dds)
+
+# Generate results object
+res <- results(dds, name = "condition_right_vs_left")
+res
+```
+
+
+```{r}
+resOrdered <- res[order(res$padj),]
+head(resOrdered)
+DEG =as.data.frame(resOrdered)
+DEG_deseq2 = na.omit(DEG)
+
+#添加上下调信息
+DEG_deseq2 <- DEG_deseq2 %>%
+  mutate(Type = if_else(padj > 0.05, "stable",
+                        if_else(abs(log2FoldChange) < 1, "stable",
+                                if_else(log2FoldChange >= 1, "up", "down")))) %>%
+  arrange(desc(abs(log2FoldChange))) %>% rownames_to_column("Symbol")
+# ggplot绘图
+ggplot(DEG_deseq2, aes(log2FoldChange,-log10(padj))) +
+  geom_point(size = 3.5, alpha = 0.8,
+             aes(color = Type),show.legend = T)  +
+  scale_color_manual(values = c("#00468B", "gray", "#E64B35")) +
+  ylim(0, 15) +
+  xlim(-10, 10) +
+  labs(x = "Log2(fold change)", y = "-log10(padj)") +
+  geom_hline(yintercept = -log10(0.05), linetype = 2, color = 'black',lwd=0.8) + 
+  geom_vline(xintercept = c(-1, 1), linetype = 2, color = 'black',lwd=0.8)+theme_bw()+
+  theme(panel.grid.major = element_blank(),panel.grid.minor = element_blank())
+# ggsave("volcano.pdf",width = 9,height = 7)
+```
+
+
+### GSVA analysis
+
+```{r}
+library(GSVA)
+```
+
+
+
+```{r}
+sce <- sce.all
+genesets <- msigdbr(species = "Homo sapiens", category = "C2") 
+genesets <- subset(genesets, select = c("gs_name","gene_symbol")) %>% as.data.frame()
+genesets <- split(genesets$gene_symbol, genesets$gs_name)
+
+# 请注意这里AverageExpression用于计算每个基因在所有细胞中的平均表达值，
+Idents(sce) <- sce$celltype
+expr <- AverageExpression(sce, assays = "RNA", slot = "data")[[1]]
+expr <- expr[rowSums(expr)>0,]  #选取非零基因
+expr <- as.matrix(expr)
+head(expr)
+```
+
+
+```{r}
+# gsva默认开启全部线程计算
+gsvaPar <- gsvaParam(expr, genesets,maxDiff = TRUE)
+gsvaPar 
+gsva.res <- gsva(gsvaPar)
+dim(gsva.res)
+head(gsva.res)[1:5,1:5]
+
+
+gsva.df <- data.frame(Genesets=rownames(gsva.res), gsva.res, check.names = F)
+gsva_d = gsva.res[sample(nrow(gsva.res),30),]
+
+
+```
+
+```{r}
+pheatmap::pheatmap(gsva_d, show_colnames = T, 
+                   scale = "row",angle_col = "45",
+                   color = colorRampPalette(c("navy", "white", "firebrick3"))(50))
+```
+
+
+
+```{r}
+gsva_long <- melt(gsva_d, id.vars = "Genesets")
+
+# 创建气泡图
+ggplot(gsva_long, aes(x = Var2, y = Var1, size = value, color = value)) +
+  geom_point(alpha = 0.7) +  # 使用散点图层绘制气泡，alpha设置点的透明度
+  scale_size_continuous(range = c(1, 6)) +  # 设置气泡大小的范围
+  theme_bw() + 
+  scale_color_gradient(low = "#336699", high =  "tomato") +
+  labs(x = "Gene Set", y = "Sample", size = "GSVA Score")+
+  ggtitle("GSVA analysis") +
+  theme(axis.text.x = element_text(angle = 45,vjust = 0.5,hjust = 0.5),
+        plot.title = element_text(hjust = 0.5))
+ggsave('gsva_dot_C2.pdf',width = 10,height = 7)
+```
+
+
+
+
+### 直接对FindAllMarkers找到的基因进行富集分析
+
+
+```{r}
+gene = markers[markers$p_val <0.01 & markers$avg_log2FC >2,]$gene
+
+entrezIDs = bitr(gene, fromType = "SYMBOL", toType = "ENTREZID", 
+                 OrgDb= "org.Hs.eg.db", drop = TRUE)
+
+gene<- entrezIDs$ENTREZID
+
+marker_new = markers[markers$gene %in% entrezIDs$SYMBOL,]
+marker_new = marker_new[!duplicated(marker_new$gene),]
+identical(marker_new$gene, entrezIDs$SYMBOL)
+
+p = identical(marker_new$gene, entrezIDs$SYMBOL);p
+
+if(!p) entrezIDs = entrezIDs[match(marker_new$gene,entrezIDs$SYMBOL),]
+marker_new$ID = entrezIDs$ENTREZID
+```
+
+
+```{r}
+## GO
+gcSample=split(marker_new$ID, marker_new$cluster) 
+###参数可以更改，看看?compareCluster
+#One of "groupGO", "enrichGO", "enrichKEGG", "enrichDO" or "enrichPathway" 
+xx <- compareCluster(gcSample,
+                     fun = "enrichGO",
+                     OrgDb = "org.Hs.eg.db",
+                     ont = "BP",
+                     pAdjustMethod = "BH",
+                     pvalueCutoff = 0.01,
+                     qvalueCutoff = 0.05
+)
+
+p <- dotplot(xx)
+library(ggthemes)
+p + theme(axis.text.x = element_text(
+  angle = 45,
+  vjust = 0.5, hjust = 0.5
+))+theme_few()
+```
+
+
+
+
+
+
 
 
 

@@ -72,7 +72,67 @@ A: 对于每一个分组的重复, 可以有效的控制批次效应.if doing DE
 一般在把多个数据merge后，会通过质控删掉一些cells和genes，然后进行integrate，那在integrate后需不需要进一步对数据进行质控呢？
 
 
+## 常见的Marker基因
 
+
+T Cells (CD3D, CD3E, CD8A,PTPRC,CD4,CD2),
+B cells (CD19, CD79A, MS4A1 [CD20]),
+Plasma cells (IGHG1, MZB1, SDC1, CD79A),
+Monocytes and macrophages (CD68, CD163, CD14),
+NK Cells (FGFBP2, FCG3RA, CX3CR1),
+Fibroblasts (FGF7, MME,GSN,LUM,DCN),
+Endothelial cells (PECAM1, VWF).
+epi or tumor (EPCAM, KRT19, PROM1, ALDH1A1, CD24).
+immune (CD45+,PTPRC),
+epithelial/cancer (EpCAM+,EPCAM),
+stromal (CD10+,MME,fibo or CD31+,PECAM1,endo)
+Mast(CPA3, CST3, KIT, TPSAB1, TPSB2, MS4A2)
+
+髓系
+macrophages (Adgre1, Cd14, and Fcgr3,LYZ,CD68,CD163),
+cDCs (Xcr1, Flt3, Ccr7,CD1E),
+pDCs (Siglech, Clec10a, Clec12a,CLEC4C),
+monocytes (Ly6c2 , Spn,CD300E),
+neutrophils (Csf3r, S100a8, and Cxcl3),
+
+
+
+神经元相关marker基因GSE212199_中枢神经系统免疫细胞
+
+astrocytes = c("AQP4", "ADGRV1", "GPC5", "RYR3")
+endothelial = c("CLDN5", "ABCB1", "EBF1") 
+excitatory = c("CAMK2A", "CBLN2", "LDB2") 
+inhibitory = c("GAD1", "LHFPL3", "PCDH15") 
+microglia = c("C3", "LRMDA", "DOCK8") 
+oligodendrocytes = c("MBP", "PLP1", "ST18") 
+OPC='Tnr,Igsf21,Neu4,Gpr17'
+Ependymal='Cfap126,Fam183b,Tmem212,pifo,Tekt1,Dnah12'
+pericyte=c(  'DCN', 'LUM',  'GSN' ,'FGF7','MME', 'ACTA2','RGS5')
+
+
+鼠肝脏GSE185042
+Kupffer = c("CD163", "CD206", "F4/80", "CD68") 
+endothelial = c("CLDN5", "ABCB1", "EBF1","CD31","VWF") 
+macrophage = c('Adgre1', 'Cd14',  'Fcgr3')
+Cholangiocyte = c("CK7", "CK19", "SOX9","EpCAM","FYXD2","TM4SF4","ANXA4") 
+Hepatocyte = c("ALB", "AFP", "CYP2E1","HNF4A","ASGR1","APOC3","FABP1"," APOA1") 
+Dividing='Ki-67,PCNA,MCM2,AURKA'
+PlasmaB='CD138,CD19,CD20,CD27,CD38,IRF4'
+Hepatic_stellate=c(  'GFAP', 'PDGFRβ',"ACTA2","COL1A1")
+cDCs=c('Xcr1', 'Flt3',  'Ccr7')
+pDCs=c('Siglech', 'Clec10a',  'Clec12a')
+
+
+
+人类心脏GSE214611—心肌梗死心脏
+
+Macrophages = c("APOC1","HLA-DRB5","C1QA","C1QB")
+CM=c("TTN","MYH7","MYH6","TNNT2") #心肌细胞
+endothelial=c("VWF", "IFI27", "PECAM1","MGP")
+Fibroblast=c("DCN", "GSN" ,"LUM","FBLN1","COL1A2")
+SMC=c("ACTA2", "CALD1", "MYH11","Myo1b","RGS5')
+monocytes=c('Ly6c2' , 'Spn')
+neutrophils=c('Csf3r', 'S100a8',  'Cxcl3') 
 
 
 
