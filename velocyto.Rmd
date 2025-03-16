@@ -9,7 +9,7 @@ output: pdf_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-## velocyto
+## velocyto old (参考下面的new)
 
 velocyto is a package for the analysis of expression dynamics in single cell RNA seq data. In particular, it enables estimations of RNA velocities of single cells by distinguishing unspliced and spliced mRNAs in standard single-cell RNA sequencing protocols (see pre-print below for more information).
 
@@ -27,11 +27,22 @@ velocyto is a package for the analysis of expression dynamics in single cell RNA
 
 
 ```{r}
+library(SeuratWrappers)
 library(velocyto)
 library(scVelo)
 ```
 
 使用velocyto包从cell ranger输出的bam文件中提取一是成熟mRNA(spliced)的count矩阵，二是未成熟mRNA(unspliced)的count矩阵. 可以在服务器上利用python版的velocyto进行分析。
+
+
+第一步：velocyto命令行工具用于从单细胞RNA测序数据中生成包含spliced和unspliced转录本信息的.loom文件。以下是使用velocyto命令行工具生成.loom文件的详细步骤：
+
+准备必要的输入文件
+velocyto需要以下输入文件：
+
+BAM文件：包含比对到参考基因组的测序reads
+注释文件：基因组注释文件（GTF格式）
+样本barcode文件：10x Genomics实验中的细胞barcode列表
 
 ```{r, engine = 'bash', eval = FALSE}
 rmsk_gtf=$HOME/pipeline/velocyto/hg38_repeat_rmsk.gtf # 从genome.ucsc.edu下载 
@@ -61,6 +72,11 @@ bm <- FindNeighbors(object = bm, dims = 1:20)
 bm <- FindClusters(object = bm)
 bm <- RunUMAP(object = bm, dims = 1:20)
  
+
+```
+
+
+```{r}
 # 拟合平衡系数 γ
 bm <- RunVelocity(object = bm, deltaT = 1, kCells = 25, fit.quantile = 0.02)
 ident.colors <- (scales::hue_pal())(n = length(x = levels(x = bm)))
@@ -77,14 +93,479 @@ show.velocity.on.embedding.cor(emb = Embeddings(object = bm, reduction = "umap")
 
 
 
-## scVelo
+## velocyte new
 
-```{python}
 
+
+```{bash}
+# 对于10x Genomics数据
+velocyto run10x \
+    /path/to/10x/sample_folder \
+    /path/to/reference/annotations.gtf
+```
+
+
+```{r}
+# RNA速率分析详细脚本
+# 基于Seurat对象和velocyto工具进行RNA速率分析
+# 注：此分析需要有unspliced (pre-mRNA)和spliced (mature mRNA)的数据
+
+# 加载必要的包
+library(Seurat)            # 用于单细胞数据处理
+library(SeuratWrappers)    # 包含Seurat与其他工具的接口
+library(velocyto.R)        # RNA速率分析主要工具包
+library(scVelo)            # 另一个进行RNA速率分析的R包
+library(ggplot2)           # 用于可视化
+library(dplyr)             # 数据处理工具
+library(patchwork)         # 组合多个图形
+
+# =================== 第1步：准备数据 ===================
+
+# 假设您已经有一个Seurat对象，称为seurat_obj
+# 如果没有，可以按照如下方式创建一个简单的Seurat对象
+# 注意：实际使用时请替换为您自己的数据路径
+
+# seurat_obj <- CreateSeuratObject(counts = Read10X("path/to/filtered_feature_bc_matrix"))
+# seurat_obj <- NormalizeData(seurat_obj)
+# seurat_obj <- FindVariableFeatures(seurat_obj)
+# seurat_obj <- ScaleData(seurat_obj)
+# seurat_obj <- RunPCA(seurat_obj)
+# seurat_obj <- FindNeighbors(seurat_obj)
+# seurat_obj <- FindClusters(seurat_obj)
+# seurat_obj <- RunUMAP(seurat_obj, dims = 1:30)
+
+# =================== 第2步：准备RNA速率数据 ===================
+
+# 方法1: 如果您已经使用velocyto命令行工具生成了.loom文件
+# 读取velocyto生成的loom文件
+loom_path <- "path/to/your_sample.loom"  # 替换为您的.loom文件路径
+ldat <- read.loom.matrices(loom_path)
+
+# 方法2: 如果您有spliced和unspliced计数矩阵
+# spliced_counts <- Read10X("path/to/spliced_counts")
+# unspliced_counts <- Read10X("path/to/unspliced_counts")
+# ldat <- list(spliced = spliced_counts, unspliced = unspliced_counts)
+
+# =================== 第3步：将RNA速率数据与Seurat对象整合 ===================
+
+# 确保细胞ID匹配
+# velocyto的loom文件中的细胞ID可能与Seurat中的不完全相同，需要进行匹配
+common_cells <- intersect(colnames(ldat$spliced), colnames(seurat_obj))
+print(paste("共有细胞数:", length(common_cells)))
+
+# 过滤RNA速率数据，只保留Seurat对象中的细胞
+ldat$spliced <- ldat$spliced[, common_cells]
+ldat$unspliced <- ldat$unspliced[, common_cells]
+
+# =================== 第4步：使用SeuratWrappers运行RNA速率分析 ===================
+
+# 将RNA速率数据添加到Seurat对象
+seurat_obj <- RunVelocity(
+  object = seurat_obj,
+  spliced = ldat$spliced,
+  unspliced = ldat$unspliced,
+  deltaT = 1,        # 时间步长，通常使用默认值1
+  kCells = 25,       # k近邻数量，可根据数据集大小调整
+  fit.quantile = 0.02 # 拟合分位数，影响速率估计的严格程度
+)
+
+# =================== 第5步：计算细胞速率 ===================
+
+# 计算细胞速率投影
+seurat_obj <- RunVelocityPCA(seurat_obj, nPCs = 30)  # 在PCA空间中计算速率
+seurat_obj <- RunVelocityUMAP(seurat_obj)  # 在UMAP空间中计算速率
+
+# =================== 第6步：可视化 ===================
+
+# 1. 绘制RNA速率向量图 (在UMAP上展示细胞状态转换方向)
+velocity_umap_plot <- show.velocity.on.embedding.cor(
+  emb = Embeddings(seurat_obj, reduction = "umap"),
+  vel = Tool(seurat_obj, slot = "RunVelocity"),
+  n = 200,           # 显示的箭头数量
+  scale = "sqrt",    # 箭头缩放方法
+  cell.colors = seurat_obj$seurat_clusters,  # 按聚类着色
+  cex = 0.8,         # 点的大小
+  arrow.scale = 3,   # 箭头大小缩放因子
+  arrow.lwd = 1,     # 箭头线宽
+  main = "RNA Velocity Vectors on UMAP"
+)
+
+# 2. 按基因绘制速率
+# 选择感兴趣的基因(例如marker基因)
+genes_of_interest <- c("Gene1", "Gene2", "Gene3")  # 替换为您感兴趣的基因名称
+
+# 循环绘制每个基因的速率
+gene_velocity_plots <- list()
+for (gene in genes_of_interest) {
+  if (gene %in% rownames(seurat_obj)) {
+    gene_velocity_plots[[gene]] <- gene.relative.velocity.estimates(
+      deltaE = Tool(seurat_obj, slot = "RunVelocity")$deltaE,
+      deltaP = Tool(seurat_obj, slot = "RunVelocity")$deltaP,
+      emat = GetAssayData(seurat_obj, assay = "RNA", slot = "data"),
+      nmat = GetAssayData(seurat_obj, assay = "RNA", slot = "data"),
+      gene.relative.velocity.estimates = gene,
+      cell.emb = Embeddings(seurat_obj, reduction = "umap"),
+      cell.colors = seurat_obj$seurat_clusters,
+      show.gene = TRUE,
+      main = paste("Velocity of", gene)
+    )
+  }
+}
+
+# 3. 绘制速率流场图
+velocity_field_plot <- show.velocity.on.embedding.cor(
+  emb = Embeddings(seurat_obj, reduction = "umap"),
+  vel = Tool(seurat_obj, slot = "RunVelocity"),
+  n = 100,           # 网格点数量
+  scale = "sqrt",    # 缩放方法
+  cell.colors = seurat_obj$seurat_clusters,
+  cell.alpha = 0.5,  # 细胞点透明度
+  grid.n = 40,       # 网格大小
+  arrow.scale = 2,   # 箭头大小
+  show.grid.flow = TRUE,  # 显示网格流
+  min.grid.cell.mass = 0.5,  # 最小网格细胞质量
+  main = "RNA Velocity Field"
+)
+
+# 4. 速率一致性分析(检查速率方向的一致性)
+# 计算速率一致性分数
+consistency_scores <- show.velocity.on.embedding.cor(
+  emb = Embeddings(seurat_obj, reduction = "umap"),
+  vel = Tool(seurat_obj, slot = "RunVelocity"),
+  return.details = TRUE,  # 返回详细数据
+  n.cores = 4              # 使用的CPU核心数
+)
+
+# 将一致性分数添加到Seurat对象
+seurat_obj$velocity_consistency <- consistency_scores$correlation_score
+
+# 绘制速率一致性图
+consistency_plot <- FeaturePlot(
+  seurat_obj,
+  features = "velocity_consistency",
+  min.cutoff = "q10",  # 最小截断值
+  max.cutoff = "q90",  # 最大截断值
+  cols = c("blue", "red"),  # 颜色范围
+  pt.size = 1
+) +
+  ggtitle("RNA Velocity Consistency") +
+  theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold"))
+
+# =================== 第7步：识别细胞命运转变的潜在调控基因 ===================
+
+# 1. 识别具有高速率的基因 (这些基因可能在细胞状态转变中起重要作用)
+vel_info <- Tool(seurat_obj, slot = "RunVelocity")
+
+# 计算每个基因的平均绝对速率
+gene_velocity_abs <- rowMeans(abs(vel_info$deltaE))
+
+# 排序并筛选出最高的基因
+top_velocity_genes <- sort(gene_velocity_abs, decreasing = TRUE)[1:50]
+print("具有最高绝对速率的前50个基因:")
+print(top_velocity_genes)
+
+# 2. 分析转换相关基因
+# 根据正则化残差估计未来状态
+future_ids <- as.integer(names(which.max(table(
+  velocyto::cell.dist.knn(
+    current = t(GetAssayData(seurat_obj, assay = "RNA", slot = "scale.data")),
+    future = t(GetAssayData(seurat_obj, assay = "RNA", slot = "scale.data") + vel_info$projected),
+    k = 10
+  )[, 1]
+))))
+
+# 比较当前状态和预测的未来状态，找出差异最大的基因
+state_diffs <- colMeans(GetAssayData(seurat_obj, assay = "RNA", slot = "scale.data")[, future_ids, drop = FALSE]) -
+              colMeans(GetAssayData(seurat_obj, assay = "RNA", slot = "scale.data"))
+
+# 排序并筛选差异最大的基因
+top_transition_genes <- sort(abs(state_diffs), decreasing = TRUE)[1:50]
+print("预测状态转变中差异最大的前50个基因:")
+print(top_transition_genes)
+
+# =================== 第8步：保存结果 ===================
+
+# 保存增强后的Seurat对象
+saveRDS(seurat_obj, file = "seurat_with_velocity.rds")
+
+# 保存绘图
+pdf("RNA_velocity_plots.pdf", width = 12, height = 10)
+velocity_umap_plot
+for (plot in gene_velocity_plots) {
+  print(plot)
+}
+velocity_field_plot
+consistency_plot
+dev.off()
+
+# =================== 第9步：扩展分析 - 速率轨迹 ===================
+
+# 计算并绘制速率轨迹（pseudotime路径）
+# 使用速率信息来预测细胞沿着分化轨迹的位置
+
+# 1. 找出起始细胞（作为参考点）
+# 可以基于已知的起始细胞类型或使用速率一致性分数
+start_cells <- names(sort(seurat_obj$velocity_consistency, decreasing = TRUE)[1:10])
+
+# 2. 计算速率轨迹
+set.seed(42)  # 设置随机种子以确保结果可重复
+velocity_pseudotime <- calculateVelocityPseudotime(
+  vel = Tool(seurat_obj, slot = "RunVelocity"),
+  cell.dist = as.dist(1 - cor(t(GetAssayData(seurat_obj, assay = "RNA", slot = "scale.data")))),
+  starting.cells = start_cells,
+  n.steps = 100,  # 模拟步数
+  scaling = 10    # 缩放因子
+)
+
+# 3. 将pseudotime添加到Seurat对象
+seurat_obj$velocity_pseudotime <- velocity_pseudotime
+
+# 4. 可视化pseudotime
+pseudotime_plot <- FeaturePlot(
+  seurat_obj,
+  features = "velocity_pseudotime",
+  min.cutoff = "q5",
+  max.cutoff = "q95",
+  cols = c("blue", "yellow", "red")
+) +
+  ggtitle("RNA Velocity Pseudotime") +
+  theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold"))
+
+# 5. 沿着pseudotime展示基因表达趋势
+selected_genes <- c("Gene1", "Gene2", "Gene3", "Gene4")  # 替换为您感兴趣的基因
+
+# 准备数据
+expression_data <- GetAssayData(seurat_obj, assay = "RNA", slot = "data")[selected_genes, ]
+pt_data <- data.frame(
+  Pseudotime = seurat_obj$velocity_pseudotime,
+  t(expression_data)
+)
+
+# 为每个基因创建沿pseudotime的表达趋势图
+gene_trend_plots <- list()
+for (gene in selected_genes) {
+  if (gene %in% rownames(expression_data)) {
+    formula <- as.formula(paste(gene, "~ Pseudotime"))
+    gene_trend_plots[[gene]] <- ggplot(pt_data, aes_string(x = "Pseudotime", y = gene)) +
+      geom_point(alpha = 0.3, size = 1) +
+      geom_smooth(method = "loess", span = 0.3, se = TRUE, color = "red") +
+      ggtitle(paste("Expression of", gene, "along Pseudotime")) +
+      theme_classic() +
+      theme(plot.title = element_text(hjust = 0.5, size = 14))
+  }
+}
+
+# 保存额外的分析结果
+pdf("RNA_velocity_trajectories.pdf", width = 12, height = 10)
+pseudotime_plot
+for (plot in gene_trend_plots) {
+  print(plot)
+}
+dev.off()
+
+# =================== 结束 ===================
+# 注意：这个脚本提供了RNA速率分析的全面框架，您可能需要根据具体数据调整参数
+# 对于正确解释结果，建议结合生物学知识和其他单细胞分析方法
 ```
 
 
 
+## scVelo
 
+```{r}
+# 步骤3：数据格式转换 --------------------------------------------------------
+# 将Seurat对象转换为loom格式（scVelo所需格式）
+SaveH5Seurat(seurat_obj, filename = "pbmc3k.h5Seurat", overwrite = TRUE)
+Convert("pbmc3k.h5Seurat", dest = "loom", overwrite = TRUE)
+
+# 步骤4：Python环境中的scVelo分析 -------------------------------------------
+# 在R中运行Python代码
+scv <- import("scvelo")  # 导入scvelo模块
+
+# Python代码块
+py_run_string(r"
+import scvelo as scv
+import scanpy as sc
+import numpy as np
+
+# 读取loom文件（包含剪切/未剪切计数矩阵）
+adata = scv.read('pbmc3k.loom', cache=True)
+
+# 添加Seurat计算的UMAP坐标（确保维度对应）
+seurat_umap = r.seurat_obj@reductions$umap@cell.embeddings
+adata.obsm['X_umap'] = seurat_umap
+
+# 预处理
+scv.pp.filter_and_normalize(adata, min_shared_counts=20, n_top_genes=2000)
+scv.pp.moments(adata, n_pcs=30, n_neighbors=30)
+
+# 计算RNA速率
+scv.tl.velocity(adata, mode='stochastic')  # 随机模式
+scv.tl.velocity_graph(adata)
+
+# 可视化设置
+scv.settings.set_figure_params(figsize=(8,8), dpi=100)
+")
+```
+
+
+```{r}
+# 步骤5：结果可视化 ---------------------------------------------------------
+# 在Python中生成可视化图形
+py_run_string(r"
+# 速度箭头叠加在UMAP上
+scv.pl.velocity_embedding_stream(
+    adata, 
+    basis='umap',
+    color='celltype',  # 假设有celltype列
+    title='RNA Velocity',
+    save='velocity_stream.png'
+)
+
+# 动态模型可视化
+scv.tl.latent_time(adata)
+scv.pl.scatter(
+    adata,
+    color='latent_time',
+    color_map='viridis',
+    size=80,
+    title='Developmental Latent Time',
+    save='latent_time.png'
+)
+")
+
+```
+
+
+## Python
+
+```{python}
+
+
+# 步骤0：环境准备 ----------------------------------------------------------
+# 安装必要库（终端中运行）
+# pip install scanpy scvelo anndata h5py numpy scikit-learn matplotlib
+
+# 步骤1：将Seurat对象保存为h5ad格式（在R中运行一次）----------------------
+'''
+# 在R中运行以下代码将Seurat对象转换为Python可读的h5ad格式：
+library(Seurat)
+library(SeuratDisk)
+
+# 假设你的Seurat对象名为 seurat_obj
+SaveH5Seurat(seurat_obj, filename = "seurat_processed.h5Seurat", overwrite = TRUE)
+Convert("seurat_processed.h5Seurat", dest = "h5ad", overwrite = TRUE)
+'''
+
+# 步骤2：Python中读取数据 -------------------------------------------------
+import scanpy as sc
+import scvelo as scv
+
+# 读取转换后的h5ad文件
+adata = sc.read_h5ad("seurat_processed.h5ad")
+
+# 检查数据结构（关键！）
+print(adata)                 # 查看数据基本信息
+print(adata.obsm.keys())     # 检查嵌入数据（UMAP/tSNE）
+print(adata.obs.columns)     # 检查metadata列名（如聚类结果）
+
+# 步骤3：准备RNA速率数据 --------------------------------------------------
+# 假设你已经通过velocyto生成loom文件（必须步骤！）
+# 需要单独生成的.loom文件（例如：sample.loom）
+
+# 合并主数据和速率数据（关键步骤）
+ldata = scv.read("your_velocity.loom", cache=True)  # 替换为你的loom文件路径
+adata = scv.utils.merge(adata, ldata)
+
+# 步骤4：预处理 -----------------------------------------------------------
+# 保持与Seurat预处理一致
+scv.pp.filter_and_normalize(
+    adata,
+    min_shared_counts=30,    # 与Seurat的FilterCells设置对应
+    n_top_genes=2000,        # 与FindVariableFeatures的nfeatures对应
+    retain_genes=None,
+    subset_highly_variable=False  # 使用Seurat的基因选择
+)
+
+# 步骤5：计算RNA速率 ------------------------------------------------------
+# 使用与Seurat相同的PCA和邻居图（确保一致性）
+scv.pp.moments(
+    adata,
+    n_pcs=30,                # 与Seurat RunPCA的dims一致
+    n_neighbors=30           # 与FindNeighbors的k.param一致
+)
+
+# 核心计算
+scv.tl.velocity(adata, mode="stochastic")
+scv.tl.velocity_graph(adata)
+
+# 步骤6：可视化（直接使用Seurat的UMAP坐标）-------------------------------
+# 确保UMAP坐标存在（来自Seurat）
+if 'X_umap' in adata.obsm:
+    print("检测到UMAP坐标")
+else:
+    print("错误：未找到UMAP坐标！请检查转换后的h5ad文件")
+
+# 流线图可视化
+scv.pl.velocity_embedding_stream(
+    adata,
+    basis='umap',           # 使用Seurat计算的UMAP
+    color='seurat_clusters',# 使用Seurat的聚类结果（检查你的列名）
+    title='RNA Velocity on Seurat UMAP',
+    dpi=200,
+    save='velocity_stream.png'
+)
+
+# 动态模型（可选）
+scv.tl.recover_dynamics(adata)
+scv.tl.velocity(adata, mode='dynamical')
+scv.tl.velocity_graph(adata)
+
+# 潜在时间分析
+scv.tl.latent_time(adata)
+scv.pl.scatter(
+    adata,
+    color='latent_time',
+    color_map='viridis',
+    size=50,
+    title='Developmental Latent Time',
+    save='latent_time.png'
+)
+
+# 步骤7：保存结果 --------------------------------------------------------
+adata.write("seurat_with_velocity.h5ad")  # 保存完整分析结果
+
+# 关键参数解释 -----------------------------------------------------------
+'''
+1. mode参数选择：
+   - stochastic（默认）：适合大多数情况，计算快
+   - dynamical：需要更多数据，计算慢但更精确
+
+2. 必须对齐的参数：
+   - n_pcs：必须与Seurat RunPCA使用的维度一致
+   - n_neighbors：与Seurat FindNeighbors的k.param一致
+   - UMAP坐标：必须直接来自Seurat计算结果
+
+3. 重要检查点：
+   - adata.obs中必须包含Seurat的聚类结果（用于着色）
+   - 确保loom文件与Seurat对象来自同一批细胞（barcode匹配）
+'''
+
+# 常见问题解决 ------------------------------------------------------------
+'''
+Q1: 出现"KeyError: 'X_umap'"
+→ 检查R转换步骤，确保Seurat对象包含UMAP计算结果
+→ 在R转换前运行：seurat_obj[["umap"]] <- seurat_obj@reductions$umap
+
+Q2: 速度箭头方向混乱
+→ 检查是否使用相同的预处理（特别是标准化和基因选择）
+→ 尝试：scv.pp.neighbors(adata, n_neighbors=15) 调整邻居数
+
+Q3: 聚类标签不匹配
+→ 检查adata.obs中的列名，确保color参数使用正确的聚类列名
+→ 可能需要重命名：adata.obs['cluster'] = adata.obs['seurat_clusters']
+'''
+
+```
 
 
