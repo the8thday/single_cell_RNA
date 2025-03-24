@@ -1,0 +1,874 @@
+---
+title: "Untitled"
+format: html
+---
+
+
+
+## GSE242889
+
+GSE242889 数据分析
+
+
+只选取了其中的两对四例样本。
+
+
+
+## 数据整理
+
+```{r}
+#| include: false
+
+library(tidyverse)
+library(SingleCellExperiment)
+library(Seurat)
+
+options(future.globals.maxSize = 4000 * 1024^2)
+```
+
+
+```{r}
+groups <- c("2T_C24", "1T_C21", "2NT_P24", "1NT_P21")
+
+seurat_objects <- list()
+
+for (group in groups) {
+  data_dir <- file.path("~/Downloads/GSE242889/GSE242889_RAW/", group)
+
+  data <- Read10X(
+    data.dir = data_dir, gene.column = 2,
+    unique.features = TRUE
+  )
+  # 创建Seurat对象
+  seurat_obj <- CreateSeuratObject(
+    counts = data, project = group,
+    min.cells = 3,
+    min.features = 200
+  )
+
+  # 添加样本标签
+  seurat_obj$disease <- ifelse(grepl("NT", group), "Non-Tumor", "Tumor")
+
+  seurat_obj$sample_num <- substr(group, 1, 1)
+
+  seurat_objects[[group]] <- seurat_obj
+}
+```
+
+
+对于doublet就先不去除了。
+
+```{r}
+merged_seurat <- merge(
+  x = seurat_objects[[1]],
+  y = seurat_objects[-1],
+  add.cell.ids = groups
+)
+```
+
+
+```{r}
+merged_seurat$log10GenesPerUMI <- log10(merged_seurat$nFeature_RNA) / log10(merged_seurat$nCount_RNA)
+# merged_seurat$cells <- rownames()
+
+merged_seurat$mitoRatio <- PercentageFeatureSet(object = merged_seurat, pattern = "^MT-")
+merged_seurat$mitoRatio <- merged_seurat@meta.data$mitoRatio / 100
+
+# 核糖体基因、红血细胞基因、管家基因
+merged_seurat <- PercentageFeatureSet(merged_seurat, "^RP[SL]",col.name = "percent.ribo")
+merged_seurat <- PercentageFeatureSet(merged_seurat, "^HB[^(P)]", col.name = "percent.hb")
+
+
+merged_seurat$sample <- merged_seurat$orig.ident
+```
+
+
+```{r}
+p1 <- VlnPlot(merged_seurat, features = c("nFeature_RNA", "nCount_RNA", "mitoRatio"), 
+              group.by = "orig.ident", pt.size = 0.1, ncol = 3)
+
+p1
+```
+
+
+```{r}
+# 针对metadata的一些质控
+
+metadata <- merged_seurat@meta.data
+
+metadata$cells <- rownames(metadata)
+
+# Rename columns
+metadata <- metadata %>%
+  dplyr::rename(
+    seq_folder = orig.ident,
+    nUMI = nCount_RNA,
+    nGene = nFeature_RNA
+  )
+```
+
+
+Visualize the number of cell counts per sample
+
+```{r}
+# Visualize the number of cell counts per sample
+metadata %>%
+  ggplot(aes(x = sample, fill = sample)) +
+  geom_bar() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  ggtitle("NCells")
+```
+
+
+The UMI counts per cell should generally be above 500, that is the low end of what we expect. If UMI counts are between 500-1000 counts, it is usable but the cells probably should have been sequenced more deeply.
+
+```{r}
+# Visualize the number UMIs/transcripts per cell
+metadata %>%
+  ggplot(aes(color = sample, x = nUMI, fill = sample)) +
+  geom_density(alpha = 0.2) +
+  scale_x_log10() +
+  theme_classic() +
+  ylab("Cell density") +
+  geom_vline(xintercept = 500)
+```
+
+
+
+Genes detected per cell. For high quality data, the proportional histogram should contain a single large peak that represents cells that were encapsulated.
+
+```{r}
+# Visualize the distribution of genes detected per cell via histogram
+metadata %>%
+  ggplot(aes(color = sample, x = nGene, fill = sample)) +
+  geom_density(alpha = 0.2) +
+  theme_classic() +
+  scale_x_log10() +
+  geom_vline(xintercept = 300)
+```
+
+
+The novelty score is computed by taking the ratio of nGenes over nUMI. Generally, we expect the novelty score to be above 0.80 for good quality cells.
+
+```{r}
+# Visualize the overall complexity of the gene expression by visualizing the genes detected per UMI (novelty score)
+metadata %>%
+  ggplot(aes(x = log10GenesPerUMI, color = sample, fill = sample)) +
+  geom_density(alpha = 0.2) +
+  theme_classic() +
+  geom_vline(xintercept = 0.8)
+```
+
+This metric can identify whether there is a large amount of mitochondrial contamination from dead or dying cells. We define poor quality samples for mitochondrial counts as cells which surpass the 0.2 mitochondrial ratio mark, unless of course you are expecting this in your sample.
+
+
+```{r}
+# Visualize the distribution of mitochondrial gene expression detected per cell
+metadata %>%
+  ggplot(aes(color = sample, x = mitoRatio, fill = sample)) +
+  geom_density(alpha = 0.2) +
+  scale_x_log10() +
+  theme_classic() +
+  geom_vline(xintercept = 0.2)
+```
+
+
+线粒体比例好高。
+
+## Seurat分析
+
+
+### Cell-level filtering
+
+这个数据集可以考虑，线粒体比例再高一些，文章用的30%
+```{r}
+merged_seurat <- subset(
+  x = merged_seurat,
+  subset = (nCount_RNA >= 500) &
+    (nFeature_RNA >= 250) &
+    (log10GenesPerUMI > 0.80) &
+    (mitoRatio < 0.20)
+)
+
+merged_seurat # 过滤掉的很少呀
+```
+
+
+```{r}
+#| eval: true
+
+# Normalize the counts
+# 此时的normalization还比较的粗糙，利用默认的log方式
+merged_seurat <- NormalizeData(merged_seurat)
+
+# Identify the most variable genes
+merged_seurat <- FindVariableFeatures(merged_seurat,
+  selection.method = "vst",
+  nfeatures = 2000,
+  verbose = FALSE
+)
+
+# Scale the counts
+merged_seurat <- ScaleData(merged_seurat)
+
+# Score cells for cell cycle
+# filtered_seurat <- CellCycleScoring(filtered_seurat,
+#   g2m.features = cc.genes.updated.2019$g2m.genes,
+#   s.features = cc.genes.updated.2019$s.genes
+# )
+
+# Perform PCA
+merged_seurat <- RunPCA(merged_seurat)
+
+# perform TSNE, UMAP
+merged_seurat <- RunUMAP(merged_seurat, dims = 1:20)
+# seurat_phase <- RunTSNE(object = seurat_phase, dims = 1:20, do.fast = TRUE)
+
+# Plot the PCA colored by cell cycle phase
+# DimPlot(filtered_seurat,
+#   reduction = "pca",
+#   group.by = "Phase",
+#   split.by = "Phase"
+# )
+```
+
+
+
+### SCTransform
+
+
+```{r}
+merged_seurat <- SCTransform(merged_seurat, 
+                            method = "glmGamPoi",
+                            vars.to.regress = c("mitoRatio"),
+                            assay = "RNA", 
+                            # vst.flavor = "v2",
+                            verbose = TRUE
+                            )
+```
+
+
+```{r}
+merged_seurat <- RunPCA(merged_seurat,
+  features = VariableFeatures(merged_seurat)
+)
+
+ElbowPlot(merged_seurat, ndims = 50)
+```
+
+```{r}
+harmonized_seurat <- harmony::RunHarmony(merged_seurat,
+  group.by.vars = c("sample"),
+  reduction.use = "pca",
+  assay.use = "SCT",
+  reduction.save = "harmony",
+  plot_convergence = TRUE
+)
+```
+
+
+
+```{r}
+
+set.seed(123)
+
+harmonized_seurat <- RunUMAP(harmonized_seurat,
+  reduction = "harmony",
+  assay = "SCT",
+  dims = 1:40
+)
+
+harmonized_seurat <- RunTSNE(harmonized_seurat,
+  reduction = "harmony",
+  assay = "SCT",
+  dims = 1:40,
+  verbose = FALSE
+)
+
+DefaultAssay(harmonized_seurat)
+```
+
+
+```{r}
+# 校正前的PCA结果（按样本着色）
+p1 <- DimPlot(harmonized_seurat, reduction = "pca", group.by = "sample") + 
+  ggtitle("Before Harmony (PCA)")
+
+# 校正后的Harmony结果（按样本着色）
+p2 <- DimPlot(harmonized_seurat, reduction = "harmony", group.by = "sample") + 
+  ggtitle("After Harmony")
+
+# 联合展示
+p1 + p2
+```
+
+
+## Clustering
+
+Seurat uses a graph-based clustering approach using a K-nearest neighbor approach, and then attempts to partition this graph into highly interconnected 'quasi-cliques' or 'communities'.
+
+
+```{r}
+
+set.seed(123)
+
+
+harmonized_seurat <- FindNeighbors(
+  object = harmonized_seurat,
+  reduction = "harmony",
+  dims = 1:40
+)
+
+# Determine the clusters for various resolutions
+harmonized_seurat <- FindClusters(
+  object = harmonized_seurat,
+  resolution = seq(0.1, 1, by = 0.1),
+  algorithm = 1
+)
+```
+
+
+```{r}
+# 不同分辨率情况下的细胞聚类情况
+
+require(clustree)
+
+clustree::clustree(harmonized_seurat, prefix = "SCT_snn_res.")
+```
+
+```{r}
+# qs::qsave(harmonized_seurat, "./datasets/harmonized_seurat_GSE242889.qs")
+```
+
+
+
+收集了特定谱系标记基因来分类主要的细胞类型，例如CD3E用于T细胞，KLRD1用于NK细胞，CD79A用于B细胞，LYZ用于髓系细胞，PECAM1用于内皮细胞，ACTA2用于间质细胞，Transferrin用于恶性细胞，EPCAM用于肝前体细胞。
+
+
+```{r}
+Idents(object = harmonized_seurat) <- "SCT_snn_res.0.3"
+```
+
+
+```{r}
+# Plot the UMAP
+DimPlot(harmonized_seurat,
+  reduction = "umap",
+  label = TRUE,
+  label.size = 6
+)
+```
+
+
+```{r}
+DimPlot(harmonized_seurat, 
+        label = TRUE, 
+        split.by = "sample")  + NoLegend()
+```
+
+
+### 细胞注释
+
+```{r}
+mlist <- list(
+    T = c('CD3E'),
+    NK = c('KLRD1'),
+    B = c('CD79A'),
+    Myeloid = c('LYZ'),
+    endothelial = c('PECAM1'),
+    mesenchymal = c('ACTA2'),
+    hepaticPC = c('EPCAM'),
+    malignant = c('TF')
+)
+```
+
+
+```{r}
+FeaturePlot(harmonized_seurat,
+  features = mlist |> unlist(),
+  reduction = "umap", pt.size = 0.6
+)
+```
+
+
+
+```{r}
+DotPlot(harmonized_seurat, features = mlist) +
+  theme(axis.text.x = element_text(angle = 90)) + NoLegend()
+```
+
+
+
+
+```{r}
+cell_type_mapping <- list(
+  "T/NK cells" = c(0, 2, 4, 18),
+  "B cells" = c(11, 12),
+  "Myeloid" = c(1,3,7,14,15),
+  "endothelial" = c(10, 13, 16),
+  "mesenchymal" = c(8, 17),
+  'hepaticPC' = c(5, 6),
+  'malignant' = c(9) # 有待商榷
+)
+```
+
+
+```{r}
+# 创建一个函数，将聚类ID映射到细胞类型
+map_cluster_to_celltype <- function(cluster_id) {
+  for (cell_type in names(cell_type_mapping)) {
+    if (cluster_id %in% cell_type_mapping[[cell_type]]) {
+      return(cell_type)
+    }
+  }
+  return("Unknown") # 对于未注释的聚类返回"Unknown"
+}
+
+# 创建一个新的列"cell_type"
+harmonized_seurat$cell_type <- sapply(
+  harmonized_seurat$SCT_snn_res.0.3,  # 或者使用你的聚类列名，如"RNA_snn_res.0.8"
+  map_cluster_to_celltype
+)
+
+# 查看细胞类型分布
+print(table(harmonized_seurat$cell_type))
+```
+
+
+```{r}
+# 使用新的细胞类型注释可视化UMAP
+p1 <- DimPlot(harmonized_seurat, 
+             reduction = "umap", 
+             group.by = "cell_type", 
+             label = TRUE, 
+             repel = TRUE) + 
+      ggtitle("UMAP by Cell Type")
+
+# 同时查看原始聚类和细胞类型注释
+p2 <- DimPlot(harmonized_seurat, 
+             reduction = "umap", 
+             group.by = "SCT_snn_res.0.3", 
+             label = TRUE, 
+             repel = TRUE) + 
+      ggtitle("UMAP by Cluster")
+
+p1 | p2 
+```
+
+
+```{r}
+cell_proportions <- harmonized_seurat@meta.data %>%
+  # 按样本和细胞类型分组
+  group_by(sample, cell_type) %>%
+  # 计算每组的细胞数
+  summarise(count = n()) %>%
+  # 按样本分组
+  group_by(sample) %>%
+  # 计算占比
+  mutate(proportion = count / sum(count) * 100) %>%
+  ungroup()
+
+# 查看计算结果
+print(cell_proportions)
+```
+
+
+```{r}
+# 创建细胞类型占比条形图
+p1 <- ggplot(cell_proportions, aes(x = sample, y = proportion, fill = cell_type)) +
+  geom_bar(stat = "identity", position = "stack") +
+  theme_bw() +
+  labs(
+    title = "Cell Type Proportions by Sample",
+    x = "Sample",
+    y = "Proportion (%)",
+    fill = "Cell Type"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right"
+  )
+
+# 打印图形
+print(p1)
+```
+
+
+
+### FindAllMarkers的分析
+
+
+```{r}
+harmonized_seurat <- PrepSCTFindMarkers(harmonized_seurat,
+  assay = "SCT",
+  verbose = TRUE
+)
+```
+
+
+```{r}
+harmonized_seurat <- qs::qread("./datasets/harmonized_seurat_GSE242889.qs")
+```
+
+
+```{r}
+
+Idents(harmonized_seurat) <- 'cell_type'
+
+cluster_markers <- FindAllMarkers(
+  harmonized_seurat,
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25,
+  test.use = "wilcox"
+)
+
+# 提取top10标记基因
+top10 <- cluster_markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 10, order_by = avg_log2FC) |> 
+  ungroup()
+
+top2 <- cluster_markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 2, order_by = avg_log2FC) |> 
+  ungroup()
+
+top5 <- cluster_markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 5, order_by = avg_log2FC) |> 
+  ungroup()
+```
+
+
+```{r}
+features <- unique(top5$gene)
+print(paste("Total unique top markers:", length(features)))
+
+top5_markers <- top5
+```
+
+
+```{r}
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
+
+
+# 从Seurat对象中提取这些基因的表达矩阵
+# 使用标准化后的数据
+expr_matrix <- GetAssayData(harmonized_seurat, slot = "data")[features, ]
+
+# 计算每个细胞类型的平均表达值
+# 首先获取细胞类型信息
+cell_types <- harmonized_seurat$cell_type
+names(cell_types) <- colnames(harmonized_seurat)
+
+# 计算每个细胞类型的平均表达值
+avg_expr <- matrix(0, nrow = length(features), ncol = length(unique(cell_types)))
+rownames(avg_expr) <- features
+colnames(avg_expr) <- unique(cell_types)
+
+for (cell_type in unique(cell_types)) {
+  cells <- names(cell_types)[cell_types == cell_type]
+  avg_expr[, cell_type] <- rowMeans(expr_matrix[, cells, drop = FALSE])
+}
+
+# 可选: 对数据进行缩放以便更好地可视化
+# 按行进行z-score标准化
+scaled_avg_expr <- t(scale(t(avg_expr)))
+
+# 对Marker进行排序，按照细胞类型分组
+# 创建一个顺序向量
+marker_order <- c()
+for (ct in unique(top5_markers$cluster)) {
+  marker_order <- c(marker_order, top5_markers$gene[top5_markers$cluster == ct])
+}
+marker_order <- unique(marker_order)
+
+# 重新排序表达矩阵
+scaled_avg_expr <- scaled_avg_expr[marker_order, ]
+
+# 准备行注释 - 显示每个基因属于哪个细胞类型
+gene_to_celltype <- setNames(
+  top5_markers$cluster[match(rownames(scaled_avg_expr), top5_markers$gene)],
+  rownames(scaled_avg_expr)
+)
+
+# 对于有些基因可能属于多个细胞类型，这里采用第一次出现的类型
+gene_to_celltype <- gene_to_celltype[!duplicated(names(gene_to_celltype))]
+
+# 创建行注释对象
+row_ha <- rowAnnotation(
+  cell_type = gene_to_celltype,
+  col = list(cell_type = setNames(colorRampPalette(brewer.pal(8, "Set1"))(length(unique(cell_types))), 
+                                 unique(cell_types))),
+  show_annotation_name = TRUE,
+  annotation_label = "Cell Type"
+)
+
+# 创建热图
+# 设置颜色映射
+col_fun <- colorRamp2(
+  c(min(scaled_avg_expr), 0, max(scaled_avg_expr)), 
+  c("blue", "white", "red")
+)
+
+# 绘制热图
+set.seed(123) # 设置随机种子以确保可重复性
+ht <- Heatmap(
+  scaled_avg_expr,
+  name = "Z-score",
+  col = col_fun,
+  cluster_rows = FALSE,    # 不对行进行聚类，因为我们已经排序好了
+  cluster_columns = TRUE,  # 对列（细胞类型）进行聚类
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  row_names_gp = gpar(fontsize = 8),
+  column_names_gp = gpar(fontsize = 10),
+  right_annotation = row_ha,
+  row_title = "Top 5 Marker Genes",
+  column_title = "Cell Types",
+  heatmap_legend_param = list(
+    title = "Expression\nZ-score",
+    at = c(-2, 0, 2),
+    labels = c("Low", "Mid", "High")
+  )
+)
+
+# 显示热图
+print(ht)
+```
+
+
+### T/NK 亚群分析
+
+
+FindSubCluster在对象的基础上对感兴趣的亚群做进一步的cluster。
+
+这个分析还是需要对亚群有一些基本的了解的。
+
+```{r}
+# 查看graph.name的名字
+harmonized_seurat@graphs
+
+
+# resolution参数的选择可以基于前面的数图来做决定等等
+
+
+sce_T_NK <- FindSubCluster(
+  harmonized_seurat,
+  cluster="T/NK cells",
+  graph.name = "SCT_snn",
+  subcluster.name = "SCT_snn_sub",
+  resolution = 0.1
+)
+```
+
+
+```{r}
+Idents(sce_T_NK) <- 'SCT_snn_sub'
+```
+
+
+```{r}
+table(Idents(sce_T_NK))
+```
+
+
+```{r}
+DimPlot(sce_T_NK, group.by = "ident", label = TRUE)
+```
+
+
+```{r}
+DimPlot(sce_T_NK, 
+        cells = WhichCells(sce_T_NK, idents = c("T/NK cells_0", "T/NK cells_1", "T/NK cells_2", 'T/NK cells_3')), 
+        label = TRUE)
+
+```
+
+识别子群集的差异表达基因
+不过感觉意义有限。
+```{r}
+subcluster_markers <- FindMarkers(sce_T_NK, ident.1 = "T/NK cells_0", ident.2 = "T/NK cells_2")
+head(subcluster_markers)
+
+```
+
+
+```{r}
+source("tcell_markers_list.R")
+```
+
+
+初步来看这些T细胞可以分为：
+cycling细胞和IL7R Tem细胞
+
+0: "CD8A" + FCGR3A = TEFF CTL, 在肿瘤中减少
+1: IL7R Tem
+2: 在肿瘤增长很多, 似乎是一个处在增殖期的T细胞，前体耗竭T细胞（Progenitor Exhausted T Cells）肿瘤浸润性T细胞（TILs）,这些T细胞很可能属于处于增殖状态的T细胞亚群，也常被称为“循环T细胞”或“增殖T细胞”
+
+3: CD4 T cell(Treg)
+
+
+如果marker基因和cluster的结果不一致，而cluster结果中的差异基因是可以说明问题的，也是可以的。
+
+```{r}
+# VlnPlot可视化
+library(paletteer)
+
+marker <- c("CD3E", "CD3D", "CD4", "CD8A", "NCAM1", "FCGR3A")
+VlnPlot(sce_T_NK,
+  features = marker, cols = c(
+    paletteer_d("awtools::bpalette"),
+    paletteer_d("awtools::a_palette"),
+    paletteer_d("awtools::mpalette"),
+    paletteer_d("awtools::spalette")
+  ),
+  combine = TRUE, raster = FALSE,
+  # cells = WhichCells(sce_T_NK, idents = c("T/NK cells_0", "T/NK cells_1", "T/NK cells_2", 'T/NK cells_3')),
+)
+```
+
+基于一些T细胞的marker基因
+
+```{r}
+FeaturePlot(
+  sce_T_NK,
+  # features = c("CD3E", "CD3D", "CD4", "CD8A", "NCAM1", "FCGR3A"),
+  features = unlist(CD8_markers_list2$CD8T),
+  cells = WhichCells(sce_T_NK, idents = c("T/NK cells_0", "T/NK cells_1", "T/NK cells_2", "T/NK cells_3")),
+  label = TRUE
+)
+```
+
+```{r}
+DotPlot(
+  sce_T_NK,
+  features = CD8_markers_list2
+) +
+  RotatedAxis()
+```
+
+
+计算这四个细胞在不同分组间的柱状图：
+
+
+可以看到肿瘤样本之间还是具有相似性的。
+
+```{r}
+
+# 假设你的Seurat对象名为'seurat_obj'
+# 假设细胞类型存储在meta.data的'cell_type'列中
+# 假设样本信息存储在meta.data的'sample'列中
+
+# 函数：计算特定细胞类型在各样本中的占比
+plot_cell_proportion <- function(seurat_obj, 
+                                 cell_types_to_show = NULL,
+                                 cell_type_col = "cell_type", 
+                                 sample_col = "sample",
+                                 colors = NULL) {
+  
+  # 提取元数据
+  meta_data <- seurat_obj@meta.data
+  
+  # 如果指定了要显示的细胞类型，则进行筛选
+  if (!is.null(cell_types_to_show)) {
+    meta_data <- meta_data[meta_data[[cell_type_col]] %in% cell_types_to_show, ]
+  }
+  
+  # 计算每个样本中每种细胞类型的数量
+  cell_counts <- meta_data %>%
+    group_by(!!sym(sample_col), !!sym(cell_type_col)) %>%
+    summarise(count = n(), .groups = "drop")
+  
+  # 计算每个样本的总细胞数
+  sample_totals <- cell_counts %>%
+    group_by(!!sym(sample_col)) %>%
+    summarise(total = sum(count), .groups = "drop")
+  
+  # 合并数据并计算占比
+  cell_props <- left_join(cell_counts, sample_totals, by = sample_col) %>%
+    mutate(proportion = count / total * 100)
+  
+  # 设置可视化参数
+  if (is.null(colors)) {
+    n_cell_types <- length(unique(cell_props[[cell_type_col]]))
+    colors <- scales::hue_pal()(n_cell_types)
+  }
+  
+  # 绘制柱状图
+  p <- ggplot(cell_props, aes(x = !!sym(sample_col), 
+                            y = proportion, 
+                            fill = !!sym(cell_type_col))) +
+    geom_bar(stat = "identity", position = "dodge") +
+    theme_bw() +
+    labs(x = "Sample", y = "Percentage (%)", fill = "Cell Type") +
+    scale_fill_manual(values = colors) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          panel.grid.minor = element_blank())
+  
+  return(list(plot = p, data = cell_props))
+}
+
+# 使用示例
+# 定义你想查看的4种细胞类型
+cell_types_of_interest <- c("T/NK cells_0", "T/NK cells_1", "T/NK cells_2", "T/NK cells_3")
+# 或者使用实际的细胞类型名称
+# cell_types_of_interest <- c("CD8_T", "CD4_T", "Treg", "MAIT")
+
+# 绘制这些细胞类型在不同样本中的占比
+result <- plot_cell_proportion(sce_T_NK, 
+                              cell_types_to_show = cell_types_of_interest,
+                              cell_type_col = "SCT_snn_sub",  # 替换为实际的列名
+                              sample_col = "sample")        # 替换为实际的列名
+
+# 显示图形
+print(result$plot)
+
+# 如果需要保存图形
+# ggsave("cell_proportion.pdf", result$plot, width = 10, height = 6)
+
+# 如果需要查看数据
+# View(result$data)
+
+# 如果需要堆叠柱状图（每个样本的细胞类型占比加起来为100%）
+stacked_plot <- ggplot(result$data, aes(x = sample, y = proportion, fill = SCT_snn_sub)) +
+  geom_bar(stat = "identity", position = "stack") +
+  theme_bw() +
+  labs(x = "Sample", y = "Percentage (%)", fill = "Cell Type") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 显示堆叠图形
+print(stacked_plot)
+
+# 保存堆叠图形
+# ggsave("cell_proportion_stacked.pdf", stacked_plot, width = 10, height = 6)
+
+# 可选：如果想要在一个样本内显示全部细胞类型的占比饼图
+pie_data <- result$data %>%
+  filter(sample == unique(result$data$sample)[1])  # 选择第一个样本
+
+pie_chart <- ggplot(pie_data, aes(x = "sample", y = proportion, fill = SCT_snn_sub)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 0) +
+  theme_void() +
+  labs(fill = "Cell Type", title = paste("Cell Type Distribution in", unique(pie_data$sample)))
+  # scale_fill_manual(values = colors)
+
+# 显示饼图
+print(pie_chart)
+```
+
+
+
+
+
+
+
+
+
+

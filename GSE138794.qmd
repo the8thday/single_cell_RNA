@@ -1,0 +1,187 @@
+---
+title: "GSE138794"
+format: html
+---
+
+## 一个小小的测试
+
+
+首先，下载该数据集下的GSM4119531— GSM4119535这5个单细胞数据
+
+GSE138794
+
+
+```{r}
+#| include: false
+
+##加载R包
+
+library(tidyverse)
+library(Seurat)
+library(Matrix)
+library(harmony)
+
+
+##GBM单细胞数据：GSM4119531-GSM4119535
+```
+
+
+```{r}
+
+
+dir = c("GSM4119531/","GSM4119532/","GSM4119533/","GSM4119534/","GSM4119535/")
+names(dir) <- c('GSM4119531','GSM4119532','GSM4119533','GSM4119534','GSM4119535')
+
+scRNAlist <- list()
+#把每个样本数据创建一个seurat对象，并存放到列表scRNAlist里
+for(i in 1:length(dir)){
+  print(i)
+  counts <- Read10X(data.dir = file.path('~/Downloads/GSE138794_RAW', dir[i]), gene.column = 1)
+  scRNAlist[[i]] <- CreateSeuratObject(counts,  min.cells=3, min.features = 200,
+                                       project = names(dir[i])
+                                       )
+}
+
+
+#使用merge将两个单细胞合并成一个seurat对象
+scRNA <- merge(scRNAlist[[1]], y = scRNAlist[2:5])
+#查看各样本细胞数量
+table(scRNA@meta.data$orig.ident)
+```
+
+
+```{r}
+scRNA <- JoinLayers(scRNA, assay = "RNA")
+```
+
+
+```{r}
+#QC质控
+scRNA[["mt_percent"]] <- PercentageFeatureSet(scRNA, pattern = "^MT-")
+VlnPlot(scRNA, features = c("nFeature_RNA", "nCount_RNA", "mt_percent"), ncol = 3,raster=FALSE)
+##数据进行质控
+minGene=200
+maxGene=7500
+mt=10
+scRNA <- subset(scRNA, subset = nFeature_RNA > minGene & nFeature_RNA  < maxGene & mt_percent < mt)
+
+
+##筛选高可变基因，并进行数据降维
+scRNA <- NormalizeData(scRNA) %>% 
+  FindVariableFeatures(selection.method = "vst",nfeatures = 3000) %>% 
+  ScaleData() %>% 
+  RunPCA(npcs = 30, verbose = T)
+
+
+library(harmony)
+###使用harmony进行多样本整合&批次矫正 
+scRNA <- RunHarmony(scRNA,reduction = "pca",group.by.vars = "orig.ident",reduction.save = "harmony")
+
+#RUN UMAP
+scRNA <- RunUMAP(scRNA, reduction = "harmony", dims = 1:30,reduction.name = "umap")
+#查看去批次效果
+DimPlot(scRNA, reduction = "umap",group.by = "orig.ident")
+```
+
+
+```{r}
+# FindClusters
+scRNA <- FindNeighbors(scRNA, reduction = "harmony", dims = 1:30) %>% 
+  FindClusters(resolution = 0.6) 
+DimPlot(scRNA, reduction = "umap",group.by = "seurat_clusters",label = T)
+
+#####手动注释：依据 原文marker,Dotplot展示各亚群marker
+Marker = list('MES like'=c('CHI3L1', 'ADM'),
+              'AC like'=c('MLC1', 'HOPX'),
+              'NPC like' =c('CD24'),
+              'OPC like'=c('PDGFRA','OLIG1'),
+              Oligo=c('PTGDS','MBP'),
+              Mac=c('CD163', 'CD68'))
+
+
+#点图 ,可以接受list
+Dot<-DotPlot(scRNA,features=Marker,cols = c('gray','red')) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1)
+  )
+Dot
+```
+
+
+
+```{r}
+#根据 上一步DotPlot结果，进行初步注释
+scRNA@meta.data$celltype <- NA
+scRNA@meta.data$celltype[scRNA@meta.data$seurat_clusters %in% c('0','5','6','13')] <- "OPC like"
+scRNA@meta.data$celltype[scRNA@meta.data$seurat_clusters  %in% c('1','7')] <- "Macrophage"
+scRNA@meta.data$celltype[scRNA@meta.data$seurat_clusters %in% c('2','3','8','9')] <- "AC like"
+scRNA@meta.data$celltype[scRNA@meta.data$seurat_clusters %in% c('4','11','14')] <- "Oligo"
+scRNA@meta.data$celltype[scRNA@meta.data$seurat_clusters %in% c('3','8','10','12')] <- "MES like"
+scRNA@meta.data$celltype[scRNA@meta.data$seurat_clusters %in% c('15')] <- "NPC like"
+ 
+Idents(scRNA)<-scRNA$celltype
+
+col<-c( "MES like"="#A6761D","Macrophage"="#E31A1C","OPC like"="#FFAA33","Oligo"= "#FF7F00" ,"AC like"="#8DD3C7" ,"NPC like"="#1965B0")
+
+DimPlot(scRNA, reduction = "umap",label = T,label.size = 5,cols = col)
+
+#可视化样本细胞比例
+#devtools::install_github('junjunlab/scRNAtoolVis')
+library(scRNAtoolVis)
+cellRatio<-cellRatioPlot(object = scRNA,
+                         sample.name = "orig.ident",
+                         celltype.name = "celltype",
+                         flow.curve = 0.5,fill.col = col)+
+  theme(axis.text.x = element_text(angle = 45,hjust = 1))
+cellRatio
+```
+
+```{r}
+# scRNA <- JoinLayers(scRNA, assay = "RNA")
+```
+
+
+
+```{r}
+#找到各细胞的标记物,且只报道阳性位点
+markers <- FindAllMarkers(scRNA, only.pos = T,
+                               min.pct = 0.25,
+                               logfc.threshold = 0.25)
+
+#一行代码出差异火山图，需安装scRNAtoolVis包
+jjVolcano(diffData = markers,
+          topGeneN = 1,
+          col.type='adjustP')
+```
+
+
+
+
+```{r}
+#对各细胞类型上调基因做KEGG富集分析
+library(clusterProfiler)
+gid <- bitr(unique(markers$gene), 'SYMBOL', 'ENTREZID', OrgDb= 'org.Hs.eg.db')
+DEG <- full_join(markers, gid, by=c('gene' = 'SYMBOL'))
+
+#KEGG通路富集分析
+KEGG = compareCluster(ENTREZID ~ cluster, data = DEG , fun='enrichKEGG')
+
+#可视化各细胞TOP5通路
+dotplot(KEGG, label_format=40) + theme(axis.text.x = element_text(angle=45, hjust=1)) + scale_color_gradient(high="#4b5cc4",low="#FE8D3C")
+
+
+```
+
+
+```{r}
+#保存单细胞分析结果
+save(scRNA,file = './datasets/GSE138794_scRNA.rdata')
+```
+
+
+
+
+
+
+
+
