@@ -1,0 +1,19 @@
+---
+title: "spacexr或STalign"
+format: html
+---
+
+## spacexr或STalign
+
+
+
+切片对齐与整合：
+对齐：用H&E图像或空间坐标对齐连续切片，可能需要手动或用工具（如spacexr或STalign）调整。
+整合：用Harmony或Seurat的IntegrateData合并所有切片的数据，生成统一的表达矩阵，同时保留切片标识（slice ID）。
+
+
+用空间自相关（Moran’s I）或伪时间分析（pseudo-depth）探索表达梯度。
+
+
+
+如果资源允许，用工具如STUtility或VoxHunt尝试3D重构，展示基因表达的空间动态。

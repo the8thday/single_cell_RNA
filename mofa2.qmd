@@ -1,0 +1,99 @@
+---
+title: "use mofa for a multi-sample seurat object"
+format: html
+---
+
+## MOFA2 for single cell RNASeq
+
+
+```{r}
+library(MOFA2)
+```
+
+
+
+```{r}
+colors <- c(
+  "Epiblast" = "grey70",
+  "Primitive Streak" = "sandybrown",
+  "Mesoderm" = "violetred",
+  "ExE endoderm" = "#548B54",
+  "ExE ectoderm" = "black"
+)
+```
+
+
+```{r}
+
+harmonized_seurat_v4 <- Seurat::Convert(harmonized_seurat, to = "v4")
+```
+
+
+手动输入的
+```{r}
+# MOFAobject <- create_mofa_from_Seurat(harmonized_seurat, groups = "sample",
+#                                       assays = 'RNA'
+#                                       )
+
+rna_matrix <- GetAssayData(harmonized_seurat, layer = "data", assay = "RNA")
+
+meta_data <- data.frame(sample = harmonized_seurat$sample)
+rownames(meta_data) <- colnames(harmonized_seurat)
+
+mofa_data <- list(RNA = as.matrix(rna_matrix))
+MOFAobject <- create_mofa(mofa_data)
+
+samples_metadata(MOFAobject) <- meta_data
+```
+
+Plot data overview
+```{r}
+plot_data_overview(MOFAobject)
+```
+
+Define MOFA options
+```{r}
+# Default data options
+data_opts <- get_default_data_options(MOFAobject)
+
+# Default model options
+model_opts <- get_default_model_options(MOFAobject)
+
+# Training options
+train_opts <- get_default_training_options(MOFAobject)
+train_opts$convergence_mode <- "fast"
+train_opts$seed <- 42
+```
+
+
+Prepare the MOFA object
+```{r}
+MOFAobject <- prepare_mofa(
+  object = MOFAobject,
+  data_options = data_opts,
+  model_options = model_opts,
+  training_options = train_opts
+)
+```
+
+
+
+```{r}
+MOFAobject <- run_mofa(MOFAobject)
+```
+
+```{r}
+names(MOFAobject@data[[1]])
+```
+
+
+```{r}
+plot_data_overview(MOFAobject, colors = c("RNA"="darkgreen"))
+```
+
+
+```{r}
+# Plot variance explained per factor across groups
+plot_variance_explained(MOFAobject, x="group", y="factor")
+```
+

@@ -1,0 +1,169 @@
+---
+title: "spatial transcripts test"
+format: html
+---
+
+## 一个小小的空间转录组的测试
+
+
+分辨率限制：Visium每个点（spot）可能包含多个细胞，需结合单细胞数据解卷积。
+
+批次效应：多实验批次数据需使用Harmony或Seurat V5整合。
+
+可视化优化：调整pt.size.factor和alpha参数增强图像可读性
+
+
+在目前的主流技术（如Visium）中，空间转录组数据本质上是二维的，原因如下：
+
+技术原理：
+Visium平台是将组织切片放在一个二维的barcoded spot阵列上，每个spot捕获该位置的RNA表达。每个spot的直径是55 μm，捕获的是一个平面区域的平均表达。
+即使结合H&E染色图像，数据也只反映切片表面的空间信息（x-y平面），没有直接的z轴（深度）信息。
+因此，单张切片的空间转录组数据是一个二维“快照”，描述的是平面内的细胞亚群分布和基因表达模式。
+与三维结构的区别：
+三维结构需要沿z轴的连续信息，而单张切片无法直接提供这一点。要得到三维数据，需要对连续切片（serial sections）进行采样并整合，但这在实际操作中是额外的步骤，不是Visium单次实验的默认输出。
+目前，真正的三维空间转录组技术（如全组织体视显微镜结合RNA检测）还处于发展阶段，Visium等主流方法仍以二维为主。
+
+
+
+## 流程
+
+```{r}
+library(Seurat)
+library(SeuratData)
+library(ggplot2)
+library(harmony)
+library(patchwork)
+```
+
+
+
+1.1 加载10x Visium数据集
+
+
+```{r}
+InstallData("stxBrain")  # 安装小鼠脑部数据集
+brain <- LoadData("stxBrain", type = "anterior1")  # 加载前脑切片数据
+
+# 查看数据结构
+head(brain@meta.data)  # 包含nCount_Spatial（总UMI数）、nFeature_Spatial（基因数）等
+```
+
+1.2 质量控制（QC）
+
+```{r}
+# 计算线粒体基因比例（小鼠线粒体基因前缀为"mt-"）
+brain[["percent.mt"]] <- PercentageFeatureSet(brain, pattern = "^mt-")
+
+# 可视化QC指标
+VlnPlot(brain, features = c("nFeature_Spatial", "nCount_Spatial", "percent.mt"), ncol = 3)
+SpatialFeaturePlot(brain, features = "nCount_Spatial")  # 查看UMI空间分布
+```
+
+
+
+2.1 使用SCTransform标准化
+```{r}
+brain <- SCTransform(brain, assay = "Spatial", verbose = FALSE)  # 基于负二项模型的归一化
+```
+
+
+2.2 高变基因筛选
+```{r}
+brain <- FindVariableFeatures(brain, selection.method = "vst", nfeatures = 3000)
+
+VariableFeaturePlot(brain)  # 可视化高变基因应显示基因方差-均值分布
+
+```
+
+
+3.1 PCA降维与Harmony整合（适用于多切片）
+
+此处只有一个样本，所以不用跑harmony，但问题是空转的数据，怎么处理样本间的批次问题呢？
+空间转录组学分析不同于scRNA-seq，样本整合分析不是必要的。
+
+```{r}
+brain <- RunPCA(brain, assay = "SCT", verbose = FALSE)
+brain <- RunHarmony(brain, group.by.vars = "orig.ident")  # 消除批次效应
+```
+
+
+
+3.2 UMAP可视化与聚类
+```{r}
+brain <- RunUMAP(brain, reduction = "pca", dims = 1:20)
+brain <- FindNeighbors(brain, reduction = "pca", dims = 1:20)
+brain <- FindClusters(brain, resolution = 0.5)  # 分辨率控制聚类数量
+
+# 可视化聚类结果
+p1 <- DimPlot(brain, reduction = "umap", label = TRUE)
+p2 <- SpatialDimPlot(brain, label = TRUE, label.size = 3)
+p1 + p2
+```
+
+
+4.1 识别空间模式基因
+
+此步特别的慢。
+```{r}
+# 自定义邻域参数（需提前定义空间图）
+# brain <- FindSpatialNeighbors(brain, method = "knn", k = 10)  # 默认 k=30
+brain <- FindSpatiallyVariableFeatures(
+  brain, 
+  assay = "SCT", 
+  features = VariableFeatures(brain)[1:1000],
+  # selection.method = "markvariogram"  # 基于空间变异函数使用 method = "moransi"（基于莫兰指数，速度更快）。
+  selection.method = "moransi",
+  verbose = TRUE 
+)
+
+# 提取并可视化前6个空间基因
+top.genes <- head(SpatiallyVariableFeatures(brain), 6)
+SpatialFeaturePlot(brain, features = top.genes, ncol = 3, alpha = c(0.1, 1))
+```
+
+
+4.2 差异表达分析（区域间）
+```{r}
+# 定义区域（示例：根据聚类结果划分）
+brain@meta.data$Region <- ifelse(brain$seurat_clusters %in% c(0, 1), "Cortex", "Thalamus")
+
+# 查找区域标记基因
+Idents(brain) <- "Region"
+markers <- FindAllMarkers(brain, only.pos = TRUE, min.pct = 0.25)
+DoHeatmap(brain, features = markers$gene[1:20])  # 热图可视化
+```
+
+
+5.1 空间交互式可视化
+
+不错的功能。
+```{r}
+SpatialDimPlot(brain, interactive = TRUE)  # 交互式探索聚类分布
+
+SpatialFeaturePlot(brain, features = "Hpca", interactive = TRUE)  # 交互式调整透明度与样式
+```
+
+
+5.2 通路富集分析（以KEGG为例）
+```{r}
+library(clusterProfiler)
+markers_entrez <- bitr(markers$gene, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = "org.Mm.eg.db")
+kegg_result <- enrichKEGG(markers_entrez$ENTREZID, organism = "mmu")
+dotplot(kegg_result, showCategory = 10)  # 可视化富集通路
+```
+
+
+6多切片整合（高级）
+```{r}
+# 加载多切片数据并整合
+brain2 <- LoadData("stxBrain", type = "posterior1")  # 后脑切片
+
+brain.list <- list(brain, brain2)
+brain.anchors <- FindIntegrationAnchors(brain.list, dims = 1:20)
+brain.integrated <- IntegrateData(brain.anchors, dims = 1:20)
+
+# 联合分析
+brain.integrated <- RunUMAP(brain.integrated, reduction = "harmony", dims = 1:20)
+SpatialDimPlot(brain.integrated, group.by = "orig.ident")  # 显示不同切片整合效果
+```
+

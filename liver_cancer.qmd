@@ -1,0 +1,829 @@
+---
+title: "liver cancer"
+format: html
+---
+
+## single cell for liver cancer
+
+> https://scatlaslc.ccr.cancer.gov/#/
+
+
+
+## 数据的整理和清洗
+
+
+Multi-Regional (GSE189903)
+This cohort consists of 112,506 cells from four HCC patients and three iCCA patients. For each tumor, single cells from five separate regions, i.e., three tumor cores (T1, T2, and T3), one tumor border (B) and an adjacent normal tissue (N), were prepared. A total of 34 samples were included in this study.
+
+
+```{r}
+#| include: false
+
+library(tidyverse)
+library(SingleCellExperiment)
+library(Seurat)
+
+options(future.globals.maxSize = 4000 * 1024^2)
+```
+
+
+three tumor cores (T1, T2, and T3), one tumor border (B) and an adjacent normal tissue (N)
+```{r}
+sample_info <- read_delim(
+  '~/Downloads/GSE189903/GSE189903_Info.txt'
+)
+
+sample_info
+```
+从上面的数据可以看到，我们只选取`1HB`,`1HN`,`1HT1`,`1HT2`, `1HT3`和2号样本。
+
+
+
+```{r}
+data <- Read10X(
+  data.dir = '~/Downloads/GSE189903/',
+  gene.column = 2,
+  unique.features = TRUE
+)
+
+seurat_obj <- CreateSeuratObject(
+  counts = data,
+  project = 'GSE189903',
+  min.cells = 3,
+  min.features = 200
+)
+```
+
+
+
+```{r}
+all(sample_info$Cell %in% colnames(seurat_obj))
+```
+
+```{r}
+sample_info <- sample_info %>% column_to_rownames('Cell')
+
+sample_info <- sample_info[colnames(seurat_obj),]
+```
+
+
+```{r}
+seurat_obj <- AddMetaData(seurat_obj, metadata = sample_info)
+```
+
+
+```{r}
+seurat_obj$patient_num <- gsub("^(\\d+).*$", "\\1", seurat_obj$Sample)
+seurat_obj$disease_type <- gsub("^\\d+([CH]).*$", "\\1", seurat_obj$Sample)
+seurat_obj$tissue <- gsub("^\\d+[CH](.*$)", "\\1", seurat_obj$Sample)
+```
+
+
+
+选取部分样本，不然小笔记本受不了：
+```{r}
+seurat_obj <- subset(seurat_obj, disease_type == 'H')
+seurat_obj <- subset(seurat_obj, patient_num %in% c('1', '2'))
+```
+
+
+
+```{r}
+#| eval: false
+
+# 通过DecontX去除这些黏连散在的细胞，使分群的界限更加清晰。
+# devtools::install_github("campbio/decontX")
+
+library(decontX)
+#提取counts矩阵
+view(sce)
+counts <- sce@assays$RNA@counts
+decontX_results <- decontX(counts)
+sce$contamination <- decontX_results$contamination
+###根据contamination值进行过滤，一般是保留<0.2的细胞,这里过滤掉了7000多个细胞,其实有点多，可能会丢失过多的信息。
+sce_filt <- sce[,sce$contamination<0.2]
+
+
+# saveRDS(seurat_obj,file = "./datasets/GSE189903_filter.RDS")
+# saveRDS(sce_filt,file = "sce_filt.RDS")
+```
+
+
+## 标准Seurat流程
+
+
+### 质控和去除Doublet等
+
+去除doublet。
+```{r}
+library(scDblFinder)
+require(BiocParallel)
+
+
+sce <- as.SingleCellExperiment(seurat_obj, assay = "RNA")
+
+# 运行 scDblFinder（假设样本信息列名为 "orig.ident"）
+sce <- scDblFinder(sce,
+  samples = colData(sce)$Sample, 
+  # clusters = "seurat_clusters",
+  BPPARAM = MulticoreParam(4)
+)
+
+table(sce$scDblFinder.class)
+
+# 将结果添加回 Seurat 对象
+seurat_obj$scDblFinder.class <- sce$scDblFinder.class
+
+# 过滤并保存
+merged_seurat <- subset(seurat_obj, scDblFinder.class == "singlet")
+```
+
+
+
+
+```{r}
+merged_seurat$log10GenesPerUMI <- log10(merged_seurat$nFeature_RNA) / log10(merged_seurat$nCount_RNA)
+# merged_seurat$cells <- rownames()
+
+merged_seurat$mitoRatio <- PercentageFeatureSet(object = merged_seurat, pattern = "^MT-")
+merged_seurat$mitoRatio <- merged_seurat@meta.data$mitoRatio / 100
+
+# 核糖体基因、红血细胞基因、管家基因
+merged_seurat <- PercentageFeatureSet(merged_seurat, "^RP[SL]",col.name = "percent.ribo")
+merged_seurat <- PercentageFeatureSet(merged_seurat, "^HB[^(P)]", col.name = "percent.hb")
+```
+
+
+
+```{r}
+p_all <- VlnPlot(merged_seurat, 
+                 features = c("nFeature_RNA", "nCount_RNA", "mitoRatio"), 
+                 group.by = "Sample", 
+                 ncol = 3, pt.size = 0)
+
+p_all
+```
+
+
+```{r}
+# 针对metadata的一些质控
+
+metadata <- merged_seurat@meta.data
+
+metadata$cells <- rownames(metadata)
+
+# Rename columns
+metadata <- metadata %>%
+  dplyr::rename(
+    seq_folder = orig.ident,
+    nUMI = nCount_RNA,
+    nGene = nFeature_RNA
+  )
+```
+
+
+Visualize the number of cell counts per sample
+
+```{r}
+# Visualize the number of cell counts per sample
+metadata %>%
+  ggplot(aes(x = Sample, fill = Sample)) +
+  geom_bar() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  ggtitle("NCells")
+```
+
+
+The UMI counts per cell should generally be above 500, that is the low end of what we expect. If UMI counts are between 500-1000 counts, it is usable but the cells probably should have been sequenced more deeply.
+
+```{r}
+# Visualize the number UMIs/transcripts per cell
+metadata %>%
+  ggplot(aes(color = Sample, x = nUMI, fill = Sample)) +
+  geom_density(alpha = 0.2) +
+  scale_x_log10() +
+  theme_classic() +
+  ylab("Cell density") +
+  geom_vline(xintercept = 500)
+```
+
+
+
+Genes detected per cell. For high quality data, the proportional histogram should contain a single large peak that represents cells that were encapsulated.
+
+```{r}
+# Visualize the distribution of genes detected per cell via histogram
+metadata %>%
+  ggplot(aes(color = Sample, x = nGene, fill = Sample)) +
+  geom_density(alpha = 0.2) +
+  theme_classic() +
+  scale_x_log10() +
+  geom_vline(xintercept = 300)
+```
+
+
+The novelty score is computed by taking the ratio of nGenes over nUMI. Generally, we expect the novelty score to be above 0.80 for good quality cells.
+
+```{r}
+# Visualize the overall complexity of the gene expression by visualizing the genes detected per UMI (novelty score)
+metadata %>%
+  ggplot(aes(x = log10GenesPerUMI, color = Sample, fill = Sample)) +
+  geom_density(alpha = 0.2) +
+  theme_classic() +
+  geom_vline(xintercept = 0.8)
+```
+
+This metric can identify whether there is a large amount of mitochondrial contamination from dead or dying cells. We define poor quality samples for mitochondrial counts as cells which surpass the 0.2 mitochondrial ratio mark, unless of course you are expecting this in your sample.
+
+
+```{r}
+# Visualize the distribution of mitochondrial gene expression detected per cell
+metadata %>%
+  ggplot(aes(color = Sample, x = mitoRatio, fill = Sample)) +
+  geom_density(alpha = 0.2) +
+  scale_x_log10() +
+  theme_classic() +
+  geom_vline(xintercept = 0.2)
+```
+
+
+Cell-level filtering
+
+```{r}
+merged_seurat <- subset(
+  x = merged_seurat,
+  subset = (nCount_RNA >= 500) &
+    (nFeature_RNA >= 250) &
+    (log10GenesPerUMI > 0.80) &
+    (mitoRatio < 0.20)
+)
+
+merged_seurat # 过滤掉的很少呀
+```
+
+
+```{r}
+#| eval: true
+
+# Normalize the counts
+# 此时的normalization还比较的粗糙，利用默认的log方式
+merged_seurat <- NormalizeData(merged_seurat)
+
+# Identify the most variable genes
+merged_seurat <- FindVariableFeatures(merged_seurat,
+  selection.method = "vst",
+  nfeatures = 2000,
+  verbose = FALSE
+)
+
+# Scale the counts
+merged_seurat <- ScaleData(merged_seurat)
+
+# Score cells for cell cycle
+# filtered_seurat <- CellCycleScoring(filtered_seurat,
+#   g2m.features = cc.genes.updated.2019$g2m.genes,
+#   s.features = cc.genes.updated.2019$s.genes
+# )
+
+# Perform PCA
+merged_seurat <- RunPCA(merged_seurat)
+
+# perform TSNE, UMAP
+merged_seurat <- RunUMAP(merged_seurat, dims = 1:20)
+# seurat_phase <- RunTSNE(object = seurat_phase, dims = 1:20, do.fast = TRUE)
+
+# Plot the PCA colored by cell cycle phase
+# DimPlot(filtered_seurat,
+#   reduction = "pca",
+#   group.by = "Phase",
+#   split.by = "Phase"
+# )
+```
+
+
+```{r}
+# qs::qsave(merged_seurat, "./datasets/merged_seurat_GSE189903.qs")
+```
+
+
+### SCTransform
+
+在进行SCTransform时，一般会对cell cycle和线粒体等会对聚类引入variation进行regress out，但如果线粒体本就在研究对象 中有意义的话，就不推荐regerss out了。当然还有其他在实验设计中引入的混淆变量、协变量等，具体情况具体分析。
+
+
+
+```{r}
+# SCTranform
+
+merged_seurat <- SCTransform(merged_seurat, 
+                            method = "glmGamPoi",
+                            vars.to.regress = c("mitoRatio"),
+                            assay = "RNA", 
+                            # vst.flavor = "v2",
+                            verbose = TRUE
+                            )
+```
+
+
+```{r}
+# saveRDS(merged_seurat, "./datasets/merged_seurat_GSE189903.rds")
+
+# merged_seurat <- qs::qread("./datasets/merged_seurat_GSE189903.qs")
+# qs::qsave(merged_seurat, "./datasets/merged_seurat_GSE189903.qs")
+```
+
+```{r}
+
+# Check which assays are stored in objects
+DefaultAssay(merged_seurat)
+```
+
+
+```{r}
+merged_seurat <- RunPCA(merged_seurat,
+  features = VariableFeatures(merged_seurat)
+)
+
+ElbowPlot(merged_seurat, ndims = 50)
+```
+
+```{r}
+harmonized_seurat <- harmony::RunHarmony(merged_seurat,
+  group.by.vars = c("Sample"),
+  reduction.use = "pca",
+  assay.use = "SCT",
+  reduction.save = "harmony",
+  plot_convergence = TRUE
+)
+```
+
+
+```{r}
+
+set.seed(123)
+
+harmonized_seurat <- RunUMAP(harmonized_seurat,
+  reduction = "harmony",
+  assay = "SCT",
+  dims = 1:40
+)
+
+harmonized_seurat <- RunTSNE(harmonized_seurat,
+  reduction = "harmony",
+  assay = "SCT",
+  dims = 1:40,
+  verbose = FALSE
+)
+
+DefaultAssay(harmonized_seurat)
+```
+
+
+```{r}
+# 校正前的PCA结果（按样本着色）
+p1 <- DimPlot(harmonized_seurat, reduction = "pca", group.by = "Sample") + 
+  ggtitle("Before Harmony (PCA)")
+
+# 校正后的Harmony结果（按样本着色）
+p2 <- DimPlot(harmonized_seurat, reduction = "harmony", group.by = "Sample") + 
+  ggtitle("After Harmony")
+
+# 联合展示
+p1 + p2
+```
+
+
+
+## Clustering
+
+Seurat uses a graph-based clustering approach using a K-nearest neighbor approach, and then attempts to partition this graph into highly interconnected 'quasi-cliques' or 'communities'.
+
+
+```{r}
+
+set.seed(123)
+
+
+harmonized_seurat <- FindNeighbors(
+  object = harmonized_seurat,
+  reduction = "harmony",
+  dims = 1:40
+)
+
+# Determine the clusters for various resolutions
+harmonized_seurat <- FindClusters(
+  object = harmonized_seurat,
+  resolution = c(0.2, 0.4, 0.6, 0.8, 1.0, 1.4),
+  algorithm = 1
+)
+```
+
+```{r}
+Idents(harmonized_seurat) <- 'Type'
+
+Idents(harmonized_seurat) <- 'SCT_snn_res.0.2'
+```
+
+```{r}
+# 可视化聚类结果
+p1 <- DimPlot(harmonized_seurat, reduction = "umap", label = TRUE) + ggtitle("Clusters")
+p2 <- DimPlot(harmonized_seurat, reduction = "umap", group.by = "Sample") + ggtitle("Sample")
+# p3 <- DimPlot(harmonized_seurat, reduction = "umap", group.by = "age") + ggtitle("age")
+# p4 <- DimPlot(harmonized_seurat, reduction = "umap", group.by = "genotype") + ggtitle("Genotype")
+
+p1 + p2
+# p3 + p4
+```
+
+```{r}
+# 不同分辨率情况下的细胞聚类情况
+
+require(clustree)
+
+clustree::clustree(harmonized_seurat, prefix = "SCT_snn_res.")
+```
+
+
+
+```{r}
+Idents(object = harmonized_seurat) <- "SCT_snn_res.0.2"
+```
+
+
+```{r}
+# Plot the UMAP
+DimPlot(harmonized_seurat,
+  reduction = "umap",
+  label = TRUE,
+  label.size = 6
+)
+```
+
+
+Generally, we expect to see the majority of the cell type clusters to be present in all conditions; however, depending on the experiment we might expect to see some condition-specific cell types present.
+```{r}
+DimPlot(harmonized_seurat, 
+        label = TRUE, 
+        split.by = "Sample")  + NoLegend()
+```
+
+
+```{r}
+# qs::qsave(harmonized_seurat, "./datasets/harmonized_seurat_GSE189903.qs")
+
+harmonized_seurat <- qs::qread("./datasets/harmonized_seurat_GSE189903.qs")
+```
+
+
+```{r}
+harmonized_seurat <- PrepSCTFindMarkers(harmonized_seurat,
+  assay = "SCT",
+  verbose = TRUE
+)
+```
+
+
+差异基因和marker基因是要同时考虑的，很多时候差异基因可能并非marker基因的前几个，可以多看几个基因。不论是差异基因还是marker基因。
+```{r}
+
+Idents(harmonized_seurat) <- 'Type'
+
+cluster_markers <- FindAllMarkers(
+  harmonized_seurat,
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+
+# 提取top10标记基因
+top10 <- cluster_markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 10, order_by = avg_log2FC)
+
+top2 <- cluster_markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 2, order_by = avg_log2FC)
+
+top5 <- cluster_markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 5, order_by = avg_log2FC)
+```
+
+
+```{r}
+colorlist <- c("#ea5c6f","#f7905a","#e187cb","#fb948d","#e2b159","#ebed6f",
+               "#b2db87","#7ee7bb","#64cccf","#a9dce6","#a48cbe","#e4b7d6",
+               "#89c8e8","#caa2f4","#1f78b4","#6a3d9a","#8acc72")
+
+# 1. 提取各组的细胞类型信息
+metadata <- harmonized_seurat@meta.data
+
+
+# 2. 计算各组中细胞类型的比例
+cell_counts <- table(metadata$Sample, metadata$Type)
+cell_props <- prop.table(cell_counts, margin = 1)
+
+# 3. 可视化细胞组成
+cell_prop_df <- as.data.frame(cell_props)
+colnames(cell_prop_df) <- c("Group", "CellType", "Proportion")
+
+# 绘制堆叠条形图
+ggplot(cell_prop_df, aes(x = Group, y = Proportion, fill = CellType)) +
+  geom_bar(stat = "identity") +
+  theme_classic() +
+  scale_fill_manual(values = colorlist) +
+  labs(title = "Cell Type Composition Across Groups")
+```
+
+
+
+### T cell
+
+这两个数据集，80%的T细胞占比，难道没有问题吗？
+
+```{r}
+Idents(harmonized_seurat) <- 'Type'
+```
+
+T 细胞 marker基因
+```{r}
+gene <- c(
+  "NCAM1", "XCL1", "FCER1G", # CD56 NK
+  "CCL4L2", "CCL3L1", "CCL4", # Inflamed NK
+  "GNLY", "NKG7", "PRF1", # GNLY CTL
+  "EGR1", "FOSB", "TNF", # TNF memory T cells
+  "IL7R", "LTB", "CXCR4", # IL7R memory T cells
+  "RGS1", "CXCL13", "CD8A", # Activated T CD8 RGS1
+  "SELL", "CCR7", # Tn
+  "FOXP3", "CTLA4", # Treg
+  "MKI67", "TOP2A"
+) # Cycling
+
+
+###CD4T
+CD4_markers_list =list(
+  Tc=c("CD3D","CD3E"),
+  CD4=c("CD4" ),
+  Treg=c("TNFRSF4","BATF","TNFRSF18","FOXP3","IL2RA","IKZF2"),
+  naive=c("CCR7","SELL","CD5"),
+  Tfh=c("CXCR5","BCL6","ICA1","TOX","TOX2","IL6ST"),#滤泡辅助性T细胞
+  ILC=c("TNFRSF25","KRT81","LST1","AREG","LTB","CD69")
+) 
+
+###CD8T
+CD8_markers_list1 =list(
+  CD8=c("CD8A","CD8B"),
+  TN_TCM=c("CCR7","SELL","TCF7","LEF1"),
+  TEM=c("GZMK"  ),
+  TEFF=c("TBX21","FCGR3A","FGFBP2"),
+  TRM=c("XCL1","XCL2","ITGAE","CD69"),
+  IEL_T = c("TMIGD2"),
+  yT1c=c("GNLY","PTGDS","GZMB","TRDC"),
+  yT2c=c("TMN1","HMGB2","TYMS"),
+  MAIT_T = c("SLC4A10")
+) 
+
+
+CD8_markers_list2 =list(
+  CD8T=c("CD8A","CD8B"),
+  MAIT=c("ZBTB16","NCR3","RORA"),
+  ExhaustedCD8T=c("LAG3","TIGIT","PDCD1","HAVCR2","CTLA4"),
+  EffMemoryCD8=c("EOMES","ITM2C"),
+  Resting_NK=c("XCL1","XCL2","KLRC1"),
+  Cytotoxic_NK=c("CX3CR1","FGFBP2","FCGR3A","KLRD1"),
+  Pre_exhausted=c("IFNG","PRF1","GNLY","GZMA","NKG7","GZMK")
+)
+```
+
+
+确实有很多的T细胞，针对T细胞展开进一步的注释：
+不论是这几个基因的表达水平还是表达的特异性，似乎也没有太多的过渡态细胞。
+```{r}
+FeaturePlot(harmonized_seurat,
+  features = c("CD3E", "CD3D", "PTPRC", 'CD8A'),
+  reduction = "umap", pt.size = 0.6
+) +
+    scale_x_continuous("") + scale_y_continuous("") +
+  theme_bw() +
+  theme(
+    panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+    axis.ticks = element_blank(), axis.text = element_blank(),
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, size = 14))
+```
+
+
+```{r}
+Tcell = harmonized_seurat[,filter(harmonized_seurat@meta.data,Type %in% c('T-cell')) %>% rownames()]
+
+Tcell
+```
+
+
+为何T细胞分布的如此散乱？可能和占比太高有些关系吧
+```{r}
+# check
+DimPlot(Tcell,reduction = "umap",
+        label = TRUE, pt.size = 0.5) 
+```
+
+
+```{r}
+Tcell = SCTransform(Tcell, vars.to.regress = c("mitoRatio", "nFeature_RNA","nCount_RNA")) 
+
+Tcell = RunPCA(Tcell, features = VariableFeatures(Tcell)) 
+ElbowPlot(Tcell,ndims = 50)
+```
+
+
+ PCA数目的选择会影响聚类得到的亚群数目，这还是需要注意一下。
+```{r}
+Tcell = Tcell %>% harmony::RunHarmony("Sample", plot_convergence = TRUE,assay.use = "SCT")
+Tcell = RunUMAP(Tcell, reduction = "harmony",dims = 1:20)
+
+Tcell = FindNeighbors(Tcell, reduction = "harmony", dims = 1:20)             
+Tcell = FindClusters(Tcell, resolution = 0.1,algorithm=1)
+```
+
+
+```{r}
+# qs::qsave(Tcell, "./datasets/Tcell_GSE189903.qs")
+
+Tcell <- qs::qread("./datasets/Tcell_GSE189903.qs")
+
+```
+```{r}
+# check
+DimPlot(Tcell,reduction = "umap",
+        label = TRUE, pt.size = 0.5) 
+```
+
+
+```{r}
+DimPlot(Tcell, reduction = "harmony", group.by = "Sample")
+```
+
+
+```{r}
+DimPlot(Tcell, reduction = "umap", split.by = "Sample")
+```
+
+
+不少的`HSP`开头的基因是其的高变基因，这一点要注意，一般这些基因都是和y压力相关的
+```{r}
+# 对高可变基因进行可视化
+top10 <- head(VariableFeatures(Tcell), 10)
+
+plot1 <- VariableFeaturePlot(Tcell)
+plot2 <- LabelPoints(
+  plot = plot1,
+  points = top10,
+  repel = TRUE
+)
+plot2
+```
+
+resolution == 0.1的时候得到的竟然还是28个亚群，真是难呀
+T细胞分那么多。。调整PCA的数目以求更少的亚群。其实从clusttree上看结果都还可以。
+
+```{r}
+FeaturePlot(Tcell,
+  features = c("GNLY", "CXCL13", "CCL4", 'TRBV4-2', 'IL17A', 'FOXP3'),
+  reduction = "umap", pt.size = 0.6
+) +
+    scale_x_continuous("") + scale_y_continuous("") +
+  theme_bw() +
+  theme(
+    panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+    axis.ticks = element_blank(), axis.text = element_blank(),
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, size = 14))
+```
+
+
+T细胞的分组问题不大，但是细分还有些困难.
+对于一些不想要的细胞，就直接行的删掉吧
+```{r}
+FeaturePlot(Tcell,
+  features = c("CD3E", "CD3D", "PTPRC", 'CD8A'),
+  reduction = "umap", pt.size = 0.6
+)
+```
+
+
+```{r}
+DotPlot(Tcell,
+  features = c("GNLY", "CXCL13", "CCL4", 'CXCR5', 'IL17A', 'FOXP3', "NCAM1","FCGR3A")
+) +
+  theme(axis.text.x = element_text(angle = 90)) + NoLegend()
+```
+
+
+```{r}
+DotPlot(Tcell,
+  features = CD8_markers_list1
+) +
+  theme(axis.text.x = element_text(angle = 90)) + NoLegend()
+```
+
+```{r}
+DotPlot(Tcell,
+  features = CD4_markers_list
+) +
+  theme(axis.text.x = element_text(angle = 90)) + NoLegend()
+```
+
+
+```{r}
+Tcell <- PrepSCTFindMarkers(Tcell,
+  assay = "SCT",
+  verbose = TRUE
+)
+```
+
+#### 差异marker基因
+
+```{r}
+Idents(Tcell) <- 'SCT_snn_res.0.1'
+
+cluster_markers <- FindAllMarkers(
+  Tcell,
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+
+# 提取top10标记基因
+top10 <- cluster_markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 10, order_by = avg_log2FC)
+
+top2 <- cluster_markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 2, order_by = avg_log2FC)
+
+top5 <- cluster_markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 5, order_by = avg_log2FC)
+```
+
+
+看一下所谓差异基因的一个分布情况：
+
+抗原驱动选择：当T细胞识别特定抗原（如病原体、肿瘤抗原）时，携带对应TCR的克隆会大量扩增，导致同一TRBV基因在亚群中富集。
+为什么主要围绕着这些亚型？？？
+
+应该是同一类细胞，只是TCR的区域不同？可以说全是CD8T细胞，只是针对的抗原不同吗？因为肿瘤的抑制性？
+```{r}
+DotPlot(Tcell, features = unique(top2$gene)) +
+  theme(axis.text.x = element_text(angle = 90)) + NoLegend()
+```
+
+
+
+#### 对感兴趣的亚群进一步的分析
+
+```{r}
+# 查看graph.name的名字
+harmonized_seurat@graphs
+
+
+# resolution参数的选择可以基于前面的数图来做决定等等
+
+
+sce_T_NK <- FindSubCluster(
+  harmonized_seurat,
+  cluster="T-cell",
+  graph.name = "SCT_snn",
+  subcluster.name = "SCT_snn_sub",
+  resolution = 0.01
+)
+```
+
+resolution==0.01分出来的T细胞都是这样的吗？
+
+全是活性很高的CD8+T细胞
+```{r}
+sel.clust = "SCT_snn_sub"
+sce_T_NK <- SetIdent(sce_T_NK, value = sel.clust)
+DimPlot(sce_T_NK,label = T)
+
+# VlnPlot可视化
+library(paletteer)
+
+marker <- c("CD3E","CD3D","CD4","CD8A","NCAM1","FCGR3A")
+VlnPlot(sce_T_NK,features = marker,cols = c(paletteer_d("awtools::bpalette"),
+           paletteer_d("awtools::a_palette"),
+           paletteer_d("awtools::mpalette"),
+           paletteer_d("awtools::spalette")),
+            combine = TRUE,raster=FALSE)
+```
+
+```{r}
+DimPlot(sce_T_NK,label = T, split.by = 'Sample')
+```
+
+
+

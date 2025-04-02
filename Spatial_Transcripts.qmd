@@ -1,0 +1,822 @@
+---
+title: "Spatial Transcript test"
+format: html
+---
+
+
+
+## 一次空间转录组的练习
+
+
+GEO：GSM5833536 （以该 GBM 胶质瘤样本为例 )
+
+考虑到数据大小，仅仅跑一个样本。
+
+
+对于多个样本的情况，比较合理的方法使用列表来处理每个样本。当然还需要进一步的了解不同的测序技术。
+
+`10x Genomics Visium`平台似乎是比较主流的。其的实验的部分需要HE染色的一些。
+
+
+```{r}
+#| include: false
+
+##加载R包
+library(tidyverse)
+library(Seurat)
+library(hdf5r)
+library(ggplot2)
+```
+
+
+分析虽然也是重要的一步，但是和整个技术的设计相比还是差一些的。
+```{r}
+##创建空转Seurat对象
+GBM4 <-Load10X_Spatial(
+       data.dir ="~/Downloads/GBM4_spaceranger_out",   #上一步数据下载路径
+       filename = "filtered_feature_bc_matrix.h5", #h5矩阵文件名
+       filter.matrix = TRUE,
+       slice ="GBM4")   # H&E 图片名(自定义)
+
+
+GBM3 <-Load10X_Spatial(
+       data.dir ="~/Downloads/GBM3_spaceranger_out",   #上一步数据下载路径
+       filename = "filtered_feature_bc_matrix.h5", #h5矩阵文件名
+       filter.matrix = TRUE,
+       slice ="GBM3"
+       )
+ 
+ 
+GBM4$orig.ident <-"GBM4" 
+GBM4
+```
+
+
+`spot`是指Spot 分辨率：如 Visium 的每个捕获点（spot）直径约 55 μm，可能包含多个细胞。
+
+
+```{r}
+#可视化每个spot的空间计数
+SpatialFeaturePlot(GBM4, features = "nCount_Spatial")
+```
+
+## QC 和 过滤
+
+Spot Filtering: Remove spots with low UMI counts, low gene counts, or high mitochondrial gene content (indicating cell damage). Thresholds depend on the tissue and platform (e.g., >500 UMIs, <10% mitochondrial reads).
+Gene Filtering: Exclude genes detected in too few spots (e.g., <3 spots) to focus on biologically relevant signals.
+Visual QC: Overlay UMI counts on the tissue image to check if high-expression spots align with cell-dense regions (e.g., nuclei in H&E staining).
+
+
+```{r}
+# 2. 质量控制 (QC)
+# 计算每个spot的线粒体基因百分比（假设线粒体基因以"MT-"开头，根据你的物种调整）
+GBM4[["percent.mt"]] <- PercentageFeatureSet(GBM4, pattern = "^MT-")
+
+# 可视化QC指标：UMI总数、基因数、线粒体百分比
+VlnPlot(GBM4, features = c("nCount_Spatial", "nFeature_Spatial", "percent.mt"), ncol = 3)
+# ggsave("QC_violin.pdf", width = 12, height = 4)
+
+# 过滤低质量spot（根据你的数据调整阈值）
+visium_data <- subset(GBM4, subset = nCount_Spatial > 500 & nFeature_Spatial > 200 & percent.mt < 10)
+```
+
+
+## normalize
+
+基本上和scRNA的逻辑是一样的。
+
+```{r}
+##SCT标准化
+GBM4 <- SCTransform(GBM4, assay = "Spatial", verbose = TRUE)
+GBM4 <- RunPCA(GBM4, assay = "SCT", verbose = FALSE) 
+# 可视化PCA的Elbow图，选择主成分数
+ElbowPlot(GBM4)
+ 
+##数据聚类
+GBM4<- FindNeighbors(GBM4, reduction = "pca", dims = 1:20)
+GBM4 <- FindClusters(GBM4, verbose = FALSE,resolution = 0.4) # 注意这里的逻辑和单细胞相似
+p1<-SpatialPlot(GBM4, label = TRUE, label.size = 5)
+ 
+#UMAP降维
+GBM4 <- RunUMAP(GBM4, reduction = "pca", dims = 1:20)
+p2 <- DimPlot(GBM4, reduction = "umap", label = TRUE)
+p1+p2
+```
+
+绘图函数的逻辑也几乎是一致的。
+```{r}
+#查看感兴趣基因空间表达分布
+SpatialFeaturePlot(GBM4, features =c("SOX10","SOD2"))
+```
+
+```{r}
+# 找到高变基因 (HVGs)
+visium_data <- FindVariableFeatures(visium_data, selection.method = "vst", nfeatures = 2000)
+
+# 可视化高变基因
+top10 <- head(VariableFeatures(visium_data), 10)
+
+VariableFeaturePlot(visium_data) + 
+  geom_label(data = subset(VariableFeatures(visium_data), gene %in% top10), aes(label = gene))
+
+```
+
+
+## 空间区域划分及区域间差异分析
+
+通过组织染色的一些信息对细胞亚群的分布做一个大概的分析。
+
+```{r}
+#视化Cluster分布及H&E组织切片
+p1<-SpatialPlot(GBM4, label = TRUE, label.size = 5)
+p2<-SpatialPlot(GBM4,pt.size.factor = 0.6)+NoLegend()
+p1+p2
+```
+"以下可能并不对，我就单纯的演示"
+
+根据上图（右）H&E 情况，初步将Cluster0 和 6 定义为Normal, 将Cluster3,5定义为Transition, 其他的 Cluster 定义为Tumor。
+
+
+```{r}
+
+#区域定义
+GBM4@meta.data$Region<-NA
+GBM4@meta.data$Region[GBM4@meta.data$seurat_clusters %in% c('1','5')] <- "Normal"
+GBM4@meta.data$Region[GBM4@meta.data$seurat_clusters %in% c('3','4')] <- "Transition"
+GBM4@meta.data$Region[GBM4@meta.data$seurat_clusters %in% c('0','2')] <- "Tumor"
+
+```
+
+
+```{r}
+SpatialPlot(GBM4, label = TRUE, label.size = 5,group.by = 'Region',
+            cols = c('Normal'='#4b5cc4','Transition'='#FE8D3C','Tumor'='#AA0000'))
+```
+
+
+接下来就可以对Normal、Transition和Tumor区域进行差异分析:
+
+```{r}
+##区域间差异分析
+#切换Idents为上面定义的Region
+Idents(GBM4)<-GBM4$Region
+
+#找到各区域的标记物，并只报道阳性位点
+markers <- FindAllMarkers(GBM4, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+#找到各区域top10基因
+top10<-markers %>%
+  group_by(cluster) %>%
+  top_n(n = 10, wt = avg_log2FC)
+
+
+#可视化top10基因热图
+DoHeatmap(GBM4, features = top10$gene,
+          group.colors = c('Normal'='#4b5cc4','Transition'='#FE8D3C','Tumor'='#AA0000')) + 
+  NoLegend()
+```
+
+接下来可以对各区域差异基因进行KEGG富集分析
+
+```{r}
+library(clusterProfiler)
+
+# 将基因SYMBOL转换为ENTREZID
+gid <- bitr(unique(markers$gene), "SYMBOL", "ENTREZID", OrgDb = "org.Hs.eg.db")
+markers <- full_join(markers, gid, by = c("gene" = "SYMBOL"))
+
+# KEGG通路富集分析
+KEGG <- compareCluster(ENTREZID ~ cluster, data = markers, fun = "enrichKEGG")
+
+# 可视化各区域TOP5通路结果
+dotplot(KEGG, label_format = 40) + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  scale_color_gradient(high = "#4b5cc4", low = "#FE8D3C")
+
+# 保存分析结果，以便下期使用
+# save(GBM4,file = 'GBM4.rdata')
+```
+
+## 空间自相关分析
+安装Giotto或Squidpy做更复杂的空间模式分析。
+
+```{r}
+# 使用Moran’s I需要额外包，比如spdep或Giotto，这里用简单方法展示一个基因
+gene_of_interest <- "YOUR_GENE1"  # 替换为你感兴趣的基因
+expr <- GetAssayData(visium_data, slot = "data")[gene_of_interest, ]
+coords <- GetTissueCoordinates(visium_data)
+# 简单计算空间相关性（需要进一步统计检验）
+dist_matrix <- as.matrix(dist(coords))
+cor_spatial <- cor(expr, dist_matrix, method = "pearson")
+cat("Spatial correlation for", gene_of_interest, ":", cor_spatial, "\n")
+```
+
+
+## 反卷积细胞注释
+
+
+当下基于高通量测序的10X Visium 空间转录组技术还达不到单细胞转录组的分辨率，其使用的 6.5 X 6.5mm的捕获区域包括5000个孔（spot），其每个spot的直径为55μm，远超单个细胞体积，导致测得的每个孔（spot）可能包含2-10个以上的细胞，这会导致特定位置的基因表达是同质或者异质细胞类型的混合状态。（10X Visium HD已与2024年初正式发布，可实现空间单细胞分辨率，但离大规模使用还有一段时间）
+
+因此，需要使用细胞类型反卷积（deconvolution）分析工具去解析每个孔中的细胞类型组成，从而实现对细胞类型的空间定位。现在此类分析工具出来很多，像SPOTlight、RCTD、CARD、Cell2location、STdeconvolve等。
+
+
+首先，需要找到相同癌种的单细胞转录组数据，并对单细胞数据进行细胞注释；本次实战使用 GEO单细胞数据，编号：GSE138794
+
+
+### CARD
+
+但是好难安装
+
+```{r}
+
+# devtools::install_github('xuranw/MuSiC') #安装依赖包
+# devtools::install_github('YingMa0107/CARD') #安装CARD反卷积R包
+###加载CARD包
+library(CARD)
+library(MuSiC)
+
+ 
+#载入实战2保存的 GBM4 空转数据
+# load('GBM4.rdata')
+ 
+###获取空转的counts表达矩阵
+# spatial_count <- GBM4@assays$Spatial@layers$counts
+spatial_count <- GetAssayData(object = GBM4, assay = "Spatial", slot = "counts")
+spatial_count[1:4,1:4]
+ 
+###获取空转的空间位置矩阵
+# spatial_loca <- GBM4@images$GBM4@coordinates
+spatial_loca <- GetTissueCoordinates(GBM4)
+spatial_location <- spatial_loca[,1:2]
+#名字必须是x y ，否则后面CARD_deconvolution会报错
+colnames(spatial_location) <- c("x","y")
+spatial_location[1:3,]
+ 
+#                   x   y
+#AAACAAGTATCTCCCA-1 50 102
+#AAACACCAATAACTGC-1 59  19
+#AAACAGAGCGACTCCT-1 14  94
+ 
+#载入‘单细胞多样本整合分析’教程 保存的 GBM-scRNA 单细胞数据
+load('./datasets/GSE138794_scRNA.rdata')
+
+# scRNA <- GSE138794_scRNA
+ 
+#获取单细胞counts矩阵
+sc_count <- GetAssayData(object = scRNA, assay = "RNA", slot = "counts")
+
+#获取单细胞细胞注释矩阵
+sc_meta <- scRNA@meta.data %>% 
+  rownames_to_column("cellID") %>%
+  dplyr::select(cellID,orig.ident,celltype) %>% 
+  mutate(CB = cellID) %>% 
+  column_to_rownames("CB")
+head(sc_meta)
+ 
+head(sc_meta)
+```
+
+Warning: sparse->dense coercion
+```{r}
+##构建CARD对象，并进行空间细胞成分反卷积
+CARD_obj = createCARDObject( 
+  sc_count = sc_count, 
+  sc_meta = sc_meta, 
+  spatial_count = spatial_count, 
+  spatial_location = spatial_location, 
+  ct.varname = "celltype", 
+  ct.select = unique(sc_meta$celltype), #细胞类型列名
+  sample.varname = "orig.ident"
+  )
+## QC on scRNASeq dataset! ...
+## QC on spatially-resolved dataset! ...
+
+#CARD 解卷积
+CARD_obj = CARD_deconvolution(CARD_object = CARD_obj)
+```
+
+
+```{r}
+#下面对反卷积结果进行可视化
+#CARD-spot 可视化spot的细胞类型分布饼图
+colors = c("#4DAF4A","#F0027F","#377EB8","#FDC086","#A6761D","#FFFF00","#BEAED4",
+           "#BF5B17","#666666")
+           
+p1<-CARD.visualize.pie(proportion = CARD_obj@Proportion_CARD,
+                         spatial_location = CARD_obj@spatial_location, 
+                         colors = colors)
+ 
+p2<-SpatialPlot(GBM4,group.by = 'Region',cols = c('Normal'='#007799','Tumor'='#AA0000'))
+p1+p2
+```
+
+
+选择一些感兴趣的细胞类型进行可视化，查看细胞类型比例的空间分布
+```{r}
+#选择一些感兴趣的细胞类型分别进行可视化
+ct.visualize = c("OPC like","AC like","MES like")
+ 
+p3 <- CARD.visualize.prop(proportion = CARD_obj@Proportion_CARD,        
+  spatial_location = CARD_obj@spatial_location, 
+  ct.visualize = ct.visualize,                
+  colors = c("lightblue","lightyellow","red"), 
+  NumCols = 3,pointSize = 1)#图中spot大小
+p3
+```
+
+
+```{r}
+#原始的基因表达可视化
+p4 <- CARD.visualize.gene(
+  spatial_expression = CARD_obj@spatial_countMat,
+  spatial_location = CARD_obj@spatial_location,
+  gene.visualize = c("SNAP25","SYT1","JUNB"),
+  colors = NULL,
+  NumCols =3)
+p4
+```
+
+
+
+```{r}
+#同时可视化两种细胞类型
+p5 = CARD.visualize.prop.2CT(
+  proportion = CARD_obj@Proportion_CARD,                             ### Cell type proportion estimated by CARD
+  spatial_location = CARD_obj@spatial_location,                  ### two cell types you want to visualize
+  ct2.visualize = c("OPC like","AC like"),
+  colors = list(c("lightblue","lightyellow","red"),c("lightblue","lightyellow","black")))       ### two color scales    
+
+p6 = CARD.visualize.prop.2CT(
+  proportion = CARD_obj@Proportion_CARD,                             ### Cell type proportion estimated by CARD
+  spatial_location = CARD_obj@spatial_location,                  ### two cell types you want to visualize
+  ct2.visualize = c("MES like","Oligo"),
+  colors = list(c("lightblue","lightyellow","red"),c("lightblue","lightyellow","black")))       ### two color scales    
+p5+p6
+```
+
+
+```{r}
+#细胞类型比例相关图热图
+p6 <- CARD.visualize.Cor(CARD_obj@Proportion_CARD,colors = NULL) 
+p6
+
+```
+
+```{r}
+#保存反卷积结果
+save(CARD_obj,file = 'CARD_obj.rdata')
+```
+
+
+
+### SPOTlight
+
+它能够整合ST和scRNA-seq数据，以推断复杂组织中细胞类型和状态的位置。SPOTlight的核心是基于种子的非负矩阵分解（seeded Non-negative Matrix Factorization, NMF）回归，该方法通过使用细胞类型标记基因进行初始化，并利用非负最小二乘法（Non-negative Least Squares, NNLS）来进一步解析ST捕获位置（spot）的空间分布。
+
+```{r}
+#| include: false
+
+library(SPOTlight)
+library(SingleCellExperiment)
+library(SpatialExperiment)
+library(scater)
+library(scran)
+```
+
+
+```{r}
+# 空转数据
+# library(TENxVisiumData)
+# spe <- MouseKidneyCoronal()
+```
+
+
+```{r}
+# Feature selection
+
+sce <- as.SingleCellExperiment(scRNA)
+sce <- scater::logNormCounts(sce)
+
+# Variance modelling
+# 首先排除 ribosomal or mitochondrial 基因
+genes <- !grepl(pattern = "^Rp[l|s]|Mt", x = rownames(sce))
+table(genes)
+
+dec <- modelGeneVar(sce, subset.row = genes)
+plot(dec$mean, dec$total, xlab = "Mean log-expression", ylab = "Variance")
+curve(metadata(dec)$trend(x), col = "blue", add = TRUE)
+# Get the top 3000 genes.
+hvg <- getTopHVGs(dec, n = 3000)
+# hvg
+grep("CD3", hvg, ignore.case = T,value = T)
+```
+
+
+接下来，获取每种细胞类型的标记基因。你可以使用任何方法，只要它能够返回一个权重，以表明该基因对该细胞类型的重要性。例如，可以使用avgLogFC（平均对数倍数变化）、AUC（曲线下面积）、pct.expressed（表达百分比）、p-value等。
+
+```{r}
+# 2.细胞类型的特征基因
+colLabels(sce) <- colData(sce)$celltype
+# Compute marker genes
+mgs <- scoreMarkers(sce, subset.row = genes)
+
+mgs_fil <- lapply(names(mgs), function(i) {
+  x <- mgs[[i]]
+# Filter and keep relevant marker genes, those with AUC > 0.8
+  x <- x[x$mean.AUC > 0.4, ]
+# Sort the genes from highest to lowest weight
+  x <- x[order(x$mean.AUC, decreasing = TRUE), ]
+# Add gene and cluster id to the dataframe
+  x$gene <- rownames(x)
+  x$cluster <- i
+  data.frame(x)
+})
+mgs_df <- do.call(rbind, mgs_fil)
+```
+
+Cell Downsampling
+接下来，对每种细胞降采样到最多100个细胞。如果一种细胞类型的细胞数少于100个，则会使用所有细胞。
+
+如果细胞身份在生物学上差异很大（例如B细胞、T细胞、巨噬细胞和上皮细胞），我们可以使用较少的细胞，因为它们的转录组特征会有很大差异。而在细胞身份转录组更相似的情况下，我们需要增加样本量（N），以便捕捉它们之间的生物学异质性。
+
+```{r}
+# 3.Cell Downsampling
+# 生成一个每种细胞类型的list对象
+idx <- split(seq(ncol(sce)), sce$celltype)
+# 降采样到每种细胞20个细胞，真实数据中需要使用100个以上
+n_cells <- 20
+cs_keep <- lapply(idx, function(i) {
+  n <- length(i)
+  if (n < n_cells)
+    n_cells <- n
+  sample(i, n_cells)
+})
+sce <- sce[, unlist(cs_keep)]
+sce
+table(sce$free_annotation)
+```
+
+
+```{r}
+spe <- as.SingleCellExperiment(GBM4)
+```
+
+
+```{r}
+## 反卷积
+res <- SPOTlight(
+  x = sce,
+  y = spe,
+  groups = as.character(sce$celltype),
+  mgs = mgs_df,
+  hvg = hvg,
+  weight_id = "mean.AUC",
+  group_id = "cluster",
+  gene_id = "gene")
+
+
+# 提取反卷积矩阵：每一行为一个spot，每一列为一种细胞类型，值为细胞类型在spot中的相对百分比
+# 行和一定为1
+head(mat <- res$mat)[, 1:3]
+dim(mat)
+
+# 提取NMF模型
+mod <- res$NMF
+```
+
+得到的mat 就是反卷积的结果了，每一行为一个spot，每一列为一种细胞类型，值为细胞类型在spot中的相对百分比，行和一定为1
+
+```{r}
+## 可视化
+## 评估每个 Topic profiles 特征对每种细胞身份的特异性。理想情况下，每种细胞身份都会有一个独特的 Topic profiles 与之关联
+plotTopicProfiles(
+  x = mod,
+  y = sce$celltype,
+  facet = FALSE,
+  min_prop = 0.01,
+  ncol = 1) +
+  theme(aspect.ratio = 1)
+```
+
+
+```{r}
+# 还需要确保来自同一细胞身份的所有细胞具有相似的 Topic profiles ，因为这将意味着SPOTlight已经为同一细胞身份的所有细胞学习到了一个一致的特征 signature
+
+
+plotTopicProfiles(
+  x = mod,
+  y = sce$celltype,
+  facet = TRUE,
+  min_prop = 0.01,
+  ncol = 6)
+```
+
+
+```{r}
+# 细胞类型共定位
+plotInteractions(mat, which = "heatmap", metric = "prop")
+plotInteractions(mat, which = "heatmap", metric = "jaccard")
+plotInteractions(mat, which = "network")
+```
+
+
+空间切片上展示注释结果
+
+```{r}
+## 饼图
+ct <- colnames(mat)
+# 占比小于0.1的不展示
+mat[mat < 0.1] <- 0
+
+# 颜色设置
+paletteMartin <- c(
+"#000000", "#004949", "#009292", "#ff6db6", "#ffb6db", 
+"#490092", "#006ddb", "#b66dff", "#6db6ff", "#b6dbff", 
+"#920000", "#924900", "#db6d00", "#24ff24", "#ffff6d")
+pal <- colorRampPalette(paletteMartin)(length(ct))
+names(pal) <- ct
+pal
+
+plotSpatialScatterpie(
+  x = spe,
+  y = mat,
+  cell_types = colnames(mat),
+  img = FALSE,
+  scatterpie_alpha = 1,
+  pie_scale = 0.4) +
+  scale_fill_manual(
+    values = pal,
+    breaks = names(pal))
+```
+
+
+
+## 识别空间模式基因
+
+
+```{r}
+
+```
+
+
+## 空转基因集GSVA分析
+
+
+```{r}
+library(GSVA)
+```
+
+
+
+```{r}
+#准备文件
+gmtfile <- "~/Downloads/h.all.v2024.1.Hs.symbols.gmt"
+
+hallmark <- read.gmt(gmtfile)
+hallmark$term <- gsub('HALLMARK_','',hallmark$term)
+hallmark.list <- hallmark %>% split(.$term) %>% lapply( "[[", 2)
+
+## 节省时间，选2条
+hallmark.list=hallmark.list[c(1,2)]
+#准备表达文件
+exp<- as.matrix(sample_seurat@assays$SCT@counts)
+#开始GSVA分析
+matrix = gsva(exp, 
+              hallmark.list, 
+              kcdf="Poisson",
+              method="ssgsea", 
+              abs.ranking=T ,parallel.sz=3)
+
+## 添加到seurat对象
+sample_seurat$Pathway1=matrix[1,]
+
+## 作图
+SpatialFeaturePlot(sample_seurat,features = 'Pathway1')
+```
+
+
+
+## 空间细胞通讯分析-CellChat v2
+
+`考虑到其二维结构的特点，分析细胞间的通讯似乎很有意义`
+
+CellChat V2 空间转录组分析需要四个输入：
+
+①data.input（基因表达数据 斑点spot/细胞）：基因应与行名和单元格并列 在带有 colnames 的列中。归一化数据（例如，library-size 归一化，然后对数变换，伪计数为 1） 需要作为 CellChat 分析的输入。
+②meta（用户分配的单元格标签和样本 labels）：一个数据框（行是带有行名的单元格），包括 的单元格信息，将用于定义单元格组。
+③空间坐标 （空间坐标 斑点/单元格）：一个数据框，其中每行都给出空间 每个细胞/点（spot）的坐标/位置。
+④spatial.factors（空间因素 distance）：包含两个距离因子和 的数据框，它依赖于空间 转录组学技术（和特定数据集）。
+
+
+```{r}
+##加载R包
+library(CellChat)
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+
+#载入实战2保存的 GBM4 空转数据
+load('GBM4.rdata')
+
+Idents(GBM4) <- "Region" 
+#可视化空间区域
+SpatialPlot(GBM4, label = TRUE, label.size = 5,cols= c('Normal'='#4b5cc4','Transition'='#FE8D3C','Tumor'='#AA0000'))
+```
+
+
+
+```{r}
+#由于一个spot包含多个细胞，本次使用Region 区域进行细胞通讯分析
+#获取空转矩阵信息
+data.input = Seurat::GetAssayData(GBM4, slot = "data", assay = "SCT") 
+
+#获取meta信息
+meta = data.frame(labels = Idents(GBM4),
+                  row.names = names(Idents(GBM4)))
+unique(meta$labels)
+
+
+#获取空间位置信息
+spatial.locs = Seurat::GetTissueCoordinates(GBM4, scale = NULL,cols = c("imagerow", "imagecol")) 
+#scalefactors_json存于GBM4_spaceranger_out/spatial文件夹下
+scalefactors = jsonlite::fromJSON(txt = file.path("E:/GSE194329/GBM4_spaceranger_out/spatial", 'scalefactors_json.json')) 
+
+spot.size = 65 #10X Visium spot大小为55μm，两个spot之间Gap为10μm
+
+conversion.factor = spot.size/scalefactors$spot_diameter_fullres
+spatial.factors = data.frame(ratio = conversion.factor, tol = spot.size/2)
+
+d.spatial <- computeCellDistance(coordinates = spatial.locs, ratio = spatial.factors$ratio, tol = spatial.factors$tol)
+
+
+#创建CellChat对象
+cellchat <- createCellChat(object = data.input, 
+                           meta = meta, 
+                           group.by = "labels", #定义的名字是labels
+                           datatype = "spatial", #数据类型：空转
+                           coordinates = spatial.locs, 
+                           spatial.factors = spatial.factors)
+
+
+
+#设置参考数据库
+CellChatDB <- CellChatDB.human # use CellChatDB.mouse if running on mouse data
+showDatabaseCategory(CellChatDB)
+```
+
+
+```{r}
+#使用CellChatDB的子集进行细胞间通信分析
+CellChatDB.use <- subsetDB(CellChatDB, search = "Secreted Signaling", key = "annotation") #选择Secreted Signaling
+cellchat@DB <- CellChatDB.use
+
+#CellChat预处理
+cellchat <- subsetData(cellchat) #即使使用整个数据库，此步骤也是必要的
+
+future::plan("multisession", workers = 4) #多线程
+
+
+#识别过表达基因
+cellchat <- identifyOverExpressedGenes(cellchat)
+
+#识别过表达配体受体对
+cellchat <- identifyOverExpressedInteractions(cellchat, variable.both = F)
+
+
+#细胞间通信网络的推断
+cellchat <- computeCommunProb(cellchat, type = "truncatedMean", trim = 0.1,
+                              distance.use = TRUE, interaction.range = 250, scale.distance = 0.01,
+                              contact.dependent = TRUE, contact.range = 100)
+```
+
+参数说明: 
+
+truncatedMean ：用于计算每个细胞组的平均基因表达
+
+distance.use = TRUE：使用空间距离限制作为计算通信概率的约束条件
+
+interaction.range = 250(约4个spot), contact.range = 100(2个spot)
+
+```{r}
+#默认情况下，每个细胞组中用于细胞间通信所需的最小细胞数为10
+cellchat <- filterCommunication(cellchat, min.cells = 10)
+
+#在信号通路水平上推断细胞间通讯
+cellchat <- computeCommunProbPathway(cellchat)
+
+#计算聚合的 cell-cell 通信网络
+cellchat <- aggregateNet(cellchat)
+
+#可视化交互次数或总交互次数 
+groupSize <- as.numeric(table(cellchat@idents))
+par(mfrow = c(1,2), xpd=TRUE)
+netVisual_circle(cellchat@net$count, vertex.weight = rowSums(cellchat@net$count), weight.scale = T, label.edge= F, title.name = "Number of interactions")
+netVisual_circle(cellchat@net$weight, vertex.weight = rowSums(cellchat@net$weight), weight.scale = T, label.edge= F, title.name = "Interaction weights/strength")
+```
+
+
+```{r}
+#热图显示celltype间的通讯次数（左）或总通讯强度(右)
+p1 <- netVisual_heatmap(cellchat, measure = "count", color.heatmap = "Blues")
+p2 <- netVisual_heatmap(cellchat, measure = "weight", color.heatmap = "Blues")
+p1 + p2
+```
+
+
+
+```{r}
+#展示显著通路结果
+cellchat@netP$pathways
+# [1] "SPP1"         "PTN"          "CypA"         "MIF"          "MK"          
+# [6] "IGFBP"        "ANGPTL"       "GRN"          "BMP"          "SEMA3"       
+# [11] "FGF"          "PSAP"         "TGFb" .....
+
+par(mfrow=c(1,1), xpd = TRUE)# xpd = TRUE以显示标题
+pathways.show <- c("PTN")
+
+#可视化 'PTN' 信号网络
+netVisual_aggregate(cellchat, signaling = pathways.show, layout = "circle")
+
+#在空间转录组上显示'PTN'信号网络
+netVisual_aggregate(cellchat, 
+                    signaling = pathways.show, 
+                    layout = "spatial", 
+                    edge.width.max = 2,
+                    vertex.size.max = 1, 
+                    alpha.image = 0.2, 
+                    vertex.label.cex = 3.5)
+```
+
+
+```{r}
+#计算和可视化网络中心性分数：
+cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "netP")#“netP”是指推断的信号通路的细胞间通信网络
+
+par(mfrow=c(1,1))
+netAnalysis_signalingRole_network(cellchat, signaling = pathways.show, width = 8, height = 2.5, font.size = 10)
+```
+
+
+
+
+## 空间共定位分析-MISTy
+
+高度多路复用空间数据测量技术的进步要求开发可扩展的方法，这些方法可以利用空间环境的可用性。Multiview 细胞间空间建模框架 （MISTy） 是一种可解释的机器学习框架，用于单细胞、高度多路复用、空间分辨数据的知识提取和分析。MISTy 通过分析细胞内和细胞间的关系，促进对标记相互作用的深入理解。
+
+```{r}
+### 实战5:空间共定位分析
+# remotes::install_github("saezlab/mistyR")
+library(mistyR)
+library(distances)
+library(future)
+
+```
+
+
+```{r}
+# 提取反卷积细胞成分
+composition <- as.data.frame(CARD_obj@Proportion_CARD)
+#将列名(细胞名)中的空格替换为下划线,否则后续会报错
+colnames(composition) <- gsub(" ", "_", colnames(composition), fixed = TRUE)
+# 提取空间位置信息
+geometry <- GetTissueCoordinates(GBM4, cols = c("imagerow", "imagecol"), scale = NULL)
+
+## 首先，需要定义一个intraview，以捕捉一个点内的细胞类型比例，
+## 为了捕捉周围组织中细胞类型比例的分布，我们添加了一个paraview，
+## 我们选择的半径是到最近邻居的距离的平均值加上标准偏差，
+## 使用family=gaussian 计算每个点的权重，然后运行MISTy并收集结果。
+
+#Calculating the radius
+geom_dist <- as.matrix(distances(geometry))  
+dist_nn <- apply(geom_dist, 1, function(x) (sort(x)[2]))
+paraview_radius <- ceiling(mean(dist_nn+ sd(dist_nn)))
+
+# Create views
+GBM_views <- create_initial_view(composition) %>%
+  add_paraview(geometry, l= paraview_radius, family = "gaussian")
+  
+# Run misty and collect results
+run_misty(GBM_views, "D:/ST/msity/vignette_structural_pipeline")
+```
+
+与intraview相比，周围组织的细胞类型在多大程度上可以解释斑点的细胞类型组成？在这里，我们可以看到两种不同的统计数据：multi.R2 显示了由多视图模型解释的总方差；gain.R2显示了从全景到全景的可解释方差的增加。
+
+
+```{r}
+##下游分析,读取上一步运行结果
+misty_results <- collect_results("D:/ST/msity/vignette_structural_pipeline")
+
+misty_results %>%
+  plot_improvement_stats("multi.R2") %>% 
+  plot_improvement_stats("gain.R2")
+```
+
+
+
+
+
+
+
+
+
+
+
