@@ -1,0 +1,2002 @@
+---
+title: "BLM 预实验 data analysis"
+format: html
+editor: source
+---
+
+
+## wuhan biobank
+
+两只小鼠，每只3个样本，共6个样本的数据。
+
+不知每个小鼠取三次的目的，技术重复？
+
+Bleomycin（BLM） 是一种抗生素类的化疗药物，临床上用于治疗某些类型的癌症（如霍奇金淋巴瘤、睾丸癌）。在小鼠研究中，它常被用作诱导肺纤维化（pulmonary fibrosis）模型的药物。
+
+
+```{r}
+#| include: false
+
+library(tidyverse)
+library(SingleCellExperiment)
+library(Seurat)
+# library(BPCells) # Efficient storage of single cell datasets via bitpacking compression
+# library(SeuratWrappers)
+library(SeuratExtend)
+
+# library(miloR)
+# library(ROGUE) # 一万年没更新了
+
+library(scCustomize)
+# library(SCP)
+# library(ggsc)
+library(SCpubr)
+
+#LLM
+# library(ceLLama)
+# library(Azimuth)
+# library(mLLMCelltype)
+# library(CASSIA)
+library(SingleR)
+
+library(BiocParallel)
+library(patchwork)
+library(viridis)
+library(qs)
+library(fs)
+
+options(future.globals.maxSize = 40000 * 1024^2)
+```
+
+
+```{r}
+data_dirs <- c('IPF-D24-L-Lung-1-A', 'IPF-D24-L-Lung-1-B', 'IPF-D24-L-Lung-1-C',
+               'IPF-D24-L-Lung-2-A', 'IPF-D24-L-Lung-2-B', 'IPF-D24-L-Lung-2-C')
+
+seurat_objects <- list()
+
+for (i in seq_along(data_dirs)) {
+  # Get sample name
+  sample_name <- data_dirs[i]
+  
+  # Read in 10X data (using filtered_feature_bc_matrix subfolder)
+  cat(paste0("Reading 10X data from: ", sample_name, "\n"))
+  data <- Read10X(data.dir = paste0('20250421_cellranger_result/rna_seq/', 
+                                    sample_name, "/filtered_feature_bc_matrix")
+                  )
+  
+  # Create Seurat object
+  seurat_obj <- CreateSeuratObject(
+    counts = data,
+    project = sample_name,
+    min.cells = 3,
+    min.features = 200
+  )
+  
+  # Add metadata identifying the sample
+  seurat_obj$sample <- sample_name
+  seurat_obj$orig.ident <- sample_name
+  
+  # Add to list
+  seurat_objects[[sample_name]] <- seurat_obj
+}
+
+```
+
+
+```{r}
+library(scDblFinder)
+
+process_single_seu <- function(seu) {
+  
+  # seu <- NormalizeData(seu)
+  # seu <- FindVariableFeatures(seu)
+  # seu <- ScaleData(seu)
+  # seu <- RunPCA(seu)
+  # seu <- RunUMAP(seu, dims = 1:20)
+  
+  
+  # Step 1: 转换为 SingleCellExperiment
+  sce <- as.SingleCellExperiment(seu, assay = "RNA")
+  
+  # Step 2: 运行 scDblFinder（自动处理跨样本双细胞）
+  sce <- scDblFinder(sce, samples = sce$orig.ident)  # 假设 orig.ident 标识不同样本
+  
+  # Step 3: 将结果添加回 Seurat 对象
+  seu$scDblFinder.score <- sce$scDblFinder.score
+  seu$scDblFinder.class <- sce$scDblFinder.class
+  
+  seu$doublet_rate <- sum(seu$scDblFinder.class == "doublet") / ncol(seu)
+  
+  ggplot(as.data.frame(sce$scDblFinder.score), 
+         aes(x = `sce$scDblFinder.score`)) +
+    geom_histogram(bins = 50) +
+    labs(title = "Doublet Score Distribution")
+  
+  # Step 4: 过滤双细胞（可选）
+  # seu <- subset(seu, subset = scDblFinder.class == "singlet")
+  
+  return(seu)
+}
+
+# 批量处理（带进度条）
+seu_list_processed <- pbapply::pblapply(seurat_objects, process_single_seu)
+
+```
+
+检验一下doublet的数目
+
+```{r}
+sce <- seu_list_processed[[1]]
+
+table(sce$scDblFinder.class)
+```
+
+
+```{r}
+# Combine all Seurat objects
+combined_seurat <- merge(
+  x = seu_list_processed[[1]], 
+  y = seu_list_processed[-1], 
+  add.cell.ids = names(seu_list_processed),
+  project = "BLM_six"
+)
+```
+
+
+```{r}
+table(combined_seurat$scDblFinder.class)
+```
+
+
+
+和2个样本的一对比6180，这里是4542， 是按照样本的占比进行去除的。
+
+`先保留doublet`
+
+```{r}
+merged_seurat <- subset(combined_seurat, 
+                          subset = scDblFinder.class == "singlet")
+
+merged_seurat
+```
+
+
+## QC
+
+```{r}
+# merged_seurat <- scCustomize::Add_Cell_QC_Metrics(
+#   object = merged_seurat,
+#   species = "Mouse"
+# )
+```
+
+
+```{r}
+
+merged_seurat$log10GenesPerUMI <- log10(merged_seurat$nFeature_RNA) / log10(merged_seurat$nCount_RNA)
+# merged_seurat$cells <- rownames()
+
+merged_seurat$percent_mito <- PercentageFeatureSet(object = merged_seurat, 
+                                                # pattern = "^MT.",
+                                                pattern = "^mt[-\\.]"
+                                                )
+merged_seurat$percent_mito <- merged_seurat@meta.data$percent_mito / 100
+
+# 核糖体基因、红血细胞基因、管家基因
+merged_seurat <- PercentageFeatureSet(merged_seurat, pattern = "^Hb[ab]-", 
+                                      col.name = "percent.hb")
+
+merged_seurat <- PercentageFeatureSet(merged_seurat, pattern = "^RP[SL]|^Rp[sl]", 
+                                      col.name = "percent.ribo")
+
+```
+
+
+```{r}
+# All functions contain
+p1 <- QC_Plots_Genes(seurat_object = merged_seurat, low_cutoff = 600, high_cutoff = 5500)
+p2 <- QC_Plots_UMIs(seurat_object = merged_seurat, low_cutoff = 1200, high_cutoff = 45000)
+p3 <- QC_Plots_Mito(seurat_object = merged_seurat, high_cutoff = 20)
+p4 <- QC_Plots_Complexity(seurat_object = merged_seurat, high_cutoff = 0.8)
+
+wrap_plots(p1, p2, ncol = 2)
+
+wrap_plots(p3, p4, ncol = 2)
+```
+
+```{r}
+QC_Plots_Combined_Vln(seurat_object = merged_seurat, feature_cutoffs = c(600, 5500), 
+                      UMI_cutoffs = c(1200,45000), 
+                      mito_cutoffs = 20, pt.size = 0.0)
+```
+
+
+```{r}
+# 针对metadata的一些质控
+
+metadata <- merged_seurat@meta.data
+
+metadata$cells <- rownames(metadata)
+
+# Rename columns
+metadata <- metadata %>%
+  dplyr::rename(
+    seq_folder = orig.ident,
+    nUMI = nCount_RNA,
+    nGene = nFeature_RNA
+  )
+```
+
+
+Visualize the number of cell counts per sample
+
+总是可以看到样本间细胞数量捕获的差异。
+
+```{r}
+# Visualize the number of cell counts per sample
+metadata %>%
+  ggplot(aes(x = sample, fill = sample)) +
+  geom_bar() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  ggtitle("NCells")
+```
+
+
+The UMI counts per cell should generally be above 500, that is the low end of what we expect. If UMI counts are between 500-1000 counts, it is usable but the cells probably should have been sequenced more deeply.
+
+```{r}
+# Visualize the number UMIs/transcripts per cell
+metadata %>%
+  ggplot(aes(color = sample, x = nUMI, fill = sample)) +
+  geom_density(alpha = 0.2) +
+  scale_x_log10() +
+  theme_classic() +
+  ylab("Cell density") +
+  geom_vline(xintercept = 500)
+```
+
+
+
+Genes detected per cell. For high quality data, the proportional histogram should contain a single large peak that represents cells that were encapsulated.
+
+```{r}
+# Visualize the distribution of genes detected per cell via histogram
+metadata %>%
+  ggplot(aes(color = sample, x = nGene, fill = sample)) +
+  geom_density(alpha = 0.2) +
+  theme_classic() +
+  scale_x_log10() +
+  geom_vline(xintercept = 300)
+```
+
+
+The novelty score is computed by taking the ratio of nGenes over nUMI. Generally, we expect the novelty score to be above 0.80 for good quality cells.
+
+```{r}
+# Visualize the overall complexity of the gene expression by visualizing the genes detected per UMI (novelty score)
+metadata %>%
+  ggplot(aes(x = log10GenesPerUMI, color = sample, fill = sample)) +
+  geom_density(alpha = 0.2) +
+  theme_classic() +
+  geom_vline(xintercept = 0.8)
+```
+
+This metric can identify whether there is a large amount of mitochondrial contamination from dead or dying cells. We define poor quality samples for mitochondrial counts as cells which surpass the 0.2 mitochondrial ratio mark, unless of course you are expecting this in your sample.
+
+
+```{r}
+# Visualize the distribution of mitochondrial gene expression detected per cell
+metadata %>%
+  ggplot(aes(color = sample, x = percent_mito , fill = sample)) +
+  geom_density(alpha = 0.2) +
+  scale_x_log10() +
+  theme_classic() +
+  geom_vline(xintercept = 0.2)
+```
+
+
+```{r}
+# Visualize the distribution of  detected per cell
+metadata %>%
+  ggplot(aes(color = sample, x = percent.ribo, fill = sample)) +
+  geom_density(alpha = 0.2) +
+  scale_x_log10() +
+  theme_classic() +
+  geom_vline(xintercept = 20)
+```
+
+```{r}
+# All functions contain
+QC_Plot_UMIvsGene(
+  seurat_object = merged_seurat, low_cutoff_gene = 600,
+  high_cutoff_gene = 5500, low_cutoff_UMI = 500,
+  high_cutoff_UMI = 50000
+)
+QC_Plot_GenevsFeature(
+  seurat_object = merged_seurat,
+  feature1 = "percent_mito", low_cutoff_gene = 600,
+  high_cutoff_gene = 5500, high_cutoff_feature = 20
+)
+```
+
+### Doublet remove
+
+```{r}
+# Doublet removal
+sce <- as.SingleCellExperiment(merged_seurat)
+sce <- scDblFinder(sce, samples = "orig.ident", BPPARAM = MulticoreParam(4))
+
+merged_seurat$scDblFinder.class <- sce$scDblFinder.class
+merged_seurat <- subset(merged_seurat, subset = scDblFinder.class == "singlet")
+```
+
+
+
+### Filtering
+
+#### Cell-level filtering
+
+考虑到实验的目的，还是尽量保存细胞的数量。
+
+```{r}
+filtered_seurat <- subset(
+  x = merged_seurat,
+  subset = (nCount_RNA >= 300) &
+    (nFeature_RNA >= 500) &
+    # (log10GenesPerUMI > 0.80) &
+    (percent_mito < 0.2)
+)
+
+filtered_seurat #
+```
+```{r}
+VlnPlot(filtered_seurat, 
+                 features = c("nFeature_RNA", "nCount_RNA", "percent_mito"), 
+                 group.by = "sample", 
+                 ncol = 3, pt.size = 0)
+```
+
+
+#### 通过PCA确定cell cycle是否需要在SCTransform中regress out
+
+
+
+```{r}
+#| eval: true
+
+# Normalize the counts
+# 此时的normalization还比较的粗糙，利用默认的log方式
+filtered_seurat <- NormalizeData(filtered_seurat)
+
+
+# a test
+# 只能提取第一个layer，似乎还是需要JoinLayer
+query_data <- LayerData(filtered_seurat, assay = "RNA", layer = "data")
+
+# Identify the most variable genes
+filtered_seurat <- FindVariableFeatures(filtered_seurat,
+  selection.method = "vst",
+  nfeatures = 2000,
+  verbose = FALSE
+)
+
+# Scale the counts
+filtered_seurat <- ScaleData(filtered_seurat)
+
+# Score cells for cell cycle
+# filtered_seurat <- CellCycleScoring(filtered_seurat,
+#   g2m.features = cc.genes.updated.2019$g2m.genes,
+#   s.features = cc.genes.updated.2019$s.genes
+# )
+
+# Perform PCA
+filtered_seurat <- RunPCA(filtered_seurat)
+
+# perform TSNE, UMAP
+filtered_seurat <- RunUMAP(filtered_seurat, dims = 1:20)
+filtered_seurat <- RunTSNE(object = filtered_seurat, dims = 1:20, 
+                           do.fast = TRUE)
+
+# Plot the PCA colored by cell cycle phase
+# DimPlot(filtered_seurat,
+#   reduction = "pca",
+#   group.by = "Phase",
+#   split.by = "Phase"
+# )
+
+filtered_seurat
+```
+
+
+```{r}
+here::here()
+```
+
+一定要保存。
+
+```{r}
+qs::qsave(filtered_seurat, "./BLM_six/filtered_seurat.qs")
+
+# filtered_seurat <- qs::qread("./BLM_six/filtered_seurat.qs")
+```
+
+### SCTransform
+
+```{r}
+#| eval: false
+
+library(future)
+
+plan("multicore", workers = 4) # unix-based
+# plan(multisession, workers = 4) # on Windows
+
+parallel::detectCores()
+
+options(future.globals.maxSize = 64 * 1024^3)
+
+# plan(sequential)  # 关闭并行计算
+
+```
+
+
+
+```{r}
+# SCTranform
+
+merged_seurat <- SCTransform(filtered_seurat, 
+                            method = "glmGamPoi",
+                            vars.to.regress = c("percent_mito"),
+                            # vars.to.regress = c("percent_ribo"),
+                            assay = "RNA", 
+                            vst.flavor = "v2",
+                            verbose = TRUE
+                            )
+```
+
+```{r}
+
+# Check which assays are stored in objects
+DefaultAssay(merged_seurat)
+```
+
+
+```{r}
+# qs::qsave(merged_seurat, "./BLM_six/merged_seurat.qs")
+
+# Load the split seurat object into the environment
+merged_seurat <- qs::qread("./BLM_six/merged_seurat.qs")
+```
+
+
+
+### harmony整合
+
+```{r}
+p.compare <- patchwork::wrap_plots(
+  ncol = 3,
+  DimPlot(merged_seurat, reduction = 'pca', group.by = 'orig.ident') + NoAxes() + ggtitle('before PCA'),
+  DimPlot(merged_seurat, reduction = 'tsne', group.by = 'orig.ident') + NoAxes() + ggtitle('before tsne'),
+  DimPlot(merged_seurat, reduction = 'umap', group.by = 'orig.ident') + NoAxes() + ggtitle('before umap')
+)
+
+p.compare
+```
+
+
+```{r}
+library(harmony)
+```
+
+
+
+```{r}
+merged_seurat <- RunPCA(merged_seurat, npcs = 50, verbose = FALSE)
+
+
+```
+
+find the best PCA dim number, 防止过拟合等等。
+
+```{r}
+ElbowPlot(merged_seurat, ndims = 50)
+
+scCustomize::PC_Plotting(seurat_object = merged_seurat, dim_number = 2)
+
+```
+
+```{r}
+# 理论上和上面的代码结果应该一致
+
+harmonized_seurat <- harmony::RunHarmony(merged_seurat,
+  group.by.vars = c("sample"),
+  reduction.use = "pca",
+  assay.use = "SCT",
+  reduction.save = "harmony",
+  plot_convergence = TRUE
+)
+```
+
+
+
+```{r}
+
+set.seed(123)
+
+harmonized_seurat <- RunUMAP(harmonized_seurat,
+  reduction = "harmony",
+  assay = "SCT",
+  dims = 1:20
+)
+
+harmonized_seurat <- RunTSNE(harmonized_seurat,
+  reduction = "harmony",
+  assay = "SCT",
+  dims = 1:20,
+  verbose = FALSE
+)
+
+DefaultAssay(harmonized_seurat)
+```
+
+
+```{r}
+# 校正前的PCA结果（按样本着色）
+p1 <- DimPlot_scCustom(harmonized_seurat, reduction = "pca", group.by = "orig.ident") + 
+  ggtitle("Before Harmony (PCA)")
+
+# 校正后的Harmony结果（按样本着色）
+p2 <- DimPlot_scCustom(harmonized_seurat, reduction = "harmony", group.by = "orig.ident") + 
+  ggtitle("After Harmony")
+
+# 联合展示
+p1
+
+p2
+```
+
+
+
+## Clustering
+
+Seurat uses a graph-based clustering approach using a K-nearest neighbor approach, and then attempts to partition this graph into highly interconnected 'quasi-cliques' or 'communities'.
+
+
+```{r}
+
+set.seed(123)
+
+
+harmonized_seurat <- FindNeighbors(
+  object = harmonized_seurat,
+  reduction = "harmony",
+  dims = 1:20
+)
+
+# Determine the clusters for various resolutions
+harmonized_seurat <- FindClusters(
+  object = harmonized_seurat,
+  resolution = seq(0.2, 2, 0.2)
+)
+```
+
+
+```{r}
+# 可视化聚类结果
+p1 <- DimPlot_scCustom(harmonized_seurat, reduction = "umap", label = TRUE) + 
+  ggtitle("Clusters")
+p2 <- DimPlot_scCustom(harmonized_seurat, reduction = "umap", group.by = "sample") + 
+  ggtitle("Sample")
+
+
+p1 
+
+p2
+# p3 + p4
+```
+
+
+```{r}
+# 不同分辨率情况下的细胞聚类情况
+
+require(clustree)
+
+clustree::clustree(harmonized_seurat, prefix = "SCT_snn_res.")
+```
+
+
+```{r}
+Idents(object = harmonized_seurat) <- "SCT_snn_res.1.2"
+
+DimPlot_scCustom(harmonized_seurat,
+  reduction = "umap",
+  label = TRUE,
+  label.size = 6
+)
+```
+
+
+```{r}
+
+Idents(object = harmonized_seurat) <- "SCT_snn_res.0.2"
+
+
+# Plot the UMAP
+DimPlot_scCustom(harmonized_seurat,
+  reduction = "umap",
+  label = TRUE,
+  label.size = 6
+)
+```
+
+
+
+```{r}
+
+
+# Single-cell RNA sequencing reveals profibrotic roles of distinct epithelial and mesenchymal lineages in pulmonary fibrosis
+# 不过分的太细的也没有必要吧
+paper1_markers <- list(
+  
+  # 上皮细胞 (Epithelial Cells)
+  "Epithelial_Cells" = list(
+    positive_markers = c("EPCAM"),
+    negative_markers = NULL,
+    comment = "通用上皮细胞标记"
+  ),
+  
+  "AT1" = list(
+    positive_markers = c("AGER", "PDPN"),
+    negative_markers = NULL,
+    comment = "肺泡1型细胞，参与气体交换"
+  ),
+  
+  "AT2" = list(
+    positive_markers = c("SFTPC", "ABCA3", "SFTPCD"),
+    negative_markers = NULL,
+    comment = "肺泡2型细胞，分泌表面活性物质"
+  ),
+  
+  "Transitional_AT2" = list(
+    positive_markers = c("SFTPC(low)", "AGER(low)"),
+    negative_markers = NULL,
+    comment = "过渡态AT2细胞，可能具有分化潜能"
+  ),
+  
+  "Basal" = list(
+    positive_markers = c("KRT5", "KRT17"),
+    negative_markers = c("COL1A1"),
+    comment = "基底细胞，上皮干细胞"
+  ),
+  
+  "KRT5-_KRT17+" = list(
+    positive_markers = c("KRT17", "COL1A1"),
+    negative_markers = c("KRT5"),
+    comment = "KRT5阴性/KRT17阳性细胞群"
+  ),
+  
+  "MUC5B+" = list(
+    positive_markers = c("MUC5B", "SCGB1A1"),
+    negative_markers = NULL,
+    comment = "分泌黏蛋白MUC5B的杯状细胞"
+  ),
+  
+  "MUC5AC+_High" = list(
+    positive_markers = c("MUC5AC"),
+    negative_markers = NULL,
+    comment = "高表达MUC5AC的杯状细胞"
+  ),
+  
+  "SCGB3A2+" = list(
+    positive_markers = c("SCGB3A2"),
+    negative_markers = c("SCGB1A1"),
+    comment = "分泌球蛋白SCGB3A2的克拉拉细胞"
+  ),
+  
+  "SCGB3A2+_SCGB1A1+" = list(
+    positive_markers = c("MGP", "SCGB1A1", "SCGB3A2"),
+    negative_markers = NULL,
+    comment = "共表达SCGB3A2和SCGB1A1的细胞亚群"
+  ),
+  
+  "Ciliated" = list(
+    positive_markers = c("FOXJ1", "TMEM190", "CAPS", "HYDIN"),
+    negative_markers = NULL,
+    comment = "纤毛细胞，负责气道黏液清除"
+  ),
+  
+  "Differentiating_Ciliated" = list(
+    positive_markers = c("FOXJ1", "SFTPB"),
+    negative_markers = NULL,
+    comment = "分化中的纤毛细胞"
+  ),
+  
+  "Proliferating_Epithelial" = list(
+    positive_markers = c("MKI67", "CDK1"),
+    negative_markers = NULL,
+    comment = "增殖态上皮细胞（细胞周期活跃）"
+  ),
+  
+  # 免疫细胞 (Immune Cells)
+  "Immune_Cells" = list(
+    positive_markers = c("PTPRC"),
+    negative_markers = NULL,
+    comment = "通用免疫细胞标记（CD45）"
+  ),
+  
+  "T_Cells" = list(
+    positive_markers = c("CD3E", "FOXP3", "IL7R", "CD8A", "CCL5"),
+    negative_markers = NULL,
+    comment = "T淋巴细胞（包括调节性T细胞、CD8+ T细胞等）"
+  ),
+  
+  "NK_Cells" = list(
+    positive_markers = c("NCR1", "KLRB1", "NKG7(high)"),
+    negative_markers = c("CD3E"),
+    comment = "自然杀伤细胞（CD3E阴性）"
+  ),
+  
+  "Macrophages" = list(
+    positive_markers = c("LYZ", "MARCO", "FCGR1A", "C1QA", "APOC1"),
+    negative_markers = NULL,
+    comment = "巨噬细胞（包括肺泡巨噬细胞）"
+  ),
+  
+  "Monocytes" = list(
+    positive_markers = c("S100A12", "FCN1", "S100A9", "LYZ", "CD14"),
+    negative_markers = NULL,
+    comment = "单核细胞（外周血来源）"
+  ),
+  
+  "cDCs" = list(
+    positive_markers = c("FCER1A", "CD1C", "CLEC9A"),
+    negative_markers = NULL,
+    comment = "经典树突状细胞"
+  ),
+  
+  "pDCs" = list(
+    positive_markers = c("LILRA4", "CLEC4C", "JCHAIN"),
+    negative_markers = NULL,
+    comment = "浆细胞样树突状细胞"
+  ),
+  
+  "Plasma_Cells" = list(
+    positive_markers = c("JCHAIN", "IGHG1", "IGLL5"),
+    negative_markers = NULL,
+    comment = "浆细胞（抗体分泌细胞）"
+  ),
+  
+  "B_Cells" = list(
+    positive_markers = c("MS4A1", "CD19", "CD79A"),
+    negative_markers = NULL,
+    comment = "B淋巴细胞"
+  ),
+  
+  "Mast_Cells" = list(
+    positive_markers = c("CPA3", "KIT"),
+    negative_markers = NULL,
+    comment = "肥大细胞"
+  ),
+  
+  "Proliferating_T_Cells" = list(
+    positive_markers = c("MKI67", "CDK1", "CD3E"),
+    negative_markers = NULL,
+    comment = "增殖态T细胞"
+  ),
+  
+  "Proliferating_Macrophages" = list(
+    positive_markers = c("MKI67", "CDK1", "LYZ"),
+    negative_markers = NULL,
+    comment = "增殖态巨噬细胞"
+  ),
+  
+  # 内皮细胞 (Endothelial Cells)
+  "Endothelial_Cells" = list(
+    positive_markers = c("PECAM1", "VWF"),
+    negative_markers = c("PTPRC"),
+    comment = "血管内皮细胞（CD31和血管性血友病因子阳性）"
+  ),
+  
+  "Lymphatic_Endothelial" = list(
+    positive_markers = c("CCL21"),
+    negative_markers = NULL,
+    comment = "淋巴管内皮细胞"
+  ),
+  
+  # 间充质细胞 (Mesenchymal Cells)
+  "Mesenchymal_Cells" = list(
+    positive_markers = NULL,
+    negative_markers = c("EPCAM", "PTPRC", "PECAM1"),
+    comment = "通用间充质细胞标记（排除上皮、免疫、内皮）"
+  ),
+  
+  "Smooth_Muscle_Cells" = list(
+    positive_markers = c("ACTA2(high)", "MYH11", "PDGFRB(high)"),
+    negative_markers = c("LUM", "PDGFRA"),
+    comment = "平滑肌细胞（高表达α-SMA和肌球蛋白）"
+  ),
+  
+  "Mesothelial_Cells" = list(
+    positive_markers = c("WT1", "UPK3B"),
+    negative_markers = c("LUM"),
+    comment = "间皮细胞（体腔表面细胞）"
+  ),
+  
+  "Myofibroblasts" = list(
+    positive_markers = c("LUM", "PDGFRA", "ACTA2", "MYLK"),
+    negative_markers = NULL,
+    comment = "肌成纤维细胞（兼具成纤维和平滑肌特征）"
+  ),
+  
+  "HAS1_High_Fibroblasts" = list(
+    positive_markers = c("LUM", "PDGFRA", "HAS1", "TWIST"),
+    negative_markers = c("PLIN2"),
+    comment = "高表达HAS1的成纤维细胞亚群"
+  ),
+  
+  "Fibroblasts" = list(
+    positive_markers = c("LUM", "PDGFRA"),
+    negative_markers = NULL,
+    comment = "普通成纤维细胞"
+  ),
+  
+  "PLIN2+_Fibroblasts" = list(
+    positive_markers = c("LUM", "PDGFRA", "PLIN2"),
+    negative_markers = NULL,
+    comment = "脂滴相关蛋白PLIN2阳性的成纤维细胞"
+  )
+)
+
+# 使用示例：提取AT2细胞的标记基因
+# cell_markers[["AT2"]]$positive_markers
+
+
+# DeepSeek 
+IPF_markers <- list(
+  # 1. 肺泡上皮细胞 (Alveolar Epithelial Cells) -----
+  "AT1" = c("AGER", "CAV1", "PDPN", "CLIC5"),             # I型肺泡细胞标记：AGER(气体交换), CLIC5(氯离子通道)
+  "AT2" = c("SFTPC", "SFTPA1", "LAMP3", "ABCA3"),         # II型肺泡细胞标记：SFTPC(表面活性物质), ABCA3(板层小体)
+  "AT2_IPF" = c("KRT8", "KRT18", "SOX4"),                 # IPF中异常AT2细胞：KRT8(上皮间质转化)
+
+  # 2. 气道上皮细胞 (Airway Epithelial Cells) -----
+  "Ciliated" = c("FOXJ1", "TUBA1A", "DNAH5", "PIFO"),      # 纤毛细胞：FOXJ1(纤毛生成主调控因子)
+  "Goblet" = c("MUC5B", "SPDEF", "FOXA3"),                # 杯状细胞：MUC5B(IPF风险基因)
+  "Basal" = c("KRT5", "TP63", "KRT17"),                   # 基底细胞：TP63(干细胞标记)
+  "Club" = c("SCGB1A1", "SCGB3A1", "CYP2F2"),             # Club细胞：SCGB1A1(分泌蛋白)
+
+  # 3. 成纤维细胞亚群 (Fibroblasts) -----
+  "Myofibroblast" = c("ACTA2", "POSTN", "COL1A1", "TAGLN"), # 肌成纤维细胞：ACTA2(α-SMA, 收缩蛋白)
+  "IPF_Fibro" = c("FAP", "THY1", "COMP", "MMP11"),         # IPF特异性成纤维细胞：FAP(成纤维激活蛋白)
+  "Mesothelial" = c("WT1", "MSLN", "UPK3B"),               # 间皮细胞：WT1(间皮特异性转录因子)
+
+  # 4. 免疫细胞 (Immune Cells) -----
+  "Macrophage" = c("CD68", "MARCO", "APOE", "FABP4"),      # 巨噬细胞：MARCO(肺泡巨噬标记)
+  "Monocyte" = c("CD14", "S100A8", "VCAN"),               # 单核细胞：S100A8(促炎钙结合蛋白)
+  "Neutrophil" = c("S100A8", "S100A9", "FCGR3B"),         # 中性粒细胞：S100A8/A9(炎症标记)
+  "CD8_T" = c("CD8A", "GZMB", "IFNG", "CXCR3"),           # CD8+ T细胞：GZMB(颗粒酶B, 细胞毒性)
+  "Treg" = c("FOXP3", "IL2RA", "CTLA4"),                  # 调节性T细胞：FOXP3(免疫抑制)
+
+  # 5. 内皮细胞 (Endothelial Cells) -----
+  "EC_General" = c("PECAM1", "CDH5", "VWF"),              # 通用内皮标记：PECAM1(CD31)
+  "EC_Angio" = c("PLVAP", "ACKR1", "ANGPT2"),             # 促血管生成内皮细胞：PLVAP(血管通透性)
+  
+  # 6. 其他 (Others) -----
+  "Pericyte" = c("PDGFRB", "CSPG4", "RGS5"),              # 周细胞：PDGFRB(血小板衍生生长因子受体)
+  "Mast" = c("TPSAB1", "CPA3", "KIT")                     # 肥大细胞：TPSAB1(类胰蛋白酶)
+)
+
+
+marker_genes_luoxi <- list(
+  "AT1" = c("AGER", "PDPN"),
+  "AT2" = c("SFTPC", "ABCA3", "SFTPD"),
+  "Transitional AT2" = c("SFTPC", "AGER"),
+  "Basal" = c("KRT5", "KRT17"),
+  "KRT5-/KRT17+" = c("KRT17", "COL1A1"),
+  "MUC5B+" = c("MUC5B", "SCGB1A1"),
+  "MUC5AC+ High" = c("MUC5AC"),
+  "SCGB3A2+" = c("SCGB3A2"),
+  "SCGB3A2+ SCGB1A1+" = c("MGP", "SCGB1A1", "SCGB3A2"),  # 修正 MGp → MGP
+  "Ciliated" = c("FOXJ1", "TMEM190", "CAPS"),
+  "Differentiating Ciliated" = c("FOXJ1", "SFTPB"),
+  "Proliferating Epithelial Cells" = c("MKI67", "CDK1"),  # 修正 MKT67 → MKI67
+  "T cells" = c("CD3E", "FOXP3", "IL7R"),                 # 修正 F0XP3 → FOXP3
+  "NK Cells" = c("NCR1", "KLRB1", "NKG7"),                # 修正 NCRI → NCR1
+  "Macrophages" = c("LYZ", "MARCO", "FCGR1A"),            # 修正 FCGRIA → FCGR1A
+  "Monocytes" = c("S100A12", "FCN1", "S100A9"),
+  "CDCs" = c("FCER1A", "CD1C", "CLEC9A"),                 # 修正 FCERIA → FCER1A
+  "DDCs" = c("LILRA4", "CLEC4C", "JCHAIN"),               # 修正 LLRA4 → LILRA4
+  "Plasma Cells" = c("JCHAIN", "TNFRSF13B", "IGLL5"),     # 修正 TGHG1 → TNFRSF13B
+  "B cells" = c("MS4A1", "CD19", "CD79A"),
+  "Mast Cells" = c("CPA3", "KIT"),
+  "Proliferating T Cells" = c("MKI67", "CDK1", "CD3E"),   # 修正 MKT67 → MKI67
+  "Proliferating Macrophages" = c("MKI67", "CDK1", "LYZ"),# 修正 MKT67 → MKI67
+  "Endothelial Cells" = c("VWF", "PECAM1"),
+  "Lymphatic Endothelial Cells" = c("CCL21"),
+  "Smooth Muscle Cells" = c("ACTA2", "MYH11", "PDGFRB"),
+  "Mesothelial Cells" = c("WT1", "UPK3B"),                # 修正 VVT1 → WT1
+  "Myofibroblasts" = c("LUM", "PDGFRA", "ACTA2"),
+  "HAS1 High Fibroblasts" = c("LUM", "PDGFRA", "HAS1"),
+  "Fibroblasts" = c("LUM", "PDGFRA"),
+  "PLIN2+ Fibroblasts" = c("LUM", "PDGFRA", "PLIN2")
+)
+```
+
+
+```{r}
+# 注意缺少免疫细胞的信息
+
+# human 
+
+# all
+lungmap_marker_genes <- list(
+  # Epithelium
+  "Basal cell" = c("TP63", "KRT5"),
+  "Secretory cell" = c("SCGB1A1", "SCGB3A2"),
+  "Ciliated cell" = c("FOXJ1", "RSPH1"),
+  "Goblet cell" = c("MUC5AC", "SPDEF"),
+  "Pulmonary neuroendocrine cell" = c("ASCL1", "GRP", "Calca"),
+  "Tuft cell" = c("POU2F3", "ASCL2", "Dclk1"),
+  "Ionocyte" = c("FOXI1", "ASCL3", "Cftr"),
+  "Bronchoalveolar stem cell" = c("SFTPC", "SCGB1A1"),
+  "Alveolar type 1 cell" = c("AGER", "RTKN2", "Hopx"),
+  "Alveolar type 2 cell" = c("SFTPC", "LAMP3"),
+  "Ductal basal cell" = c("VIM", "SOX9"),
+  "Myoepithelial cell" = c("KRT14", "MYH11"),
+  "Mucous cell" = c("MUC5B", "SPDEF"),
+  "Serous cell" = c("LYZ", "LTF"),
+
+  # Mesenchyme
+  "Airway smooth muscle cell" = c("ACTA2", "DES", "LGR6"),
+  "Vascular smooth muscle cell" = c("NTRK3", "ITGA7", "Cnn1"),
+  "Chondrocytes" = c("COL2A1", "HAPLN1"),
+  "Alveolar fibroblast 1" = c("TCF21", "WNT2"),
+  "Alveolar fibroblast 2" = c("MFAP5", "SCARA5"),
+  "Secondary crest myofibroblast cell" = c("DACH2", "Fgf18"),
+  "Pericyte" = c("TRPC6", "LAMC3"),
+  "Mesothelium" = c("WT1", "UPK3B", "FREM2"),
+
+  # Endothelium
+  "Arterial endothelial cell" = c("DKK2", "GJA5"),
+  "Venous endothelial cell" = c("ACKR1", "HDAC9", "Slc6a2"),
+  "Lymphatic endothelial cell" = c("PROX1", "MMRN1"),
+  "Capillary cell 1" = c("IL7R", "Aplnr", "Gpihbp1"),
+  "Capillary cell 2" = c("EDNRB", "HPGD", "Apln", "Car4")
+)
+
+
+lungmap_marker_genes_mouse <- list(
+  # Epithelium
+  "Basal cell" = c("Tp63", "Krt5"),
+  "Secretory cell" = c("Scgb1a1", "Scgb3a2"),
+  "Ciliated cell" = c("Foxj1", "Rsph1"),
+  "Goblet cell" = c("Muc5ac", "Spdef"),
+  "Pulmonary neuroendocrine cell" = c("Ascl1", "Grp", "Calca"),
+  "Tuft cell" = c("Pou2f3", "Ascl2", "Dclk1"),
+  "Ionocyte" = c("Foxi1", "Ascl3", "Cftr"),
+  "Bronchoalveolar stem cell" = c("Sftpc", "Scgb1a1"),
+  "Alveolar type 1 cell" = c("Rtkn2", "Hopx", "Ager"),
+  "Alveolar type 2 cell" = c("Sftpc", "Lamp3"),
+  "Ductal basal cell" = c("Vim", "Sox9"),
+  "Myoepithelial cell" = c("Krt14", "Myh11"),
+  "Mucous cell" = c("Muc5b", "Spdef"),
+  "Serous cell" = c("Lyz", "Ltf"),
+
+  # Mesenchyme
+  "Airway smooth muscle cell" = c("Acta2", "Des", "Lgr6"),
+  "Vascular smooth muscle cell" = c("Ntrk3", "Itga7", "Cnn1"),
+  "Chondrocytes" = c("Col2a1", "Hapln1"),
+  "Alveolar fibroblast 1" = c("Tcf21", "Wnt2"),
+  "Alveolar fibroblast 2" = c("Mfap5", "Scara5"),
+  "Secondary crest myofibroblast cell" = c("Fgf18"),
+  "Pericyte" = c("Trpc6", "Lamc3"),
+  "Mesothelium" = c("Wt1", "Upk3b", "Frem2"),
+
+  # Endothelium
+  "Arterial endothelial cell" = c("Dkk2", "Gja5"),
+  "Venous endothelial cell" = c("Slc6a2"),
+  "Lymphatic endothelial cell" = c("Prox1", "Mmnr1"),
+  "Capillary cell 1" = c("Aplnr", "Gpihbp1"),
+  "Capillary cell 2" = c("Ednrb", "Apln", "Car4"),
+  'Systemic Venous Endothelial Cell' = c('Col15a1', ' Vwa1', 'Ackr1')
+)
+
+
+```
+
+
+大概的逻辑就是把人的基因marker变成小鼠的名字进行重命名,
+
+首先是大分类的注释。
+
+```{r}
+scCustomize::FeaturePlot_scCustom(harmonized_seurat, 
+            features = c('Epcam', 'Ptprc', 'Pecam1', 'Vwf'), 
+            reduction = "umap", 
+            # ncol = 4
+            # na_cutoff = NULL
+            ) +
+  NoLegend()
+```
+
+`Rtkn2`,什么鬼，肺泡好像都没了。肺组织的单细胞数据，不应该有很多的肺泡细胞吗?
+```{r}
+taget_markers <- lungmap_marker_genes_mouse$`Systemic Venous Endothelial Cell`
+
+FeaturePlot(harmonized_seurat, 
+            features = taget_markers,
+            # features = mouse_markers$AT2,
+            # features = mouse_immune_markers$Lymphoid$T_Cells$CD8_T_Cells$General,
+            reduction = "umap", 
+            # ncol = 4
+            ) +
+  NoLegend()
+
+scCustomize::FeaturePlot_scCustom(harmonized_seurat, 
+            features = taget_markers,
+            # features = mouse_markers$AT2,
+            # features = mouse_immune_markers$Lymphoid$T_Cells$CD8_T_Cells$General,
+            reduction = "umap", 
+            # ncol = 4
+            ) +
+  NoLegend()
+
+```
+
+```{r}
+scCustomize::Clustered_DotPlot(seurat_object = harmonized_seurat, 
+                               features = lungmap_marker_genes_mouse %>% unlist()
+                               )
+```
+
+```{r}
+Clustered_DotPlot(seurat_object = harmonized_seurat, 
+                  features = mouse_markers %>% unlist()
+                  )
+
+SCpubr::do_DotPlot(sample = harmonized_seurat, 
+                   features = mouse_markers,
+                   dot.scale = 8,
+                   font.size = 8,
+                   cluster = TRUE
+                   )
+```
+
+
+如果对哪个基因的表达不是很清晰，可以进一步的查看对应基因的表达。
+比如进一步的验证Rtkn2。
+```{r}
+Plot_Density_Custom(seurat_object = harmonized_seurat, 
+                    features = "Epx"
+                    )
+
+Cluster_Highlight_Plot(
+  seurat_object = harmonized_seurat,
+  cluster_name = "12",
+  highlight_color = "navy",
+  background_color = "lightgray"
+)
+```
+
+有一个细胞群体的线粒体占比好高。检查一下。
+```{r}
+VlnPlot(harmonized_seurat, features = "percent_mito", 
+        group.by = "SCT_snn_res.1.2") + NoLegend()
+```
+
+
+对metadata感兴趣的部分，都可以进行展示：
+Highlight Cells
+```{r}
+# 不过对于细胞表达值的选择需要注意
+
+# Get cell names
+ROCK1_sub <- WhichCells(object = harmonized_seurat, 
+                        expression = ROCK1 > 2)
+
+# Make into list
+cells <- list(ROCK1 = ROCK1_sub)
+
+# Plot
+Cell_Highlight_Plot(seurat_object = harmonized_seurat, 
+                    cells_highlight = cells)
+```
+
+
+### Cell Annotation
+
+#### SingleR or A
+
+```{r}
+require(Azimuth)
+require(SingleR)
+```
+
+```{r}
+DefaultAssay(harmonized_seurat) <- 'RNA'
+harmonized_seurat <- JoinLayers(harmonized_seurat)
+```
+
+
+
+```{r}
+# 使用 Human Primary Cell Atlas DataBase (HPCA) 作为参考数据库
+# hpca.se <- celldex::HumanPrimaryCellAtlasData(ensembl=F)
+# immgen <- celldex::ImmGenData()
+immgen <- celldex::MouseRNAseqData()
+
+query_data <- LayerData(harmonized_seurat, assay = "RNA", 
+                        layer = "data")
+
+singler_results <- SingleR(
+  test = query_data,
+  ref = immgen,
+  labels = immgen$label.main,
+)
+
+# 将注释结果添加到Seurat对象
+harmonized_seurat$singler_labels <- singler_results$labels
+
+# 可视化注释结果
+DimPlot(harmonized_seurat, 
+        group.by = "singler_labels", 
+        label = TRUE) + 
+  NoLegend()
+```
+
+reference based annotation:
+```{r}
+# The RunAzimuth function can take a Seurat object as input
+harmonized_seurat <- RunAzimuth(harmonized_seurat, reference = "pbmcref")
+```
+
+
+
+#### manual annnotation
+
+```{r}
+# SCT_snn_res.0.2
+cluster2type <- c(
+  '0' = 'B_cell',
+  '1' = 'Monocyte',
+  '2' = 'Macrophages',
+  '3' = 'CD4_T',
+  '4' = 'Endothelial',
+  '5' = 'CD4CD8T',
+  '6' = 'NK_cell',
+  '7' = 'interstitial macrophages',
+  '8' = 'cDC',
+  '9' = 'CD8_T',
+  '10' = 'Macrophages',
+  '11' = 'Mesenchymal',
+  '12' = 'Epithelium',
+  '13' = 'Mitochondria-high',
+  '14' = 'Epithelium',
+  '15' = 'pDC',
+  '16' = 'Endothelial'
+)
+
+harmonized_seurat@meta.data$cell_level1 <- cluster2type[as.character(harmonized_seurat@meta.data$SCT_snn_res.0.2)]
+```
+
+
+```{r}
+
+```
+
+选择SCT_snn_res.1 and SCT_snn_res.0.2 作为主要的参考。
+
+```{r}
+Idents(object = harmonized_seurat) <- "SCT_snn_res.1"
+
+harmonized_seurat@meta.data$cell_level2 <- cluster2type[as.character(harmonized_seurat@meta.data$SCT_snn_res.1)]
+```
+
+在完成了单细胞的mapping后, 做进一步的查看。
+
+`cell_level1`,
+`cell_level2`,
+`cell_type`
+
+```{r}
+
+DimPlot(harmonized_seurat, 
+        reduction = "umap", 
+        group.by  = "cell_level2",
+        label = T)
+
+DimPlot_scCustom(seurat_object = harmonized_seurat,
+                 group.by = 'cell_level2',
+                 label = TRUE
+                 ) + NoLegend()
+```
+
+
+```{r}
+Idents(harmonized_seurat) <- 'cell_type'
+
+DimPlot_scCustom(harmonized_seurat, 
+        label = TRUE, 
+        label.size = 4)  + NoLegend()
+```
+
+
+### Marker identification
+
+```{r}
+harmonized_seurat <- PrepSCTFindMarkers(harmonized_seurat,
+  assay = "SCT",
+  verbose = TRUE
+)
+```
+
+
+*`read the final data here!!!!!!`*
+
+```{r}
+
+# harmonized_seurat <- qs::qread("./BLM_six/harmonized_seurat_second.qs")
+
+qs::qsave(harmonized_seurat, "./BLM_six/harmonized_seurat_second.qs")
+
+```
+
+
+```{r}
+# don't run! load data below
+
+# Idents(harmonized_seurat) <- 'cell_type'
+
+cluster_markers <- read_csv('./BLM_six/cluster_markers_SCT_second.csv')
+
+# cluster_markers <- FindAllMarkers(
+#   harmonized_seurat,
+#   only.pos = TRUE,
+#   min.pct = 0.25,
+#   logfc.threshold = 0.25
+# )
+
+# 提取top10标记基因
+top10 <- cluster_markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 10, order_by = avg_log2FC)
+
+top2 <- cluster_markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 2, order_by = avg_log2FC)
+
+top5 <- cluster_markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 5, order_by = avg_log2FC)
+
+top20 <- cluster_markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 20, order_by = avg_log2FC)
+
+top50 <- cluster_markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 50, order_by = avg_log2FC)
+```
+
+```{r}
+# 整理top20的全部cluster基因
+# 一般用于给CellMarker2使用
+top_list <- split(top20[,c("cluster", "gene")],top20$cluster)
+
+purrr::map_df(seq_along(top_list),function(x){
+  data.frame(cluster = unique(top_list[[x]]$cluster),
+             genes = paste(top_list[[x]]$gene,sep = ",",collapse = ","))
+}) -> top_df
+```
+
+
+```{r}
+# 3. 整理输入格式
+top_marker <- top20
+result <- ""
+unique_clusters <- unique(top_marker$cluster)
+for (cluster in unique_clusters) {
+  genes <- as.data.frame(top_marker[as.character(top_marker$cluster) == cluster, "gene"])[,1] %>% as.character()
+  cluster_string <- paste0("cluster_", cluster, ":", paste(genes, collapse = ","))
+  if (!cluster=="0") {
+    result <- paste(result, cluster_string, sep = "\n")
+  }else{
+    result <- paste(result, cluster_string, sep = "")
+  }
+}
+cat(result)
+```
+
+
+```{r}
+top50 %>% filter(cluster == 18) %>% pull(gene) %>% 
+  paste(collapse = ',')
+```
+
+
+```{r}
+# cluster_markers |> write_csv('./BLM_six/cluster_markers_SCT.csv')
+
+# cluster_markers <- read_csv('./BLM_six/cluster_markers_SCT.csv')
+```
+
+
+```{r}
+DotPlot(harmonized_seurat, features = top2$gene) +
+  theme(axis.text.x = element_text(angle = 90)) + NoLegend()
+
+
+top2$gene |> unique() -> g
+#五种方式可视化marker基因
+# DoHeatmap(harmonized_seurat,features=g)
+
+# DotPlot(harmonized_seurat,features=g)+RotatedAxis()
+
+# VlnPlot(harmonized_seurat,features=g[1:6])
+
+FeaturePlot(harmonized_seurat,features=g[1:4])
+
+# RidgePlot(harmonized_seurat,features=g[1:6])
+```
+
+
+```{r}
+require(scRNAtoolVis)
+```
+
+
+```{r}
+celltype_colors <- c(
+  "Spermatogonia" = "#FF7F0E",  # 暖橙色
+  "Spermatocytes" = "#1F77B4",  # 经典蓝
+  "Spermatids" = "#2CA02C",     # 自然绿
+  "Endothelial" = "#D62728",    # 警示红
+  "Macrophages" = "#8C564B",    # 陶土棕
+  "Sertoli" = "#9467BD",        # 紫水晶色
+  "Leydig" = "#E377C2",         # 粉彩色
+  "Myoid" = "#7F7F7F",          # 中性灰
+  "Immune" = "#BCBD22",         # 橄榄绿
+  "Progenitor" = "#17BECF",     # 青蓝色
+  "Undefined" = "#AEC7E8",      # 浅天蓝
+  "Doublet" = "#FFBB78"         # 浅珊瑚色
+)
+```
+
+
+```{r}
+scRNAtoolVis::cellRatioPlot(object = harmonized_seurat,
+                            sample.name = 'orig.ident',
+                            celltype.name = 'cell_level2',
+                            flow.curve = 0.5,
+                            # fill.col = col,
+                            sample.order = c()
+                            ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### 注释好之后的一些统计指标
+
+主要是细胞的数量和细胞的占比等。
+
+```{r}
+cluster_stats <- Cluster_Stats_All_Samples(seurat_object = harmonized_seurat)
+
+cluster_stats %>% as_tibble()
+```
+
+堆积柱状图
+
+```{r}
+
+Idents(harmonized_seurat) = 'cell_type'
+
+
+SCP::CellStatPlot(harmonized_seurat, 
+             stat.by = "cell_level1", 
+             group.by = "orig.ident", 
+             label = TRUE)
+
+
+scCustomize::Proportion_Plot(harmonized_seurat,
+                             split.by = 'orig.ident',
+                             x_lab_rotate = F
+                             ) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+```{r}
+cluster_stats %>% as_tibble() %>% 
+  write_excel_csv('./BLM_six/cluster_stats.csv')
+```
+
+
+### DotPlot or HeatMap in different condition
+
+绘制感兴趣的基因或者`FindAllMarkers`找到的marker基因按照condition条件的不同的
+DotPlot。`需不需要分细胞亚群？？？？`
+
+
+```{r}
+target_genes <- c('ROCK1', 'ROCK2', 'MAP3K19', 'CFD', 'CFB')
+```
+
+
+```{r}
+p_1 <- SCpubr::do_DotPlot(sample = harmonized_seurat, 
+                        features = target_genes,
+                        group.by = 'group',
+                        cluster = TRUE
+                        )
+
+p_2 <- SCpubr::do_DotPlot(sample = harmonized_seurat, 
+                        features = target_genes,
+                        group.by = 'cell_type',
+                        cluster = TRUE
+                        )
+
+p_1
+
+p_2
+```
+
+
+```{r}
+p_1 <- SCpubr::do_DotPlot(sample = harmonized_seurat, 
+                        features = top2$gene,
+                        group.by = 'group',
+                        cluster = TRUE
+                        )
+
+p_2 <- SCpubr::do_DotPlot(sample = harmonized_seurat, 
+                        features = top2$gene,
+                        group.by = 'cell_type',
+                        cluster = TRUE
+                        )
+
+p_1
+
+p_2
+```
+
+
+In `scanpy`, there is a function to create a stacked violin plot.
+
+```{r}
+sample_colors <- c("forestgreen", "firebrick1", "dodgerblue")
+
+human_colors_list <- c("dodgerblue", "navy", "forestgreen", "darkorange2", 
+                       "darkorchid3", "orchid","orange", "gold", "gray")
+
+# Create Plots
+scCustomize::Stacked_VlnPlot(seurat_object = harmonized_seurat, 
+                             features = target_genes, 
+                             x_lab_rotate = TRUE,
+                             colors_use = sample_colors, 
+                             split.by = "group"
+                             )
+```
+
+
+
+### 不同细胞亚群在不同分组条件下的统计分析
+
+常常采用的统计方法包括：
+
+```{r}
+SCP::CellStatPlot(harmonized_seurat, 
+             stat.by = "cell_level2", 
+             group.by = "orig.ident", 
+             label = TRUE)
+
+Idents(harmonized_seurat) = 'cell_level2'
+scCustomize::Proportion_Plot(harmonized_seurat,
+                             split.by = 'orig.ident',
+                             x_lab_rotate = F
+                             ) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+
+```{r}
+# 对特定细胞类型进行组间比较
+metadata <- harmonized_seurat@meta.data
+celltype_of_interest <- "Upper-layer excitatory neurons"
+cell_type_counts <- table(metadata$sample[metadata$cell_type == celltype_of_interest])
+total_counts_per_sample <- table(metadata$sample)
+cell_type_counts <- cell_type_counts[names(total_counts_per_sample)]
+prop.test(as.numeric(cell_type_counts), as.numeric(total_counts_per_sample))
+```
+
+
+
+```{r}
+# use wilcox_test
+
+# 获取每个样本各细胞类型的数量
+cell_counts <- harmonized_seurat@meta.data %>%
+  dplyr::count(sample, group, cell_type, name = "n_cells")
+
+# 计算每个样本的总细胞数
+total_cells <- cell_counts %>% 
+  group_by(sample) %>% 
+  summarise(total = sum(n_cells))
+
+# 计算比例并合并数据
+cell_proportions <- cell_counts %>%
+  left_join(total_cells, by = "sample") %>%
+  mutate(proportion = n_cells / total)
+
+stat_results <- cell_proportions %>%
+  group_by(cell_type) %>%
+  wilcox_test(proportion ~ group) %>%
+  adjust_pvalue(method = "BH") %>%
+  add_significance() %>%
+  add_xy_position(x = "condition", dodge = 0.8)
+
+# 查看结果
+print(stat_results, n = Inf)
+```
+
+
+```{r}
+# require(ggpubr)
+
+ggplot(cell_proportions, aes(x = group, y = proportion)) +
+  geom_boxplot(aes(fill = group), width = 0.6, show.legend = FALSE) +
+  geom_jitter(aes(color = group), width = 0.15, size = 2, alpha = 0.7) +
+  facet_wrap(~cell_type, scales = "free_y", ncol = 4) +
+  scale_fill_manual(values = c("#00BFC4", "#F8766D")) +
+  scale_color_manual(values = c("#008B8B", "#CD5C5C")) +
+  labs(y = "Cell Proportion", x = "") +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.background = element_blank(),
+    panel.spacing = unit(1, "lines")
+  )
+```
+
+
+```{r}
+require(ggprism)
+require(ggrepel)
+
+#------------------------------------------------------------------
+# 第一部分：从Seurat对象中提取细胞类型和分组信息
+#------------------------------------------------------------------
+
+# 提取细胞类型和分组信息
+cell_data <- data.frame(
+  CellType = Idents(harmonized_seurat),  # 假设当前的Idents是细胞类型
+  Condition = harmonized_seurat$condition  # 假设'condition'是您的分组变量（disease/health）
+)
+
+# 确保分组变量是因子类型，并设置参考水平为"health"
+cell_data$Condition <- factor(cell_data$Condition, levels = c("nonUIP", "UIP"))
+
+#------------------------------------------------------------------
+# 第二部分：计算每个细胞类型在不同条件下的占比
+#------------------------------------------------------------------
+
+# 计算每个分组中各细胞类型的数量
+cell_counts <- cell_data %>%
+  group_by(Condition, CellType) %>%
+  summarise(n = n(), .groups = "drop")
+
+# 计算每个分组中的总细胞数
+total_cells <- cell_counts %>%
+  group_by(Condition) %>%
+  summarise(total = sum(n), .groups = "drop")
+
+# 合并数据并计算占比
+cell_proportions <- cell_counts %>%
+  left_join(total_cells, by = "Condition") %>%
+  mutate(proportion = n / total,
+         percentage = proportion * 100)
+
+#------------------------------------------------------------------
+# 第三部分：统计检验 - 使用Fisher精确检验
+#------------------------------------------------------------------
+
+# 创建一个数据框来存储所有细胞类型的统计结果
+stat_results <- data.frame()
+
+# 获取所有唯一的细胞类型
+cell_types <- unique(cell_data$CellType)
+
+# 对每个细胞类型进行Fisher精确检验
+for (cell_type in cell_types) {
+  # 创建2x2列联表：该细胞类型 vs 其他细胞类型，在两个条件下
+  contingency_table <- matrix(0, nrow = 2, ncol = 2)
+  
+  # 该细胞类型在health和disease中的数量
+  type_counts <- cell_counts %>% 
+    filter(CellType == cell_type)
+  
+  # 填充列联表
+  health_idx <- which(type_counts$Condition == "nonUIP")
+  disease_idx <- which(type_counts$Condition == "UIP")
+  
+  if (length(health_idx) > 0) {
+    contingency_table[1, 1] <- type_counts$n[health_idx]  # 该细胞类型在health中的数量
+  }
+  
+  if (length(disease_idx) > 0) {
+    contingency_table[2, 1] <- type_counts$n[disease_idx]  # 该细胞类型在disease中的数量
+  }
+  
+  # 其他细胞类型在健康和疾病中的数量
+  health_total <- total_cells$total[total_cells$Condition == "nonUIP"]
+  disease_total <- total_cells$total[total_cells$Condition == "UIP"]
+  
+  contingency_table[1, 2] <- health_total - contingency_table[1, 1]
+  contingency_table[2, 2] <- disease_total - contingency_table[2, 1]
+  
+  # 执行Fisher精确检验
+  fisher_test <- fisher.test(contingency_table)
+  
+  # 保存结果
+  result <- data.frame(
+    CellType = cell_type,
+    p_value = fisher_test$p.value,
+    odds_ratio = fisher_test$estimate,
+    health_prop = contingency_table[1, 1] / health_total,
+    disease_prop = contingency_table[2, 1] / disease_total,
+    fold_change = (contingency_table[2, 1] / disease_total) / (contingency_table[1, 1] / health_total)
+  )
+  
+  stat_results <- rbind(stat_results, result)
+}
+
+# 多重检验校正
+stat_results$p_adjusted <- p.adjust(stat_results$p_value, method = "BH")
+
+# 添加显著性标记
+stat_results <- stat_results %>%
+  mutate(significance = case_when(
+    p_adjusted < 0.001 ~ "***",
+    p_adjusted < 0.01 ~ "**",
+    p_adjusted < 0.05 ~ "*",
+    TRUE ~ "ns"
+  ))
+
+# 按p值排序
+stat_results <- stat_results %>%
+  arrange(p_value)
+
+# 打印统计结果
+print(stat_results)
+
+# 保存结果到CSV文件
+# write.csv(stat_results, "cell_type_proportion_statistics.csv", row.names = FALSE)
+
+
+```
+
+
+```{r}
+#------------------------------------------------------------------
+# 第四部分：可视化 - 条形图展示占比差异
+#------------------------------------------------------------------
+
+# 1. 创建条形图展示每个细胞类型在两个条件下的占比
+p1 <- ggplot(cell_proportions, aes(x = CellType, y = percentage, fill = Condition)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.9), width = 0.8) +
+  scale_fill_manual(values = c("nonUIP" = "#2C7FB8", "UIP" = "#D7301F")) +
+  labs(title = "Cell Type Proportions by Condition",
+       x = "Cell Type", 
+       y = "Percentage (%)") +
+  theme_prism(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "top") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))
+
+# 2. 创建点图 - 展示每个细胞类型的占比差异及统计显著性
+# 为点图准备数据
+plot_data <- cell_proportions %>%
+  pivot_wider(id_cols = CellType, 
+              names_from = Condition, 
+              values_from = percentage) %>%
+  left_join(stat_results, by = "CellType")
+
+# 创建点图
+p2 <- ggplot(plot_data, aes(x = health, y = disease, color = -log10(p_adjusted))) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(size = 3) +
+  scale_color_viridis() +
+  geom_text_repel(aes(label = CellType), 
+                  box.padding = 0.5, 
+                  point.padding = 0.2,
+                  segment.color = 'grey50',
+                  force = 2) +
+  labs(title = "Cell Type Proportions: Disease vs Health",
+       x = "Health (%)", 
+       y = "Disease (%)",
+       color = "-log10(p-adj)") +
+  theme_prism(base_size = 12) +
+  coord_fixed() +
+  theme(legend.position = "right")
+
+# 3. 创建火山图 - 展示差异倍数和统计显著性
+p3 <- ggplot(stat_results, aes(x = log2(fold_change), y = -log10(p_adjusted), 
+                              color = -log10(p_adjusted))) +
+  geom_point(size = 3) +
+  scale_color_viridis() +
+  geom_text_repel(aes(label = ifelse(p_adjusted < 0.05, as.character(CellType), "")), 
+                  box.padding = 0.5, 
+                  point.padding = 0.2,
+                  segment.color = 'grey50') +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  labs(title = "Volcano Plot of Cell Type Proportion Changes",
+       x = "log2(Fold Change) [Disease/Health]", 
+       y = "-log10(p-adjusted)",
+       color = "-log10(p-adj)") +
+  theme_prism(base_size = 12)
+
+p1
+```
+
+
+### 差异基因分析
+
+目的：分析不同分组和细胞亚群中的基因的差异情况：
+
+```{r}
+
+seurat_obj <- harmonized_seurat
+seurat_obj$condition <- seurat_obj$group
+
+
+# 函数虽不错，但还是不想用
+# SCP::RunDEtest
+
+# 2. Create a combined identity for each cell: cell_type + condition
+seurat_obj$celltype_condition <- paste0(seurat_obj$`cell_type`, "_", seurat_obj$condition)
+
+# 3. Set this as the active identity for comparison
+Idents(seurat_obj) <- "celltype_condition"
+
+
+```
+
+注意选择感兴趣的细胞亚型。结合上面的亚群分析，选择`secretory_cells`
+
+```{r}
+# 4. Run differential expression for each cell type
+# For example, for a cell type "T_cells":
+de_t_cells <- FindMarkers(seurat_obj, 
+                        ident.1 = "secretory_cells_UIP", 
+                        ident.2 = "secretory_cells_nonUIP",
+                        min.pct = 0.1,       # Only test genes detected in at least 10% of cells
+                        logfc.threshold = 0.25,  # Minimum log2 fold-change
+                        test.use = "MAST")    #
+
+# 5. View results
+head(de_t_cells[order(de_t_cells$avg_log2FC, decreasing = TRUE), ])
+```
+
+查看感兴趣基因的结果：
+```{r}
+de_t_cells[target_genes, ]
+```
+
+
+Visualizing the Results
+```{r}
+# For a specific cell type, visualize top DE genes
+cell_type_of_interest <- 'secretory_cells'
+# de_data <- de_results[[cell_type_of_interest]]
+de_data <- de_t_cells
+
+# Volcano plot
+ggplot(de_data, aes(x = avg_log2FC, y = -log10(p_val_adj))) +
+  geom_point(aes(color = p_val_adj < 0.05 & abs(avg_log2FC) > 0.5)) +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  theme_minimal() +
+  labs(title = paste0("DE Genes in ", cell_type_of_interest),
+       x = "Log2 Fold Change",
+       y = "-Log10 Adjusted P-value")
+
+# Feature plots for top genes
+top_genes <- rownames(de_data[order(de_data$p_val_adj), ])[1:4]
+FeaturePlot(seurat_obj, features = top_genes, 
+            split.by = "condition")
+
+# Heatmap of top DE genes
+top_genes <- rownames(de_data[order(de_data$p_val_adj), ])[1:20]
+# DoHeatmap(subset(seurat_obj, idents = c(ident1, ident2)), features = top_genes)
+```
+
+
+
+得到所有细胞亚群在不同condition下的差异基因list
+```{r}
+# Get unique cell types
+cell_types <- unique(seurat_obj$cell_type)
+
+# Create list to store results
+de_results <- list()
+
+# For each cell type, perform differential expression analysis
+for (ct in cell_types) {
+  # Subset to current cell type
+  cells <- WhichCells(seurat_obj, expression = celltype == ct)
+  cell_type_obj <- subset(seurat_obj, cells = cells)
+  
+  # Run differential expression - comparing conditions
+  de_results[[ct]] <- FindMarkers(
+    cell_type_obj,
+    group.by = "condition",
+    ident.1 = "nonUIP", # e.g., "treated"
+    ident.2 = "UIP", # e.g., "control"
+    test.use = "MAST",      # or other tests like "wilcox", "DESeq2", "negbinom", etc.
+    min.pct = 0.1,          # only test genes detected in at least 10% of cells
+    logfc.threshold = 0.25  # log fold-change threshold
+  )
+}
+```
+
+
+```{r}
+# Look at results for a specific cell type
+head(de_results[["T_cell"]], n = 20)
+
+# Sort results by adjusted p-value
+de_results[["T_cell"]] %>% arrange(p_val_adj)
+
+# Save all results to files
+for (ct in names(de_results)) {
+  write.csv(de_results[[ct]], file = paste0("DE_", ct, ".csv"))
+}
+```
+
+
+### 富集分析以及GSEA分析
+
+可以对选择的差异基因基因富集分析，
+也可以采用compareCluster进行分析
+
+```{r}
+#| include: false
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+```
+
+
+针对`FindAllMarkers`的结果直接进行富集分析
+```{r}
+markers <- cluster_markers |> group_by(cluster) |>
+    filter(p_val_adj < 0.001) |>
+    ungroup()
+
+gid <- bitr(unique(markers$gene), 'SYMBOL', 'ENTREZID', OrgDb= 'org.Hs.eg.db')
+markers <- full_join(markers, gid, by=c('gene' = 'SYMBOL'))
+```
+
+
+```{r}
+x = compareCluster(ENTREZID ~ cluster, data = markers, fun='enrichKEGG')
+```
+
+
+```{r}
+dotplot(x, label_format=40) + 
+  theme(axis.text.x = element_text(angle=45, 
+                                   hjust=1)
+        ) 
+```
+
+
+#### GSVA Anayslis
+
+
+```{r}
+library(GSVA)
+library(GSEABase)
+library(limma)
+library(BiocParallel)
+```
+
+
+```{r}
+# genesets <- msigdbr::msigdbr(species = "Homo sapiens", 
+#                     category = "C2"
+#                     ) 
+# genesets=read.gmt("~/Downloads/h.all.v2024.1.Hs.symbols.gmt")[,c(2,1)]
+genesets=read.gmt("~/Downloads/c2.cp.kegg_medicus.v2024.1.Hs.symbols.gmt")[,c(2,1)]
+genesets=unstack(genesets)
+
+# genesets <- subset(genesets, select = c("gs_name","gene_symbol")) %>% as.data.frame()
+# genesets <- split(genesets$gene_symbol, genesets$gs_name)
+```
+
+```{r}
+# 请注意这里AverageExpression用于计算每个基因在所有细胞中的平均表达值，
+sce <- harmonized_seurat
+Idents(sce) <- 'cell_type'
+# Idents(harmonized_seurat) <- "celltype_condition"
+
+expr <- AverageExpression(sce, assays = "RNA", layer = "data",
+                          group.by = 'ident'
+                          )[[1]]
+expr <- expr[rowSums(expr)>0,]  #选取非零基因
+expr <- as.matrix(expr)
+head(expr)
+```
+
+
+```{r}
+# gsva默认开启全部线程计算
+gsvaPar <- gsvaParam(expr, genesets, maxDiff = TRUE)
+gsvaPar 
+
+gsva.res <- gsva(gsvaPar,
+                 verbose = TRUE
+                 )
+dim(gsva.res)
+
+```
+
+
+```{r}
+gsva.df <- data.frame(Genesets=rownames(gsva.res), gsva.res, check.names = F)
+gsva_d = gsva.res[sample(nrow(gsva.res),30),]
+```
+
+
+```{r}
+pheatmap::pheatmap(gsva_d, show_colnames = T, 
+                   scale = "row",angle_col = "45",
+                   color = colorRampPalette(c("navy", "white", "firebrick3"))(50))
+```
+
+
+
+```{r}
+gsva_long <- pivot_longer(gsva.df, cols = -Genesets)
+
+# 创建气泡图
+ggplot(gsva_long, aes(x = Genesets, y = name, size = value, color = value)) +
+  geom_point(alpha = 0.7) +  # 使用散点图层绘制气泡，alpha设置点的透明度
+  scale_size_continuous(range = c(1, 6)) +  # 设置气泡大小的范围
+  theme_bw() + 
+  scale_color_gradient(low = "#336699", high =  "tomato") +
+  labs(x = "Gene Set", y = "Sample", size = "GSVA Score")+
+  ggtitle("GSVA analysis") +
+  theme(axis.text.x = element_text(angle = 45,vjust = 0.5,hjust = 0.5),
+        plot.title = element_text(hjust = 0.5))
+
+```
+
+
+```{r}
+# 为limma创建设计矩阵
+group_factor <- factor(target_cells$selected_group)
+design <- model.matrix(~0 + group_factor)
+colnames(design) <- levels(group_factor)
+```
+
+
+```{r}
+# 确保GSVA结果和细胞顺序匹配
+gsva_results_h <- gsva_results_h[, colnames(target_cells)]
+gsva_results_kegg <- gsva_results_kegg[, colnames(target_cells)]
+gsva_results_bp <- gsva_results_bp[, colnames(target_cells)]
+```
+
+
+```{r}
+# 对Hallmark基因集进行差异分析
+fit_h <- lmFit(gsva_results_h, design)
+contrast_matrix <- makeContrasts(contrasts = paste0(group2, "-", group1), levels = design)
+fit2_h <- contrasts.fit(fit_h, contrast_matrix)
+fit2_h <- eBayes(fit2_h)
+results_h <- topTable(fit2_h, number = Inf)
+print(paste0("Hallmark差异富集通路数量: ", sum(results_h$adj.P.Val < 0.05)))
+```
+
+
