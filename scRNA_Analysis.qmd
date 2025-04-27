@@ -28,6 +28,10 @@ library(Seurat)
 library(Matrix)
 library(scales)
 
+library(SCP)
+library(scCustomize)
+library(dittoSeq)
+
 library(BiocParallel)
 
 # options(future.globals.maxSize = 4000 * 1024^2)
@@ -56,6 +60,12 @@ merged_seurat <- merge(
   y = stim_raw_feature_bc_matrix,
   add.cell.id = c("ctrl", "stim")
 )
+```
+
+
+`scCustomize`非常方便使用。
+```{r}
+merged_seurat <- Add_Cell_QC_Metrics(object = merged_seurat, species = "human")
 ```
 
 
@@ -885,6 +895,38 @@ b.interferon.response <- FindMarkers(seurat_integrated,
                                      verbose = FALSE)
 print(dim(b.interferon.response))
 head(b.interferon.response, n = 5)
+```
+
+
+得到所有细胞亚群在不同condition下的差异基因list
+```{r}
+# Get list of all cell types
+cell_types <- unique(seurat_obj$celltype)
+
+# Create empty list to store DE results
+de_results <- list()
+
+# Loop through each cell type
+for(cell_type in cell_types) {
+  # Define the identities to compare
+  ident1 <- paste0(cell_type, "_disease")
+  ident2 <- paste0(cell_type, "_healthy")
+  
+  # Check if both conditions exist for this cell type
+  if(ident1 %in% levels(Idents(seurat_obj)) & ident2 %in% levels(Idents(seurat_obj))) {
+    # Run DE analysis
+    de_results[[cell_type]] <- FindMarkers(seurat_obj,
+                                         ident.1 = ident1,
+                                         ident.2 = ident2,
+                                         min.pct = 0.1,
+                                         logfc.threshold = 0.25,
+                                         test.use = "MAST")
+    
+    # Save results to file
+    write.csv(de_results[[cell_type]], 
+              file = paste0(cell_type, "_DE_results.csv"))
+  }
+}
 ```
 
 
