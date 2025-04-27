@@ -13,24 +13,7 @@ toc-title: Contents
 number-sections: true
 ---
 
-## 一些分析时的前提
-
-首先要表达歉意！在数据处理的时候，确实发现一些客观无法改变的事情，想必各位老师都可以谅解。肯定对分析结果有影响，但好在不是根本的影响。而且仅仅出于面试考察的目的，下面的分析内容是完全满足的。
-
-以下是一些分析中留存的问题：
-
-1，本人待业中，一直忙碌于投简历、面试，所以时间、精力上必然不能给这个分析太多。因为每一个机会对我而言都是平等的，我都得好好的对待、去争取。
-
-2，scRNA作为一个需要反复质控，每一步都需要质控，质控后需要重新对比分析，的分析流程，目前只进行基本的质控流程，不展开太多探索性性质的质控过程。本人多年前的笔记本，跑一步`SCTransform`都要两三个小时。
-
-3，`细胞注释`作为最为重要的一步，需要对项目有所了解，需要文献和数据库的支持，需要反复的对比注释结果，但相应的也较为耗费时间，故此处的细胞注释仅仅采用快速查到的marker gene进行基本的注释。
-
-4，差异分析也只是采用`FindMarkers`，而不采用`Pseudobulk DE by DESeq2`的方法。
-
-
-
-当然，以上这些问题在一个`真正的工作环境`下都是非常容易解决的。
-
+> https://pluto.bio/resources/Learning%20Series/annotating-clusters-in-scrnaseq#list-of-annotation-tools
 
 ## 临港实验室单细胞项目
 
@@ -210,6 +193,7 @@ merged_seurat <- merge(seurat_objects[[1]], y = seurat_objects[2:5],
 ```
 
 
+按照官网教程，这样跑就可以了。
 ```{r}
 # 转换为 SingleCellExperiment
 sce <- as.SingleCellExperiment(merged_seurat)
@@ -985,6 +969,7 @@ DotPlot(harmonized_seurat,
 
 ```{r}
 # 安装并加载SingleR
+# # SingleR() expects reference datasets to be normalized and log-transformed.
 
 library(SingleR)
 
