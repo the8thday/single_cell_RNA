@@ -2,6 +2,8 @@
 output: github_document
 ---
 
+**Important: To update `README.md`, please knit this `README.Rmd` file in RStudio or using the `rmarkdown::render("README.Rmd")` command.**
+
 <!-- README.md is generated from README.Rmd. Please edit that file -->
 
 ```{r, include = FALSE}
@@ -16,6 +18,99 @@ knitr::opts_chunk$set(
 <!-- badges: start -->
 <!-- badges: end -->
 
-The goal of single_cell_RNA is to record notes about scRNA-Seq analysis, this notes will update as i has more practice on scRNA-Seq.
+This repository serves as a personal collection of notes, R scripts, and reproducible workflows related to single-cell RNA sequencing (scRNA-seq) data analysis. It's a place to document my learning process, store useful code snippets, and develop best practices as I gain more experience in the field.
 
+## Contents
 
+This repository contains a variety of files related to scRNA-seq analysis, including:
+
+*   **R scripts (.R):** Standalone scripts for specific tasks.
+*   **R Markdown documents (.Rmd):** Notebooks combining code, text, and output, often used for workflows and tutorials.
+*   **Quarto documents (.qmd):** Similar to R Markdown, but with additional features and often used for newer analyses.
+*   **Example datasets:** Data used in various analyses, though not explicitly listed here.
+
+Key analysis files include:
+
+*   `scRNA_Notes.Rmd`: General notes, common marker genes, and foundational concepts for scRNA-seq.
+*   `Seurat4.Rmd`: A comprehensive workflow for scRNA-seq analysis using Seurat v4.
+*   `Seurat5.qmd`: An updated workflow, likely for Seurat v5, exploring new features.
+*   `Monocle3.Rmd`, `Monocle3.R`, `monocle_lingang.qmd`: Scripts and notebooks for trajectory inference analysis using Monocle3.
+*   `Harmony.Rmd`: Demonstrates data integration and batch correction using the Harmony algorithm.
+*   `cellChat.Rmd`: Analysis of cell-cell communication networks from scRNA-seq data.
+*   `SCENIC.Rmd`: Workflow for SCENIC (Single-Cell Regulatory Network Inference and Clustering).
+*   `DE_analysis_scrnaseq.Rmd`: Focuses on differential gene expression analysis in scRNA-seq datasets.
+*   `SingleR.Rmd`: Automated cell type annotation using the SingleR package.
+*   `ArchR.R`: Script for processing and analyzing single-cell ATAC-seq data with ArchR.
+*   `GSVA.Rmd`: Gene Set Variation Analysis (GSVA) for scRNA-seq to assess pathway activity.
+*   `inferCNV.Rmd`: Notes and workflow for inferring copy number variations (CNVs) from scRNA-seq data.
+*   `velocyto.Rmd`: RNA velocity analysis to predict future cell states.
+*   `Spatial_Transcripts.qmd`, `10x_Genomics_Visium.R`: Analysis of spatial transcriptomics data, with a focus on 10x Genomics Visium platform.
+*   `GSE138794.qmd`: Analysis of a specific dataset (e.g., from GEO accession GSE138794).
+*   `GSE242889.qmd`: Analysis of another specific dataset (e.g., GSE242889).
+
+## Key Scripts and Workflows
+
+This section highlights some of the core analyses and methodologies explored in this repository.
+
+### Comprehensive scRNA-seq Analysis with Seurat (`Seurat4.Rmd`)
+
+The `Seurat4.Rmd` file provides a detailed workflow for analyzing scRNA-seq data using the Seurat R package (version 4). Key steps covered in this workflow include:
+
+*   **Data Loading and Object Creation:** Reading 10X Genomics data (or other formats) using `Read10X`, creating Seurat objects with `CreateSeuratObject`, and merging multiple datasets using `merge`.
+*   **Quality Control (QC):** Calculating mitochondrial gene ratios (`PercentageFeatureSet`), and filtering out low-quality cells based on metrics like the number of unique molecular identifiers (UMIs) (`nCount_RNA`), detected genes (`nFeature_RNA`), and mitochondrial content.
+*   **Data Preprocessing:**
+    *   **Normalization:** Standard log-normalization (`NormalizeData`) or variance stabilizing transformation using `SCTransform`.
+    *   **Scaling:** Regressing out unwanted sources of variation (e.g., `nCount_RNA`, `mitoRatio`, cell cycle scores) using `ScaleData`.
+*   **Dimensionality Reduction:**
+    *   Principal Component Analysis (PCA) (`RunPCA`) to identify the most significant sources of variation.
+    *   Uniform Manifold Approximation and Projection (UMAP) (`RunUMAP`) for 2D visualization of cell clusters.
+*   **Cell Cycle Analysis:** Scoring cells for their phase in the cell cycle and regressing out cell cycle effects if necessary.
+*   **Data Integration:** Strategies for combining data from multiple samples or experimental conditions while correcting for batch effects. This includes Seurat's integration workflow (`SelectIntegrationFeatures`, `PrepSCTIntegration`, `FindIntegrationAnchors`, `IntegrateData`) and alternative methods like Harmony (`RunHarmony`).
+*   **Clustering:** Identifying cell populations by constructing a shared nearest neighbor (SNN) graph (`FindNeighbors`) and applying community detection algorithms (`FindClusters`).
+*   **Marker Gene Identification:** Finding genes differentially expressed in each cluster (`FindAllMarkers`) or conserved across conditions (`FindConservedMarkers`).
+*   **Cell Type Annotation:** Assigning biological labels to clusters based on known marker genes (manual annotation) or using automated annotation tools (e.g., SingleR, not explicitly detailed in `Seurat4.Rmd` but present in `SingleR.Rmd`).
+
+### Other Notable Analyses
+
+The repository also includes explorations of various other advanced scRNA-seq analyses:
+
+*   **Trajectory Inference:** Inferring developmental trajectories and pseudotime ordering of cells using `Monocle3` (`Monocle3.Rmd`, `Monocle3.R`, `monocle_lingang.qmd`).
+*   **Cell-Cell Communication:** Analyzing intercellular signaling networks using `CellChat` (`cellChat.Rmd`).
+*   **Gene Regulatory Networks:** Reconstructing gene regulatory networks and identifying regulons using `SCENIC` (`SCENIC.Rmd`).
+*   **Spatial Transcriptomics:** Analyzing spatially resolved gene expression data, with examples from the 10x Genomics Visium platform (`Spatial_Transcripts.qmd`, `10x_Genomics_Visium.R`).
+*   **Single-cell ATAC-seq Analysis:** Processing and analyzing chromatin accessibility data using `ArchR` (`ArchR.R`).
+
+## Datasets
+
+The `datasets/` directory houses example data used in various analysis workflows within this repository. These datasets are typically smaller subsets or specific examples to demonstrate particular tools or techniques.
+
+Key datasets include:
+
+*   `ctrl_raw_feature_bc_matrix/` and `stim_raw_feature_bc_matrix/`: These directories contain example raw gene expression data from 10x Genomics Cell Ranger output (feature-barcode matrices). Specifically, they represent a control sample (`ctrl`) and a stimulated sample (`stim`). This data is used, for example, in the `Seurat4.Rmd` workflow to demonstrate data loading, quality control, integration, and downstream analysis of scRNA-seq data from different conditions.
+*   `monocle_trajectory_test/`: This directory contains example data formatted for trajectory inference analysis using the Monocle3 package. It likely includes R data objects (`.rds` files) such as `cds_colData.rds`, `cds_exprs.rds`, and `gene_annotation.rds`, representing cell metadata, expression data, and gene annotations, respectively, necessary to construct a `cell_data_set` object for Monocle3.
+*   `annotation.csv`: This file is likely a gene annotation file, providing information such as gene symbols, Ensembl IDs, or other relevant gene metadata. It is used in various scripts for annotating gene lists or results from differential expression or marker gene analyses.
+
+## Usage
+
+The R Markdown (`.Rmd`) and Quarto (`.qmd`) files in this repository are designed to be self-contained analyses or notes. You can open these files in RStudio (or other compatible Integrated Development Environments). Once opened, you can "knit" (for `.Rmd` files) or "render" (for `.qmd` files) the documents. This process executes the embedded R code and generates a formatted output document (typically HTML, but PDF or Word can also be configured), allowing you to view the notes, code, and results, and to re-execute the analyses if you have the necessary datasets and R packages installed.
+
+To run most of the analyses and workflows presented here, you will likely need to have several key R packages installed. Common packages used throughout this repository include:
+
+*   `Seurat`
+*   `tidyverse` (which bundles packages like `ggplot2`, `dplyr`, `readr`, etc.)
+*   `SingleCellExperiment`
+*   `Monocle3`
+*   `Harmony`
+*   `CellChat`
+*   `SCENIC` (along with its dependency `AUCell`)
+*   `ArchR`
+*   `GSVA`
+*   `inferCNV`
+*   `velocyto.R` (note: some workflows might use the Python command-line tool `velocyto`)
+*   `SingleR`
+
+Please note that specific scripts or workflows might require additional R packages. Always check the `library()` calls at the beginning of each `.Rmd`, `.qmd`, or `.R` file to see the full list of required packages and install them if necessary.
+
+## Contributing
+
+This repository primarily serves as a personal collection of notes and scripts. However, suggestions or contributions are welcome. Please feel free to open an issue to discuss potential changes or submit a pull request.
