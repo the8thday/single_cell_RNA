@@ -1,0 +1,3847 @@
+---
+title: "GSE136831 data analysis"
+format: html
+editor: source
+---
+
+
+## GSE136831
+
+> Single-cell RNA-seq reveals ectopic and aberrant lung-resident cell populations in idiopathic pulmonary fibrosis
+
+这批数据还是满重要的。其就是IPFAtlas的数据源。
+
+不过这批数据和提供了rds文件也没什么差别。似乎这个数据集可以直接拿来用。
+
+主要利用这批数据，理清IPF细胞的组成和大概的占比。
+
+```{r}
+#| include: false
+
+library(tidyverse)
+library(SingleCellExperiment)
+library(Seurat)
+# library(BPCells) # Efficient storage of single cell datasets via bitpacking compression
+# library(SeuratWrappers)
+
+# library(miloR)
+# library(ROGUE) # 一万年没更新了
+
+library(scCustomize)
+# library(SCP)
+# library(ggsc)
+library(SCpubr)
+
+#LLM
+# library(ceLLama)
+# library(Azimuth)
+library(SingleR)
+
+library(patchwork)
+library(viridis)
+library(qs)
+library(fs)
+
+options(future.globals.maxSize = 40 * 1024^3)
+```
+
+
+为了和GEO中metadata的数据保持一致，修改如下参数as 0：
+现在不做filter和后来在做是一样的。
+```{r}
+data_dir <- file.path(here::here(), 'GSE136831')
+
+dd <- Read10X(
+  data.dir = data_dir,
+  gene.column = 2,
+  unique.features = TRUE
+)
+
+seurat_obj <- CreateSeuratObject(
+  counts = dd,
+  project = 'GSE136831',
+  min.cells = 0,
+  min.features = 0
+)
+
+seurat_obj
+```
+
+*add meta information*
+
+细胞层面的metadata。
+
+Subject_Identity即是78例样本。
+
+```{r}
+
+sample_info <- read.delim(
+  './GSE136831/GSE136831_AllCells.Samples.CellType.MetadataTable.txt',
+  row.names = 1
+)
+
+sample_info %>% head()
+
+dim(sample_info)
+
+all(sample_info$Subject_Identity == sample_info$Library_Identity)
+```
+
+```{r}
+sample_info <- sample_info[colnames(seurat_obj), , drop = FALSE]
+
+seurat_obj <- AddMetaData(seurat_obj,
+                          metadata = sample_info
+                          )
+```
+
+
+样本层面的信息：
+```{r}
+geoquery_data <- read_csv(
+  './GSE136831/geoquery_metadata.csv'
+) %>% 
+  dplyr::select(-source_name_ch1)
+
+geoquery_data
+```
+
+```{r}
+geoquery_data %>% janitor::tabyl(disease)
+
+# skimr::skim(geoquery_data)
+```
+
+
+```{r}
+#| eval: true
+
+# 对于很多数据的情况何以直接join
+# 创建样本级元数据框（行名 = 样本 ID）
+# sample_metadata <- metadata_clean %>%
+#   column_to_rownames("title")  # 将 title 设为行名
+
+# 根据 orig.ident 将样本元数据合并到细胞元数据
+seurat_obj@meta.data <- seurat_obj@meta.data %>%
+  rownames_to_column("cell_id") %>%  # 临时将细胞 ID 作为列
+  left_join(
+    geoquery_data,  # 将行名（样本 ID）转为列
+    by = c("Subject_Identity"='title')
+  ) %>%
+  column_to_rownames("cell_id")  # 恢复行名为细胞 ID
+```
+
+
+
+```{r}
+seurat_obj$sample <- seurat_obj$Subject_Identity
+seurat_obj$orig.ident <- seurat_obj$sample
+# seurat_obj <- seurat_obj[, order(seurat_obj@meta.data$group)]
+
+merged_seurat <- seurat_obj
+```
+
+
+```{r}
+head(seurat_obj@active.ident)
+# or
+head(Idents(seurat_obj))
+
+```
+
+## QC
+
+```{r}
+Idents(merged_seurat) <- 'orig.ident'
+```
+
+
+```{r}
+merged_seurat <- scCustomize ::Add_Cell_QC_Metrics(object = merged_seurat, 
+                                                   species = "human")
+```
+
+
+```{r}
+# All functions contain
+p1 <- QC_Plots_Genes(seurat_object = merged_seurat, low_cutoff = 600, high_cutoff = 5500,
+                     group.by = 'orig.ident'
+                     )
+p2 <- QC_Plots_UMIs(seurat_object = merged_seurat, low_cutoff = 1200, high_cutoff = 45000)
+p3 <- QC_Plots_Mito(seurat_object = merged_seurat, high_cutoff = 20)
+p4 <- QC_Plots_Complexity(seurat_object = merged_seurat, high_cutoff = 0.8)
+
+# wrap_plots(p1, p2, ncol = 2)
+# 
+# wrap_plots(p3, p4, ncol = 2)
+
+p1
+p2
+```
+
+```{r}
+p3
+
+p4
+```
+
+
+```{r}
+QC_Plots_Combined_Vln(seurat_object = merged_seurat, feature_cutoffs = c(600, 5500), 
+                      UMI_cutoffs = c(1200,45000), 
+                      mito_cutoffs = 20, pt.size = 0.0)
+```
+
+
+```{r}
+# 针对metadata的一些质控
+
+metadata <- merged_seurat@meta.data
+
+metadata$cells <- rownames(metadata)
+
+# Rename columns
+metadata <- metadata %>%
+  dplyr::rename(
+    seq_folder = orig.ident,
+    # nUMI = nCount_RNA,
+    # nGene = nFeature_RNA
+  )
+```
+
+
+Visualize the number of cell counts per sample
+
+什么鬼，为什么这么少的细胞
+
+```{r}
+# Visualize the number of cell counts per sample
+metadata %>%
+  ggplot(aes(x = sample, fill = sample)) +
+  geom_bar() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  theme(legend.position = "none") +
+  ggtitle("NCells")
+```
+
+
+The UMI counts per cell should generally be above 500, that is the low end of what we expect. If UMI counts are between 500-1000 counts, it is usable but the cells probably should have been sequenced more deeply.
+
+```{r}
+# Visualize the number UMIs/transcripts per cell
+metadata %>%
+  ggplot(aes(color = sample, x = nUMI, fill = sample)) +
+  geom_density(alpha = 0.2) +
+  scale_x_log10() +
+  theme_classic() +
+  ylab("Cell density") +
+  theme(legend.position = "none") +
+  geom_vline(xintercept = 500)
+```
+
+
+
+Genes detected per cell. For high quality data, the proportional histogram should contain a single large peak that represents cells that were encapsulated.
+
+```{r}
+# Visualize the distribution of genes detected per cell via histogram
+metadata %>%
+  ggplot(aes(color = sample, x = nGene, fill = sample)) +
+  geom_density(alpha = 0.2) +
+  theme_classic() +
+  theme(legend.position = "none") +
+  scale_x_log10() +
+  geom_vline(xintercept = 300)
+```
+
+
+The novelty score is computed by taking the ratio of nGenes over nUMI. Generally, we expect the novelty score to be above 0.80 for good quality cells.
+
+```{r}
+# Visualize the overall complexity of the gene expression by visualizing the genes detected per UMI (novelty score)
+metadata %>%
+  ggplot(aes(x = log10GenesPerUMI, color = sample, fill = sample)) +
+  geom_density(alpha = 0.2) +
+  theme_classic() +
+  theme(legend.position = "none") +
+  geom_vline(xintercept = 0.8)
+```
+
+This metric can identify whether there is a large amount of mitochondrial contamination from dead or dying cells. We define poor quality samples for mitochondrial counts as cells which surpass the 0.2 mitochondrial ratio mark, unless of course you are expecting this in your sample.
+
+
+```{r}
+# Visualize the distribution of mitochondrial gene expression detected per cell
+metadata %>%
+  ggplot(aes(color = sample, x = percent_mito , fill = sample)) +
+  geom_density(alpha = 0.2) +
+  scale_x_log10() +
+  theme_classic() +
+  theme(legend.position = "none") +
+  geom_vline(xintercept = 20)
+```
+
+
+```{r}
+# Visualize the distribution of  detected per cell
+metadata %>%
+  ggplot(aes(color = sample, x = percent_ribo, fill = sample)) +
+  geom_density(alpha = 0.2) +
+  scale_x_log10() +
+  theme_classic() +
+  theme(legend.position = "none") +
+  geom_vline(xintercept = 20)
+```
+
+```{r}
+# All functions contain
+QC_Plot_UMIvsGene(
+  seurat_object = merged_seurat, low_cutoff_gene = 600,
+  high_cutoff_gene = 5500, low_cutoff_UMI = 500,
+  high_cutoff_UMI = 50000
+)
+QC_Plot_GenevsFeature(
+  seurat_object = merged_seurat,
+  feature1 = "percent_mito", low_cutoff_gene = 600,
+  high_cutoff_gene = 5500, high_cutoff_feature = 20
+)
+```
+
+
+### Filtering
+
+#### Cell-level filtering
+
+Cells with less than 1000 transcripts profiled or more than 20% of their transcriptome of mitochondrial origin were then removed. The average number of cells returned per library is 2925 (±1811.852). 
+
+```{r}
+# filtered_seurat[["RNA"]] <- split(filtered_seurat[["RNA"]], 
+#                                   f = filtered_seurat$sample)
+```
+
+
+```{r}
+filtered_seurat <- subset(
+  x = merged_seurat,
+  subset = (nCount_RNA >= 300) &
+    (nFeature_RNA >= 1000) &
+    (log10GenesPerUMI > 0.80) &
+    (percent_mito < 20)
+)
+
+filtered_seurat # 过滤掉的很少呀
+```
+
+#### gene-level filtering
+
+keep only genes which are expressed in 10 or more cells.
+
+```{r}
+# Extract counts
+counts <- GetAssayData(object = filtered_seurat, layer = "counts")
+# Output a logical vector for every gene on whether the more than zero counts per cell
+nonzero <- counts > 0
+# Sums all TRUE values and returns TRUE if more than 10 TRUE values per gene
+keep_genes <- Matrix::rowSums(nonzero) >= 10
+# Only keeping those genes expressed in more than 10 cells
+filtered_counts <- counts[keep_genes, ]
+# Reassign to filtered Seurat object
+filtered_seurat <- CreateSeuratObject(filtered_counts, meta.data = filtered_seurat@meta.data)
+```
+
+
+### doublet
+
+```{r}
+library(scDblFinder)
+require(BiocParallel)
+
+# 转换为 SingleCellExperiment
+sce <- as.SingleCellExperiment(filtered_seurat)
+
+# 运行 scDblFinder（假设样本信息列名为 "orig.ident"）
+sce <- scDblFinder(sce,
+  samples = colData(sce)$orig.ident,
+  # clusters = "seurat_clusters",
+  BPPARAM = MulticoreParam(4)
+)
+
+filtered_seurat$scDblFinder.score <- sce$scDblFinder.score
+filtered_seurat$scDblFinder.class <- sce$scDblFinder.class
+
+filtered_seurat$doublet_rate <- sum(filtered_seurat$scDblFinder.class == "doublet") / ncol(filtered_seurat)
+
+ggplot(
+  as.data.frame(sce$scDblFinder.score),
+  aes(x = `sce$scDblFinder.score`)
+) +
+  geom_histogram(bins = 50) +
+  labs(title = "Doublet Score Distribution")
+
+
+```
+
+```{r}
+19917/(19917 + 250421)
+```
+
+
+```{r}
+# Step 4: 过滤双细胞（可选）
+filtered_seurat <- subset(filtered_seurat, subset = scDblFinder.class == "singlet")
+
+filtered_seurat
+```
+
+
+
+#### 通过PCA确定cell cycle是否需要在SCTransform中regress out
+
+
+
+```{r}
+#| eval: true
+
+# Normalize the counts
+# 此时的normalization还比较的粗糙，利用默认的log方式
+filtered_seurat <- NormalizeData(filtered_seurat)
+
+# Identify the most variable genes
+filtered_seurat <- FindVariableFeatures(filtered_seurat,
+  selection.method = "vst",
+  nfeatures = 2000,
+  verbose = FALSE
+)
+
+# Scale the counts
+filtered_seurat <- ScaleData(filtered_seurat)
+
+# Score cells for cell cycle
+# filtered_seurat <- CellCycleScoring(filtered_seurat,
+#   g2m.features = cc.genes.updated.2019$g2m.genes,
+#   s.features = cc.genes.updated.2019$s.genes
+# )
+
+# Perform PCA
+filtered_seurat <- RunPCA(filtered_seurat)
+
+# perform TSNE, UMAP
+filtered_seurat <- RunUMAP(filtered_seurat, dims = 1:20)
+filtered_seurat <- RunTSNE(object = filtered_seurat, dims = 1:20, 
+                           do.fast = TRUE)
+
+# Plot the PCA colored by cell cycle phase
+DimPlot(filtered_seurat,
+  reduction = "pca",
+  group.by = "Phase",
+  split.by = "Phase"
+)
+```
+
+
+```{r}
+here::here()
+```
+
+
+```{r}
+qs::qsave(filtered_seurat, "./GSE136831/filtered_seurat_doublet.qs")
+
+# filtered_seurat <- qs::qread("./GSE136831/filtered_seurat.qs")
+
+filtered_seurat <- qs::qread("./GSE136831/filtered_seurat_doublet.qs")
+```
+
+
+```{r}
+# filtered_seurat <- JoinLayers(filtered_seurat)
+```
+
+### SCTransform
+
+```{r}
+#| eval: false
+
+library(future)
+
+plan("multicore", workers = 4) # unix-based
+# plan(multisession, workers = 4) # on Windows
+
+parallel::detectCores()
+
+options(future.globals.maxSize = 64 * 1024^3)
+
+# plan(sequential)  # 关闭并行计算
+
+```
+
+
+
+```{r}
+# SCTranform
+# 512G的内存都不够用的，这一步的意义到底是什么呀。
+
+options(future.globals.maxSize = 64 * 1024^3)
+
+merged_seurat <- SCTransform(filtered_seurat, 
+                            method = "glmGamPoi",
+                            new.assay.name = "SCT",
+                            vars.to.regress = c("percent_mito"),
+                            # vars.to.regress = c("percent_ribo"),
+                            assay = "RNA", # Name of assay to pull the count data from
+                            vst.flavor = "v2",
+                            # conserve.memory= True,
+                            return.only.var.genes = TRUE,
+                            verbose = TRUE
+                            )
+```
+
+```{r}
+
+# Check which assays are stored in objects
+DefaultAssay(merged_seurat)
+```
+
+
+```{r}
+# qs::qsave(merged_seurat, "./GSE136831/merged_seurat.qs")
+
+# Load the split seurat object into the environment
+merged_seurat <- qs::qread("./GSE136831/merged_seurat.qs")
+```
+
+
+
+### harmony整合
+
+其实在做整合之时，按照sample信息进行split也是不错甚至更好的选择。
+
+```{r}
+p.compare <- patchwork::wrap_plots(
+  ncol = 3,
+  DimPlot(merged_seurat, reduction = 'pca', group.by = 'orig.ident') + NoAxes() + ggtitle('before PCA'),
+  # DimPlot(merged_seurat, reduction = 'tsne', group.by = 'orig.ident') + NoAxes() + ggtitle('before tsne'),
+  DimPlot(merged_seurat, reduction = 'umap', group.by = 'orig.ident') + NoAxes() + ggtitle('before umap')
+)
+
+p.compare
+```
+
+
+```{r}
+library(harmony)
+```
+
+
+
+```{r}
+merged_seurat <- RunPCA(merged_seurat, npcs = 50, verbose = FALSE)
+
+
+```
+
+find the best PCA dim number, 防止过拟合等等。
+
+```{r}
+ElbowPlot(merged_seurat, ndims = 50)
+
+scCustomize::PC_Plotting(seurat_object = merged_seurat, dim_number = 2)
+
+```
+
+```{r}
+# 理论上和上面的代码结果应该一致
+
+harmonized_seurat <- harmony::RunHarmony(merged_seurat,
+  group.by.vars = c("sample"),
+  reduction.use = "pca",
+  assay.use = "SCT",
+  reduction.save = "harmony",
+  plot_convergence = TRUE
+)
+```
+
+
+
+```{r}
+
+set.seed(123)
+
+harmonized_seurat <- RunUMAP(harmonized_seurat,
+  reduction = "harmony",
+  assay = "SCT",
+  dims = 1:20
+)
+
+harmonized_seurat <- RunTSNE(harmonized_seurat,
+  reduction = "harmony",
+  assay = "SCT",
+  dims = 1:20,
+  verbose = FALSE
+)
+
+DefaultAssay(harmonized_seurat)
+```
+
+
+```{r}
+# 校正前的PCA结果（按样本着色）
+p1 <- DimPlot_scCustom(harmonized_seurat, reduction = "pca", group.by = "orig.ident") + 
+  ggtitle("Before Harmony (PCA)") + NoLegend()
+
+# 校正后的Harmony结果（按样本着色）
+p2 <- DimPlot_scCustom(harmonized_seurat, reduction = "harmony", group.by = "orig.ident") + 
+  ggtitle("After Harmony") + NoLegend()
+
+# 联合展示
+p1
+
+p2
+```
+
+
+
+## Clustering
+
+Seurat uses a graph-based clustering approach using a K-nearest neighbor approach, and then attempts to partition this graph into highly interconnected 'quasi-cliques' or 'communities'.
+
+
+```{r}
+
+set.seed(123)
+
+
+harmonized_seurat <- FindNeighbors(
+  object = harmonized_seurat,
+  reduction = "harmony",
+  dims = 1:20
+)
+
+# Determine the clusters for various resolutions
+harmonized_seurat <- FindClusters(
+  object = harmonized_seurat,
+  resolution = seq(0.1, 1, 0.1)
+)
+```
+
+
+```{r}
+# 可视化聚类结果
+p1 <- DimPlot_scCustom(harmonized_seurat, reduction = "umap", label = TRUE) + 
+  ggtitle("Clusters")
+p2 <- DimPlot_scCustom(harmonized_seurat, reduction = "umap", group.by = "sample") + 
+  ggtitle("Sample") + NoLegend()
+
+
+p1 
+
+p2
+# p3 + p4
+```
+
+
+```{r}
+# 不同分辨率情况下的细胞聚类情况
+
+require(clustree)
+
+clustree::clustree(harmonized_seurat, prefix = "SCT_snn_res.")
+```
+
+
+```{r}
+Idents(object = harmonized_seurat) <- "SCT_snn_res.0.1"
+
+DimPlot_scCustom(harmonized_seurat,
+  reduction = "umap",
+  label = TRUE,
+  label.size = 6
+)
+```
+
+粗略的看下四类的分组。
+
+
+```{r}
+
+Idents(object = harmonized_seurat) <- "SCT_snn_res.0.8"
+
+
+# Plot the UMAP
+DimPlot_scCustom(harmonized_seurat,
+  reduction = "umap",
+  label = TRUE,
+  label.size = 6
+)
+```
+
+### Cell Annotation
+
+```{r}
+
+
+# Single-cell RNA sequencing reveals profibrotic roles of distinct epithelial and mesenchymal lineages in pulmonary fibrosis
+# 不过分的太细的也没有必要吧
+paper1_markers <- list(
+  
+  # 上皮细胞 (Epithelial Cells)
+  "Epithelial_Cells" = list(
+    positive_markers = c("EPCAM"),
+    negative_markers = NULL,
+    comment = "通用上皮细胞标记"
+  ),
+  
+  "AT1" = list(
+    positive_markers = c("AGER", "PDPN"),
+    negative_markers = NULL,
+    comment = "肺泡1型细胞，参与气体交换"
+  ),
+  
+  "AT2" = list(
+    positive_markers = c("SFTPC", "ABCA3", "SFTPCD"),
+    negative_markers = NULL,
+    comment = "肺泡2型细胞，分泌表面活性物质"
+  ),
+  
+  "Transitional_AT2" = list(
+    positive_markers = c("SFTPC(low)", "AGER(low)"),
+    negative_markers = NULL,
+    comment = "过渡态AT2细胞，可能具有分化潜能"
+  ),
+  
+  "Basal" = list(
+    positive_markers = c("KRT5", "KRT17"),
+    negative_markers = c("COL1A1"),
+    comment = "基底细胞，上皮干细胞"
+  ),
+  
+  "KRT5-_KRT17+" = list(
+    positive_markers = c("KRT17", "COL1A1"),
+    negative_markers = c("KRT5"),
+    comment = "KRT5阴性/KRT17阳性细胞群"
+  ),
+  
+  "MUC5B+" = list(
+    positive_markers = c("MUC5B", "SCGB1A1"),
+    negative_markers = NULL,
+    comment = "分泌黏蛋白MUC5B的杯状细胞"
+  ),
+  
+  "MUC5AC+_High" = list(
+    positive_markers = c("MUC5AC"),
+    negative_markers = NULL,
+    comment = "高表达MUC5AC的杯状细胞"
+  ),
+  
+  "SCGB3A2+" = list(
+    positive_markers = c("SCGB3A2"),
+    negative_markers = c("SCGB1A1"),
+    comment = "分泌球蛋白SCGB3A2的克拉拉细胞"
+  ),
+  
+  "SCGB3A2+_SCGB1A1+" = list(
+    positive_markers = c("MGP", "SCGB1A1", "SCGB3A2"),
+    negative_markers = NULL,
+    comment = "共表达SCGB3A2和SCGB1A1的细胞亚群"
+  ),
+  
+  "Ciliated" = list(
+    positive_markers = c("FOXJ1", "TMEM190", "CAPS", "HYDIN"),
+    negative_markers = NULL,
+    comment = "纤毛细胞，负责气道黏液清除"
+  ),
+  
+  "Differentiating_Ciliated" = list(
+    positive_markers = c("FOXJ1", "SFTPB"),
+    negative_markers = NULL,
+    comment = "分化中的纤毛细胞"
+  ),
+  
+  "Proliferating_Epithelial" = list(
+    positive_markers = c("MKI67", "CDK1"),
+    negative_markers = NULL,
+    comment = "增殖态上皮细胞（细胞周期活跃）"
+  ),
+  
+  # 免疫细胞 (Immune Cells)
+  "Immune_Cells" = list(
+    positive_markers = c("PTPRC"),
+    negative_markers = NULL,
+    comment = "通用免疫细胞标记（CD45）"
+  ),
+  
+  "T_Cells" = list(
+    positive_markers = c("CD3E", "FOXP3", "IL7R", "CD8A", "CCL5"),
+    negative_markers = NULL,
+    comment = "T淋巴细胞（包括调节性T细胞、CD8+ T细胞等）"
+  ),
+  
+  "NK_Cells" = list(
+    positive_markers = c("NCR1", "KLRB1", "NKG7(high)"),
+    negative_markers = c("CD3E"),
+    comment = "自然杀伤细胞（CD3E阴性）"
+  ),
+  
+  "Macrophages" = list(
+    positive_markers = c("LYZ", "MARCO", "FCGR1A", "C1QA", "APOC1"),
+    negative_markers = NULL,
+    comment = "巨噬细胞（包括肺泡巨噬细胞）"
+  ),
+  
+  "Monocytes" = list(
+    positive_markers = c("S100A12", "FCN1", "S100A9", "LYZ", "CD14"),
+    negative_markers = NULL,
+    comment = "单核细胞（外周血来源）"
+  ),
+  
+  "cDCs" = list(
+    positive_markers = c("FCER1A", "CD1C", "CLEC9A"),
+    negative_markers = NULL,
+    comment = "经典树突状细胞"
+  ),
+  
+  "pDCs" = list(
+    positive_markers = c("LILRA4", "CLEC4C", "JCHAIN"),
+    negative_markers = NULL,
+    comment = "浆细胞样树突状细胞"
+  ),
+  
+  "Plasma_Cells" = list(
+    positive_markers = c("JCHAIN", "IGHG1", "IGLL5"),
+    negative_markers = NULL,
+    comment = "浆细胞（抗体分泌细胞）"
+  ),
+  
+  "B_Cells" = list(
+    positive_markers = c("MS4A1", "CD19", "CD79A"),
+    negative_markers = NULL,
+    comment = "B淋巴细胞"
+  ),
+  
+  "Mast_Cells" = list(
+    positive_markers = c("CPA3", "KIT"),
+    negative_markers = NULL,
+    comment = "肥大细胞"
+  ),
+  
+  "Proliferating_T_Cells" = list(
+    positive_markers = c("MKI67", "CDK1", "CD3E"),
+    negative_markers = NULL,
+    comment = "增殖态T细胞"
+  ),
+  
+  "Proliferating_Macrophages" = list(
+    positive_markers = c("MKI67", "CDK1", "LYZ"),
+    negative_markers = NULL,
+    comment = "增殖态巨噬细胞"
+  ),
+  
+  # 内皮细胞 (Endothelial Cells)
+  "Endothelial_Cells" = list(
+    positive_markers = c("PECAM1", "VWF"),
+    negative_markers = c("PTPRC"),
+    comment = "血管内皮细胞（CD31和血管性血友病因子阳性）"
+  ),
+  
+  "Lymphatic_Endothelial" = list(
+    positive_markers = c("CCL21"),
+    negative_markers = NULL,
+    comment = "淋巴管内皮细胞"
+  ),
+  
+  # 间充质细胞 (Mesenchymal Cells)
+  "Mesenchymal_Cells" = list(
+    positive_markers = NULL,
+    negative_markers = c("EPCAM", "PTPRC", "PECAM1"),
+    comment = "通用间充质细胞标记（排除上皮、免疫、内皮）"
+  ),
+  
+  "Smooth_Muscle_Cells" = list(
+    positive_markers = c("ACTA2(high)", "MYH11", "PDGFRB(high)"),
+    negative_markers = c("LUM", "PDGFRA"),
+    comment = "平滑肌细胞（高表达α-SMA和肌球蛋白）"
+  ),
+  
+  "Mesothelial_Cells" = list(
+    positive_markers = c("WT1", "UPK3B"),
+    negative_markers = c("LUM"),
+    comment = "间皮细胞（体腔表面细胞）"
+  ),
+  
+  "Myofibroblasts" = list(
+    positive_markers = c("LUM", "PDGFRA", "ACTA2", "MYLK"),
+    negative_markers = NULL,
+    comment = "肌成纤维细胞（兼具成纤维和平滑肌特征）"
+  ),
+  
+  "HAS1_High_Fibroblasts" = list(
+    positive_markers = c("LUM", "PDGFRA", "HAS1", "TWIST"),
+    negative_markers = c("PLIN2"),
+    comment = "高表达HAS1的成纤维细胞亚群"
+  ),
+  
+  "Fibroblasts" = list(
+    positive_markers = c("LUM", "PDGFRA"),
+    negative_markers = NULL,
+    comment = "普通成纤维细胞"
+  ),
+  
+  "PLIN2+_Fibroblasts" = list(
+    positive_markers = c("LUM", "PDGFRA", "PLIN2"),
+    negative_markers = NULL,
+    comment = "脂滴相关蛋白PLIN2阳性的成纤维细胞"
+  )
+)
+
+# 使用示例：提取AT2细胞的标记基因
+# cell_markers[["AT2"]]$positive_markers
+
+
+# DeepSeek 
+IPF_markers <- list(
+  # 1. 肺泡上皮细胞 (Alveolar Epithelial Cells) -----
+  "AT1" = c("AGER", "CAV1", "PDPN", "CLIC5"),             # I型肺泡细胞标记：AGER(气体交换), CLIC5(氯离子通道)
+  "AT2" = c("SFTPC", "SFTPA1", "LAMP3", "ABCA3"),         # II型肺泡细胞标记：SFTPC(表面活性物质), ABCA3(板层小体)
+  "AT2_IPF" = c("KRT8", "KRT18", "SOX4"),                 # IPF中异常AT2细胞：KRT8(上皮间质转化)
+
+  # 2. 气道上皮细胞 (Airway Epithelial Cells) -----
+  "Ciliated" = c("FOXJ1", "TUBA1A", "DNAH5", "PIFO"),      # 纤毛细胞：FOXJ1(纤毛生成主调控因子)
+  "Goblet" = c("MUC5B", "SPDEF", "FOXA3"),                # 杯状细胞：MUC5B(IPF风险基因)
+  "Basal" = c("KRT5", "TP63", "KRT17"),                   # 基底细胞：TP63(干细胞标记)
+  "Club" = c("SCGB1A1", "SCGB3A1", "CYP2F2"),             # Club细胞：SCGB1A1(分泌蛋白)
+
+  # 3. 成纤维细胞亚群 (Fibroblasts) -----
+  "Myofibroblast" = c("ACTA2", "POSTN", "COL1A1", "TAGLN"), # 肌成纤维细胞：ACTA2(α-SMA, 收缩蛋白)
+  "IPF_Fibro" = c("FAP", "THY1", "COMP", "MMP11"),         # IPF特异性成纤维细胞：FAP(成纤维激活蛋白)
+  "Mesothelial" = c("WT1", "MSLN", "UPK3B"),               # 间皮细胞：WT1(间皮特异性转录因子)
+
+  # 4. 免疫细胞 (Immune Cells) -----
+  "Macrophage" = c("CD68", "MARCO", "APOE", "FABP4"),      # 巨噬细胞：MARCO(肺泡巨噬标记)
+  "Monocyte" = c("CD14", "S100A8", "VCAN"),               # 单核细胞：S100A8(促炎钙结合蛋白)
+  "Neutrophil" = c("S100A8", "S100A9", "FCGR3B"),         # 中性粒细胞：S100A8/A9(炎症标记)
+  "CD8_T" = c("CD8A", "GZMB", "IFNG", "CXCR3"),           # CD8+ T细胞：GZMB(颗粒酶B, 细胞毒性)
+  "Treg" = c("FOXP3", "IL2RA", "CTLA4"),                  # 调节性T细胞：FOXP3(免疫抑制)
+
+  # 5. 内皮细胞 (Endothelial Cells) -----
+  "EC_General" = c("PECAM1", "CDH5", "VWF"),              # 通用内皮标记：PECAM1(CD31)
+  "EC_Angio" = c("PLVAP", "ACKR1", "ANGPT2"),             # 促血管生成内皮细胞：PLVAP(血管通透性)
+  
+  # 6. 其他 (Others) -----
+  "Pericyte" = c("PDGFRB", "CSPG4", "RGS5"),              # 周细胞：PDGFRB(血小板衍生生长因子受体)
+  "Mast" = c("TPSAB1", "CPA3", "KIT")                     # 肥大细胞：TPSAB1(类胰蛋白酶)
+)
+
+# 罗西应该就是上一篇文章整理的
+marker_genes_luoxi <- list(
+  "AT1" = c("AGER", "PDPN"),
+  "AT2" = c("SFTPC", "ABCA3", "SFTPD"),
+  "Transitional AT2" = c("SFTPC", "AGER"),
+  "Basal" = c("KRT5", "KRT17"),
+  "KRT5-/KRT17+" = c("KRT17", "COL1A1"),
+  "MUC5B+" = c("MUC5B", "SCGB1A1"),
+  "MUC5AC+ High" = c("MUC5AC"),
+  "SCGB3A2+" = c("SCGB3A2"),
+  "SCGB3A2+ SCGB1A1+" = c("MGP", "SCGB1A1", "SCGB3A2"),  # 修正 MGp → MGP
+  "Ciliated" = c("FOXJ1", "TMEM190", "CAPS"),
+  "Differentiating Ciliated" = c("FOXJ1", "SFTPB"),
+  "Proliferating Epithelial Cells" = c("MKI67", "CDK1"),  # 修正 MKT67 → MKI67
+  "T cells" = c("CD3E", "FOXP3", "IL7R"),                 # 修正 F0XP3 → FOXP3
+  "NK Cells" = c("NCR1", "KLRB1", "NKG7"),                # 修正 NCRI → NCR1
+  "Macrophages" = c("LYZ", "MARCO", "FCGR1A"),            # 修正 FCGRIA → FCGR1A
+  "Monocytes" = c("S100A12", "FCN1", "S100A9"),
+  "CDCs" = c("FCER1A", "CD1C", "CLEC9A"),                 # 修正 FCERIA → FCER1A
+  "DDCs" = c("LILRA4", "CLEC4C", "JCHAIN"),               # 修正 LLRA4 → LILRA4
+  "Plasma Cells" = c("JCHAIN", "TNFRSF13B", "IGLL5"),     # 修正 TGHG1 → TNFRSF13B
+  "B cells" = c("MS4A1", "CD19", "CD79A"),
+  "Mast Cells" = c("CPA3", "KIT"),
+  "Proliferating T Cells" = c("MKI67", "CDK1", "CD3E"),   # 修正 MKT67 → MKI67
+  "Proliferating Macrophages" = c("MKI67", "CDK1", "LYZ"),# 修正 MKT67 → MKI67
+  "Endothelial Cells" = c("VWF", "PECAM1"),
+  "Lymphatic Endothelial Cells" = c("CCL21"),
+  "Smooth Muscle Cells" = c("ACTA2", "MYH11", "PDGFRB"),
+  "Mesothelial Cells" = c("WT1", "UPK3B"),                # 修正 VVT1 → WT1
+  "Myofibroblasts" = c("LUM", "PDGFRA", "ACTA2"),
+  "HAS1 High Fibroblasts" = c("LUM", "PDGFRA", "HAS1"),
+  "Fibroblasts" = c("LUM", "PDGFRA"),
+  "PLIN2+ Fibroblasts" = c("LUM", "PDGFRA", "PLIN2")
+)
+
+
+# this paper
+paper2_markergene <- list(
+  'Epithelial Cells' = c('EPCAM'),
+  'Stromal Cells' = c('VIM', 'ACTA2'),
+  'Myeloid Cells' = c('CD14', 'LYZ'),
+  'Lymphoid Cells' = c('CD3D', 'CD45'),
+  'Immune Cells' = c('PTPRC', 'CD19'),
+  'Endothelial' = c('PECAM1')
+)
+```
+
+Recursive clustering analysis of subpopulations of pure immune (PTPRC+), epithelial and the remaining mesenchymal populations were conducted to improve the granularity of our cell annotations.
+
+这篇文章的marker基因的参考意义，感觉不是很大，其还是以`FindAllMarkers`的结果为
+主要细胞注释类型。还有其的DOR的方法。而且其附件中所提供的也是FindAllMarkers的结果。
+
+Epithelial cells were identified as EPCAM+ and isolated from the whole lung set. The epithelial cell types were annotated by identifying the clusters expressing the following marker genes: basal: KRT5, KRT17; aberrant basaloid: COL1A1, KRT17; mucous: MUC5AC; club: SCGB3A2; ciliated: TPPP3; AT1: AGER; AT2: SFTPC, SFTPA1, ionocytes: FOXI1.
+
+```{r}
+scCustomize::FeaturePlot_scCustom(harmonized_seurat, 
+            features = paper2_markergene %>% unlist(),
+            reduction = "umap", 
+            # ncol = 4
+            # na_cutoff = NULL
+            ) +
+  NoLegend()
+```
+
+四个细胞亚群的大分组，参考GSE135893
+```{r}
+scCustomize::FeaturePlot_scCustom(harmonized_seurat, 
+            features = c('EPCAM', 'PTPRC', 'PECAM1', 'VWF'),
+            reduction = "umap", 
+            # ncol = 4
+            # na_cutoff = NULL
+            ) +
+  NoLegend()
+```
+
+
+```{r}
+
+```
+
+```{r}
+DimPlot_scCustom(harmonized_seurat,
+  reduction = "umap",
+  label = TRUE,
+  label.size = 6,
+  group.by = 'CellType_Category'
+)
+
+# 文章里所说的38/39种细胞
+DimPlot_scCustom(harmonized_seurat,
+  reduction = "umap",
+  label = TRUE,
+  label.size = 4,
+  group.by = 'Manuscript_Identity'
+) + NoLegend()
+
+DimPlot_scCustom(harmonized_seurat,
+  reduction = "umap",
+  label = TRUE,
+  label.size = 2,
+  group.by = 'Subclass_Cell_Identity'
+) + NoLegend()
+```
+
+`通过和文章中的marker基因进行对比，这几个marker还是可以的。`
+
+`这个文章最为重要的作用，可以考虑用来验证marker基因`
+AT1: AGER
+ATII: SFTPC,ABCA3
+
+```{r}
+
+
+scCustomize::FeaturePlot_scCustom(harmonized_seurat, 
+            # features = IPF_markers$AT2, 
+            features = paper1_markers$Ciliated$positive_markers,
+            reduction = "umap", 
+            # ncol = 4
+            ) +
+  NoLegend()
+```
+
+
+如果对哪个基因的表达不是很清晰，可以进一步的查看对应基因的表达。
+```{r}
+Plot_Density_Custom(seurat_object = harmonized_seurat, 
+                    features = "VIM"
+                    )
+
+Cluster_Highlight_Plot(
+  seurat_object = harmonized_seurat,
+  cluster_name = "17",
+  highlight_color = "navy",
+  background_color = "lightgray"
+)
+```
+
+对metadata感兴趣的部分，都可以进行展示：
+Highlight Cells
+```{r}
+# 不过对于细胞表达值的选择需要注意
+
+# Get cell names
+ROCK1_sub <- WhichCells(object = harmonized_seurat, 
+                        expression = ROCK1 > 2)
+
+# Make into list
+cells <- list(ROCK1 = ROCK1_sub)
+
+# Plot
+Cell_Highlight_Plot(seurat_object = harmonized_seurat, 
+                    cells_highlight = cells)
+```
+
+
+`对于这篇文章，可以考虑先不进行细胞注释，参考文章里的内容。`
+```{r}
+# cluster2type <- c(
+#   '0' = 'ciliated_cells',
+#   '1' = 'secretory_cells'
+# )
+```
+
+`CellType_Category`
+`Subclass_Cell_Identity`
+```{r}
+Idents(object = harmonized_seurat) <- "Manuscript_Identity"
+```
+
+在完成了单细胞的mapping后, 做进一步的查看。
+
+```{r}
+#| eval: false
+
+
+
+harmonized_seurat@meta.data$cell_type <- cluster2type[as.character(harmonized_seurat@meta.data$SCT_snn_res.0.2)]
+
+DimPlot(harmonized_seurat, 
+        reduction = "umap", 
+        group.by  = "cell_type",
+        label = T)
+
+DimPlot_scCustom(seurat_object = harmonized_seurat)
+```
+
+
+Disease_Identity
+```{r}
+# Idents(harmonized_seurat) <- 'cell_type'
+
+DimPlot_scCustom(harmonized_seurat, 
+        label = TRUE, 
+        label.size = 2,
+        split.by = "Disease_Identity",
+        split_seurat = TRUE
+        )  + NoLegend()
+```
+
+
+### Marker identification
+
+```{r}
+harmonized_seurat <- PrepSCTFindMarkers(harmonized_seurat,
+  assay = "SCT",
+  verbose = TRUE
+)
+```
+
+
+*`read the final data here!!!!!!`*
+
+```{r}
+
+harmonized_seurat <- qs::qread("./GSE136831/harmonized_seurat.qs")
+
+# qs::qsave(harmonized_seurat, "./GSE136831/harmonized_seurat.qs")
+
+```
+
+
+```{r}
+# don't run! load data below
+
+# Idents(harmonized_seurat) <- 'cell_type'
+
+cluster_markers <- read_csv('./GSE136831/cluster_markers_SCT.csv')
+
+# cluster_markers <- FindAllMarkers(
+#   harmonized_seurat,
+#   only.pos = TRUE,
+#   min.pct = 0.25,
+#   logfc.threshold = 0.25
+# )
+
+# 提取top10标记基因
+top10 <- cluster_markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 10, order_by = avg_log2FC)
+
+top2 <- cluster_markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 2, order_by = avg_log2FC)
+
+top5 <- cluster_markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 5, order_by = avg_log2FC)
+```
+
+```{r}
+# cluster_markers |> write_csv('./GSE136831/cluster_markers_SCT.csv')
+
+# cluster_markers <- read_csv('./GSE136831/cluster_markers_SCT.csv')
+
+head(cluster_markers)
+```
+
+
+```{r}
+require(scRNAtoolVis)
+```
+
+
+### DotPlot or HeatMap in different condition
+
+绘制感兴趣的基因或者`FindAllMarkers`找到的marker基因按照condition条件的不同的
+DotPlot。`需不需要分细胞亚群？？？？`
+
+LMP2 → PSMB8
+LMP7 → PSMB9
+GLUT9 → SLC2A9
+IP6K → IP6K1/2/3(PPIP5K1)
+NHE3 -> SLC9A3
+CB1 -> CNR1
+PKCθ → PRKCQ
+ACTRⅡ → ACTR2
+CXCR7 => ACKR3
+DEFB4 -> DEFB4A
+PKM2 -> PKM
+```{r}
+# target_genes <- c('ROCK1', 'ROCK2', 'MAP3K19', 'CFD', 'CFB')
+
+target_genes <- c("CFD", "L1TD1", "SLC15A4", "GPR183", "PIM2", "PPL", "CXCR3", 
+"IRF5", "RHBDF2", "PPP1R15B", "F2RL1", "STAT6", "TREX2", "PRKCQ", 
+"VAV1", "CCR6", "PSMB8", "PSMB9", "CMKLR1", "KCNA3", "IRAK4", "VNN1", 
+"CFB", "KIT", "HK2", "EHMT2", "DNM1", "ACSS2", "TRPC5", "PDE4A", 
+"OGG1", "GPR75", "ACTR2", "PPIP5K1", "UCP1", "NOTCH1", "FAP", 
+"GPR68", "ACKR3", "FBXW7", "PKM", "QPCT", "S100A4", "RUNX2", 
+"PIEZO1", "PLA2G7", "LRP6", "DEFB4A", "SSTR4", "CNR1", "CACNA1B", 
+"MAP3K19", "P2RX4", "LPAR1", "ROCK1", "P2RX3", "TRPA1", "GZMK", 
+"ARPC2", "ANO1", "SLC2A9", "GPR65", "RBP4", "GADD45A", "EZH2", 
+"GPR4", "SLC9A3", "ROCK2", "IP6K1")
+```
+
+
+```{r}
+harmonized_seurat$group <- harmonized_seurat$Disease_Identity
+
+harmonized_seurat$cell_type = harmonized_seurat$Manuscript_Identity
+```
+
+
+```{r}
+p_1 <- SCpubr::do_DotPlot(sample = harmonized_seurat, 
+                        features = target_genes,
+                        group.by = 'group',
+                        cluster = TRUE
+                        )
+
+p_2 <- SCpubr::do_DotPlot(sample = harmonized_seurat, 
+                        features = target_genes,
+                        group.by = 'cell_type',
+                        cluster = TRUE
+                        )
+
+p_1
+
+p_2
+```
+
+
+FindAllMarker's results
+```{r}
+p_1 <- SCpubr::do_DotPlot(sample = harmonized_seurat, 
+                        features = top2$gene,
+                        group.by = 'group',
+                        cluster = TRUE
+                        )
+
+p_2 <- SCpubr::do_DotPlot(sample = harmonized_seurat, 
+                        features = top2$gene,
+                        group.by = 'cell_type',
+                        cluster = TRUE
+                        )
+
+p_1
+
+p_2
+```
+
+
+```{r}
+# Find markers and limit to those expressed in greater than 75% of target population
+all_markers <- cluster_markers %>%
+    Add_Pct_Diff() %>%
+    filter(pct_diff > 0.6)
+
+top_markers <- Extract_Top_Markers(marker_dataframe = all_markers, 
+                                   num_genes = 3, 
+                                   named_vector = FALSE,
+                                   make_unique = TRUE)
+
+Clustered_DotPlot(seurat_object = harmonized_seurat, 
+                  features = top_markers,
+                  show_ident_legend = FALSE
+                  )
+```
+
+
+In `scanpy`, there is a function to create a stacked violin plot.
+
+```{r}
+sample_colors <- c("forestgreen", "firebrick1", "dodgerblue")
+
+human_colors_list <- c("navy", "forestgreen", "darkorange2", 
+                       "darkorchid3", "dodgerblue", "orchid","orange", "gold", "gray")
+
+# Create Plots
+scCustomize::Stacked_VlnPlot(seurat_object = harmonized_seurat, 
+                             features = target_genes[1:5], 
+                             x_lab_rotate = TRUE,
+                             colors_use = sample_colors, 
+                             split.by = "group",
+                             plot_legend = TRUE
+                             ) -> p_1
+
+p_1
+```
+
+基因数目太多，循环绘制并保存
+```{r}
+# 定义颜色列表
+sample_colors <- c("forestgreen", "firebrick1", "dodgerblue")
+human_colors_list <- c("navy", "forestgreen", "darkorange2", 
+                       "darkorchid3", "dodgerblue", "orchid","orange", "gold", "gray")
+
+# 检查target_genes在seurat对象中是否存在
+available_genes <- target_genes[target_genes %in% rownames(harmonized_seurat)]
+if(length(available_genes) == 0) {
+  stop("没有找到目标基因，请检查基因名称是否正确。")
+}
+
+# 提示用户有哪些基因不存在
+missing_genes <- target_genes[!target_genes %in% rownames(harmonized_seurat)]
+if(length(missing_genes) > 0) {
+  cat("以下基因在seurat对象中不存在:\n")
+  cat(paste(missing_genes, collapse = ", "), "\n")
+}
+
+# 计算需要创建的图表数量
+genes_per_plot <- 5
+num_plots <- ceiling(length(available_genes) / genes_per_plot)
+
+# 创建PDF文件
+pdf(file = "./GSE136831/results/stacked_violin_plots.pdf", width = 12, height = 8)
+
+# 循环绘制图形
+for(i in 1:num_plots) {
+  # 确定当前批次的基因
+  start_idx <- (i-1) * genes_per_plot + 1
+  end_idx <- min(i * genes_per_plot, length(available_genes))
+  current_genes <- available_genes[start_idx:end_idx]
+  
+  # 绘制堆叠小提琴图
+  p <- scCustomize::Stacked_VlnPlot(
+    seurat_object = harmonized_seurat, 
+    features = current_genes, 
+    x_lab_rotate = TRUE,
+    colors_use = sample_colors, 
+    split.by = "group",
+    plot_legend = TRUE
+  )
+  
+  # 添加标题，显示当前绘制的是第几批基因
+  p <- p + ggtitle(paste0("基因 ", start_idx, " 至 ", end_idx, " (共", length(available_genes), "个)"))
+  
+  # 打印图形
+  print(p)
+}
+
+# 关闭PDF设备
+dev.off()
+
+cat("完成! 已生成", num_plots, "张图表，保存在 stacked_violin_plots.pdf 文件中。\n")
+```
+
+
+### 不同细胞亚群在不同分组条件下的统计分析
+
+这里主要是细胞数目和细胞占比的一些统计指标。
+
+```{r}
+SCP::CellStatPlot(harmonized_seurat, 
+             stat.by = "group", 
+             group.by = "Manuscript_Identity", 
+             label = TRUE)
+```
+
+```{r}
+SCpubr::do_BarPlot(
+  sample = harmonized_seurat,
+  group.by = "cell_type",
+  legend.position = "none",
+  plot.title = "Number of cells per cluster",
+  flip = TRUE,
+  order = TRUE
+)
+
+SCpubr::do_BarPlot(
+  sample = harmonized_seurat,
+  group.by = "cell_type",
+  split.by = 'group',
+  # legend.position = "none",
+  plot.title = "Number of cells per cluster",
+  flip = TRUE,
+  #order = TRUE,
+  position = "fill"
+)
+```
+
+
+`AT1` and `ATII` cell
+```{r}
+cluster_stats <- Cluster_Stats_All_Samples(seurat_object = harmonized_seurat)
+
+cluster_stats
+```
+
+
+
+```{r}
+Proportion_Plot(seurat_object = harmonized_seurat, plot_type = "bar")
+
+Proportion_Plot(seurat_object = harmonized_seurat, plot_type = "pie")
+```
+
+```{r}
+Proportion_Plot(seurat_object = harmonized_seurat, 
+                plot_type = "bar", split.by = "group")
+```
+
+
+```{r}
+# 对特定细胞类型进行组间比较
+metadata <- harmonized_seurat@meta.data
+celltype_of_interest <- "ATI"
+
+cell_type_counts <- table(metadata$sample[metadata$cell_type == celltype_of_interest])
+total_counts_per_sample <- table(metadata$sample)
+cell_type_counts <- cell_type_counts[names(total_counts_per_sample)]
+prop.test(as.numeric(cell_type_counts), as.numeric(total_counts_per_sample))
+```
+
+
+
+```{r}
+# use wilcox_test
+
+# 获取每个样本各细胞类型的数量
+cell_counts <- seurat_obj@meta.data %>%
+  dplyr::count(sample, group, cell_type, name = "n_cells")
+
+# 计算每个样本的总细胞数
+total_cells <- cell_counts %>% 
+  group_by(sample) %>% 
+  summarise(total = sum(n_cells))
+
+# 计算比例并合并数据
+cell_proportions <- cell_counts %>%
+  left_join(total_cells, by = "sample") %>%
+  mutate(proportion = n_cells / total) %>% 
+  dplyr::filter(n_cells > 1)
+  # dplyr::filter(cell_type != 'Aberrant_Basaloid')
+
+stat_results <- cell_proportions %>%
+  group_by(cell_type, group) %>%
+  filter(n() >= 2) %>%  # Ensure at least 2 observations per group
+  ungroup() %>%
+  group_by(cell_type) %>%
+  filter(n_distinct(group) == 2) %>%  # Ensure both groups are present
+  wilcox_test(proportion ~ group) %>%
+  adjust_pvalue(method = "BH") %>%
+  add_significance() %>%
+  add_xy_position(x = "condition", dodge = 0.8)
+
+# 查看结果
+print(stat_results, n = Inf)
+```
+
+
+```{r}
+# require(ggpubr)
+
+ggplot(cell_proportions, aes(x = group, y = proportion)) +
+  geom_boxplot(aes(fill = group), width = 0.6, show.legend = FALSE) +
+  geom_jitter(aes(color = group), width = 0.15, size = 2, alpha = 0.7) +
+  facet_wrap(~cell_type, scales = "free_y", ncol = 4) +
+  scale_fill_manual(values = human_colors_list) +
+  scale_color_manual(values = human_colors_list) +
+  labs(y = "Cell Proportion", x = "") +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.background = element_blank(),
+    panel.spacing = unit(1, "lines")
+  )
+```
+
+
+```{r}
+require(ggprism)
+require(ggrepel)
+
+#------------------------------------------------------------------
+# 第一部分：从Seurat对象中提取细胞类型和分组信息
+#------------------------------------------------------------------
+
+# 提取细胞类型和分组信息
+cell_data <- data.frame(
+  CellType = Idents(harmonized_seurat),  # 假设当前的Idents是细胞类型
+  Condition = harmonized_seurat$condition  # 假设'condition'是您的分组变量（disease/health）
+)
+
+# 确保分组变量是因子类型，并设置参考水平为"health"
+cell_data$Condition <- factor(cell_data$Condition, levels = c("nonUIP", "UIP"))
+
+#------------------------------------------------------------------
+# 第二部分：计算每个细胞类型在不同条件下的占比
+#------------------------------------------------------------------
+
+# 计算每个分组中各细胞类型的数量
+cell_counts <- cell_data %>%
+  group_by(Condition, CellType) %>%
+  summarise(n = n(), .groups = "drop")
+
+# 计算每个分组中的总细胞数
+total_cells <- cell_counts %>%
+  group_by(Condition) %>%
+  summarise(total = sum(n), .groups = "drop")
+
+# 合并数据并计算占比
+cell_proportions <- cell_counts %>%
+  left_join(total_cells, by = "Condition") %>%
+  mutate(proportion = n / total,
+         percentage = proportion * 100)
+
+#------------------------------------------------------------------
+# 第三部分：统计检验 - 使用Fisher精确检验
+#------------------------------------------------------------------
+
+# 创建一个数据框来存储所有细胞类型的统计结果
+stat_results <- data.frame()
+
+# 获取所有唯一的细胞类型
+cell_types <- unique(cell_data$CellType)
+
+# 对每个细胞类型进行Fisher精确检验
+for (cell_type in cell_types) {
+  # 创建2x2列联表：该细胞类型 vs 其他细胞类型，在两个条件下
+  contingency_table <- matrix(0, nrow = 2, ncol = 2)
+  
+  # 该细胞类型在health和disease中的数量
+  type_counts <- cell_counts %>% 
+    filter(CellType == cell_type)
+  
+  # 填充列联表
+  health_idx <- which(type_counts$Condition == "nonUIP")
+  disease_idx <- which(type_counts$Condition == "UIP")
+  
+  if (length(health_idx) > 0) {
+    contingency_table[1, 1] <- type_counts$n[health_idx]  # 该细胞类型在health中的数量
+  }
+  
+  if (length(disease_idx) > 0) {
+    contingency_table[2, 1] <- type_counts$n[disease_idx]  # 该细胞类型在disease中的数量
+  }
+  
+  # 其他细胞类型在健康和疾病中的数量
+  health_total <- total_cells$total[total_cells$Condition == "nonUIP"]
+  disease_total <- total_cells$total[total_cells$Condition == "UIP"]
+  
+  contingency_table[1, 2] <- health_total - contingency_table[1, 1]
+  contingency_table[2, 2] <- disease_total - contingency_table[2, 1]
+  
+  # 执行Fisher精确检验
+  fisher_test <- fisher.test(contingency_table)
+  
+  # 保存结果
+  result <- data.frame(
+    CellType = cell_type,
+    p_value = fisher_test$p.value,
+    odds_ratio = fisher_test$estimate,
+    health_prop = contingency_table[1, 1] / health_total,
+    disease_prop = contingency_table[2, 1] / disease_total,
+    fold_change = (contingency_table[2, 1] / disease_total) / (contingency_table[1, 1] / health_total)
+  )
+  
+  stat_results <- rbind(stat_results, result)
+}
+
+# 多重检验校正
+stat_results$p_adjusted <- p.adjust(stat_results$p_value, method = "BH")
+
+# 添加显著性标记
+stat_results <- stat_results %>%
+  mutate(significance = case_when(
+    p_adjusted < 0.001 ~ "***",
+    p_adjusted < 0.01 ~ "**",
+    p_adjusted < 0.05 ~ "*",
+    TRUE ~ "ns"
+  ))
+
+# 按p值排序
+stat_results <- stat_results %>%
+  arrange(p_value)
+
+# 打印统计结果
+print(stat_results)
+
+# 保存结果到CSV文件
+# write.csv(stat_results, "cell_type_proportion_statistics.csv", row.names = FALSE)
+
+
+```
+
+
+```{r}
+#------------------------------------------------------------------
+# 第四部分：可视化 - 条形图展示占比差异
+#------------------------------------------------------------------
+
+# 1. 创建条形图展示每个细胞类型在两个条件下的占比
+p1 <- ggplot(cell_proportions, aes(x = CellType, y = percentage, fill = Condition)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.9), width = 0.8) +
+  scale_fill_manual(values = c("nonUIP" = "#2C7FB8", "UIP" = "#D7301F")) +
+  labs(title = "Cell Type Proportions by Condition",
+       x = "Cell Type", 
+       y = "Percentage (%)") +
+  theme_prism(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "top") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))
+
+# 2. 创建点图 - 展示每个细胞类型的占比差异及统计显著性
+# 为点图准备数据
+plot_data <- cell_proportions %>%
+  pivot_wider(id_cols = CellType, 
+              names_from = Condition, 
+              values_from = percentage) %>%
+  left_join(stat_results, by = "CellType")
+
+# 创建点图
+p2 <- ggplot(plot_data, aes(x = health, y = disease, color = -log10(p_adjusted))) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(size = 3) +
+  scale_color_viridis() +
+  geom_text_repel(aes(label = CellType), 
+                  box.padding = 0.5, 
+                  point.padding = 0.2,
+                  segment.color = 'grey50',
+                  force = 2) +
+  labs(title = "Cell Type Proportions: Disease vs Health",
+       x = "Health (%)", 
+       y = "Disease (%)",
+       color = "-log10(p-adj)") +
+  theme_prism(base_size = 12) +
+  coord_fixed() +
+  theme(legend.position = "right")
+
+# 3. 创建火山图 - 展示差异倍数和统计显著性
+p3 <- ggplot(stat_results, aes(x = log2(fold_change), y = -log10(p_adjusted), 
+                              color = -log10(p_adjusted))) +
+  geom_point(size = 3) +
+  scale_color_viridis() +
+  geom_text_repel(aes(label = ifelse(p_adjusted < 0.05, as.character(CellType), "")), 
+                  box.padding = 0.5, 
+                  point.padding = 0.2,
+                  segment.color = 'grey50') +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  labs(title = "Volcano Plot of Cell Type Proportion Changes",
+       x = "log2(Fold Change) [Disease/Health]", 
+       y = "-log10(p-adjusted)",
+       color = "-log10(p-adj)") +
+  theme_prism(base_size = 12)
+
+p1
+```
+
+
+### 差异基因分析
+
+目的：分析不同分组和细胞亚群中的基因的差异情况：
+
+健康人和IPF患者在不同的细胞亚型只能够的差异统计分析。
+
+
+#### FindMarkers
+
+Once integrative analysis is complete, you can rejoin the layers - which collapses the individual datasets together and recreates the original counts and data layers. You will need to do this before performing any differential expression analysis. However, you can always resplit the layers in case you would like to reperform integrative analysis.
+
+```{r}
+
+seurat_obj <- harmonized_seurat
+seurat_obj$condition <- seurat_obj$group
+
+
+# 函数虽不错，但还是不想用
+# SCP::RunDEtest
+
+# 2. Create a combined identity for each cell: cell_type + condition
+seurat_obj$celltype_condition <- paste0(seurat_obj$`cell_type`, "_", seurat_obj$condition)
+
+# 3. Set this as the active identity for comparison
+Idents(seurat_obj) <- "celltype_condition"
+
+
+```
+
+注意选择感兴趣的细胞亚型。结合上面的亚群分析，选择`secretory_cells`,
+`显式`的呈现结果总是比隐式是更好的选择。
+
+```{r}
+# 4. Run differential expression for each cell type
+# For example, for a cell type "T_cells":
+de_AT1_cells <- FindMarkers(seurat_obj, 
+                        ident.1 = "ATI_IPF", 
+                        ident.2 = "ATI_Control",
+                        min.pct = 0.01,       # Only test genes detected in at least 10% of cells
+                        logfc.threshold = 0.1,  # Minimum log2 fold-change
+                        # test.use = "MAST",
+                        test.use = "wilcox"
+                        )    #
+
+# 5. View results
+head(de_AT1_cells[order(de_AT1_cells$avg_log2FC, decreasing = TRUE), ])
+```
+
+查看感兴趣基因的结果：
+```{r}
+de_AT1_cells %>% 
+  rownames_to_column() %>% 
+  dplyr::filter(rowname %in% target_genes)
+```
+
+
+Visualizing the Results
+```{r}
+# For a specific cell type, visualize top DE genes
+cell_type_of_interest <- 'ATI'
+# de_data <- de_results[[cell_type_of_interest]]
+de_data <- de_AT1_cells
+
+# Volcano plot
+ggplot(de_data, aes(x = avg_log2FC, y = -log10(p_val_adj))) +
+  geom_point(aes(color = p_val_adj < 0.05 & abs(avg_log2FC) > 0.5)) +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  theme_minimal() +
+  labs(title = paste0("DE Genes in ", cell_type_of_interest),
+       x = "Log2 Fold Change",
+       y = "-Log10 Adjusted P-value")
+
+# Feature plots for top genes
+top_genes <- rownames(de_data[order(de_data$p_val_adj), ])[1:4]
+FeaturePlot(seurat_obj, features = top_genes, 
+            split.by = "condition")
+
+# Heatmap of top DE genes
+top_genes <- rownames(de_data[order(de_data$p_val_adj), ])[1:20]
+# DoHeatmap(subset(seurat_obj, idents = c(ident1, ident2)), features = top_genes)
+```
+
+
+
+得到所有细胞亚群在不同condition下的差异基因list,
+首先subset 出来单一的细胞亚群：
+```{r}
+# Get unique cell types
+cell_types <- unique(seurat_obj$cell_type)
+
+# Create list to store results
+de_results <- list()
+min_cells_per_group <- 3  # Minimum number of cells required in each condition
+
+# For each cell type, perform differential expression analysis
+for (ct in cell_types) {
+  message(paste0("Processing cell type: ", ct))
+  
+  # Subset to current cell type
+  cells_subset <- subset(seurat_obj, cell_type == ct)
+  
+  # Check cell counts per condition
+  condition_counts <- table(cells_subset$condition)
+  message(paste0("  Cell counts: ", paste(names(condition_counts), condition_counts, sep="=", collapse=", ")))
+  
+  # Check if we have enough cells in each condition
+  if (any(condition_counts < min_cells_per_group)) {
+    message(paste0("  WARNING: Skipping ", ct, " - insufficient cells in one or more conditions"))
+    de_results[[ct]] <- data.frame(insufficent_cells = TRUE)
+    next
+  }
+  
+  # Verify both conditions exist
+  if (!all(c("IPF", "Control") %in% names(condition_counts))) {
+    message(paste0("  WARNING: Skipping ", ct, " - missing one of the required conditions"))
+    de_results[[ct]] <- data.frame(missing_condition = TRUE)
+    next
+  }
+  
+  # Run differential expression - comparing conditions
+  tryCatch({
+    de_results[[ct]] <- FindMarkers(
+      cells_subset,
+      group.by = "condition",
+      ident.1 = "IPF",
+      ident.2 = "Control",
+      test.use = "wilcox",
+      min.pct = 0.01,       # Minimum percentage of cells expressing gene
+      logfc.threshold = 0.1  # Log fold-change threshold
+    )
+    
+    # Add metadata columns
+    de_results[[ct]]$cell_type <- ct
+    de_results[[ct]]$cells_ident1 <- condition_counts["IPF"]
+    de_results[[ct]]$cells_ident2 <- condition_counts["Control"]
+    de_results[[ct]]$gene <- rownames(de_results[[ct]])
+    
+    message(paste0("  Successfully identified ", nrow(de_results[[ct]]), " DE genes"))
+  }, error = function(e) {
+    message(paste0("  ERROR in ", ct, ": ", e$message))
+    de_results[[ct]] <- data.frame(error = e$message)
+  })
+}
+```
+
+
+```{r}
+# Look at results for a specific cell type
+head(de_results[["ATI"]], n = 10)
+
+# Sort results by adjusted p-value
+de_results[["ATI"]] %>% arrange(p_val_adj) %>% 
+  rownames_to_column() %>% 
+  dplyr::filter(rowname %in% target_genes)
+
+# Save all results to files
+# for (ct in names(de_results)) {
+#   write.csv(de_results[[ct]], file = paste0("DE_", ct, ".csv"))
+# }
+```
+
+
+save de_results object:
+```{r}
+qs::qsave(de_results, "./GSE136831/de_results.qs")
+```
+
+
+```{r}
+# Merge all the results into a single dataframe
+valid_results <- names(de_results)[sapply(de_results, function(x) "p_val" %in% colnames(x))]
+message(paste0("Merging results from ", length(valid_results), " cell types..."))
+
+if(length(valid_results) > 0) {
+  # Combine all valid results
+  merged_de_results <- do.call(rbind, de_results[valid_results])
+  
+  # Add column for significance
+  merged_de_results$significant <- merged_de_results$p_val_adj < 0.05
+  
+  # Calculate total number of significant genes per cell type
+  sig_counts <- table(merged_de_results$cell_type[merged_de_results$significant])
+  message("Significant DE genes by cell type:")
+  print(sig_counts)
+  
+  # Sort by significance and fold change
+  merged_de_results <- merged_de_results[order(merged_de_results$cell_type, 
+                                               merged_de_results$p_val_adj, 
+                                               -abs(merged_de_results$avg_log2FC)), ]
+  
+  # Write to file
+  output_file <- "DE_results_by_celltype.csv"
+  # write.csv(merged_de_results, output_file, row.names = FALSE)
+  message(paste0("Results saved to ", output_file))
+  
+  # Generate top DE genes per cell type
+  top_de_genes <- data.frame()
+  for(ct in unique(merged_de_results$cell_type)) {
+    ct_results <- merged_de_results[merged_de_results$cell_type == ct & merged_de_results$significant, ]
+    if(nrow(ct_results) > 0) {
+      top_genes <- head(ct_results[order(ct_results$p_val_adj), ], 10)
+      top_de_genes <- rbind(top_de_genes, top_genes)
+    }
+  }
+  
+  # Save top genes to file
+  # write.csv(top_de_genes, "Top_DE_genes_by_celltype.csv", row.names = FALSE)
+  message("Top DE genes saved to Top_DE_genes_by_celltype.csv")
+  
+  # Create a summary table
+  summary_table <- data.frame(
+    cell_type = names(de_results),
+    total_genes_tested = sapply(de_results, function(x) ifelse("p_val" %in% colnames(x), nrow(x), 0)),
+    significant_genes = sapply(names(de_results), function(ct) {
+      if("p_val" %in% colnames(de_results[[ct]])) {
+        sum(de_results[[ct]]$p_val_adj < 0.05, na.rm = TRUE)
+      } else {
+        0
+      }
+    }),
+    IPF_cells = sapply(de_results, function(x) {
+      if("cells_ident1" %in% colnames(x)) x$cells_ident1[1] else NA
+    }),
+    Control_cells = sapply(de_results, function(x) {
+      if("cells_ident2" %in% colnames(x)) x$cells_ident2[1] else NA
+    }),
+    error = sapply(de_results, function(x) "error" %in% colnames(x))
+  )
+  
+  # Add cell type proportions
+  total_IPF <- sum(seurat_obj$condition == "IPF")
+  total_Control <- sum(seurat_obj$condition == "Control")
+  
+  summary_table$IPF_proportion <- summary_table$IPF_cells / total_IPF
+  summary_table$Control_proportion <- summary_table$Control_cells / total_Control
+  
+  # Calculate enrichment/depletion of cell types
+  summary_table$cell_type_ratio <- (summary_table$IPF_proportion + 0.001) / (summary_table$Control_proportion + 0.001)
+  summary_table$cell_type_log2ratio <- log2(summary_table$cell_type_ratio)
+  
+  # Save summary table
+  # write.csv(summary_table, "DE_analysis_summary.csv", row.names = FALSE)
+  message("Analysis summary saved to DE_analysis_summary.csv")
+  
+  # Return the merged results
+  # return(list(
+  #   merged_results = merged_de_results,
+  #   top_genes = top_de_genes,
+  #   summary = summary_table
+  # ))
+} else {
+  message("No valid differential expression results found!")
+  return(NULL)
+}
+```
+
+```{r}
+merged_de_results %>% 
+  as_tibble() %>% 
+  dplyr::filter(gene %in% target_genes) %>% 
+  dplyr::filter(significant == TRUE)
+```
+
+考虑考虑也可以给这个结果画个热图：
+```{r}
+merged_de_results %>% 
+  as_tibble() %>% 
+  dplyr::filter(gene %in% target_genes) -> combined_results
+```
+
+
+
+#### Pseudobulk DE by DESeq2
+
+把细胞作为单位变成了，患者、细胞亚型、分组信息.
+其实就是在患者层面和细胞亚群层面上做的差异分析。
+
+最近的一项研究强调了伪Bulk的问题，其中推论统计应用于统计上不独立的生物复制。未能考虑重复（来自同一个体的细胞）的内在相关性会增加错误发现率（FDR）。
+
+```{r}
+# library(muscat)
+# library(DESeq2)
+```
+
+
+考虑到group和orig.ident的一一对应的关系，纳入一个就可以。
+If return.seurat = TRUE, aggregated values are placed in the 'counts' layer of the returned object.
+```{r}
+
+pseudo_av <-AggregateExpression(harmonized_seurat,
+                         group.by = c('group',"orig.ident","cell_type"),
+                         assays = "RNA",# Default is all assays, counts data又不发生变
+                         #layer = "counts",
+                         return.seurat = TRUE   #
+                         )
+
+tail(Cells(pseudo_av))
+```
+
+```{r}
+# 如果return.seurat = FALSE，可以直接提取counts数据
+# av=as.data.frame(pseudo_av[[1]])
+# head(av)[1:10,1:10] 
+```
+
+```{r}
+pseudo_av$celltype_condition <- paste0(pseudo_av$`cell_type`, "_", pseudo_av$group)
+
+# 3. Set this as the active identity for comparison
+Idents(pseudo_av) <- "celltype_condition"
+```
+
+
+可以考虑用p_val，或者p_val_adj做不同的filter cutoff。
+```{r}
+de_markers <- FindMarkers(pseudo_av, 
+                          ident.1 = "ATI_IPF", 
+                          ident.2 = "ATI_Control", 
+                          slot = "counts", 
+                          test.use = "DESeq2",
+                          verbose = TRUE,
+                          assay = 'RNA'
+                          )
+
+de_markers$gene <- rownames(de_markers)
+
+k1 = de_markers$avg_log2FC< -1 & de_markers$p_val <0.05
+k2 = de_markers$avg_log2FC> 1 & de_markers$p_val <0.05
+de_markers$change <- ifelse(k1,"down",ifelse(k2,"up","not"))
+
+```
+
+从Pvalue的结果来看还是和wilcox的结果具备一定的一致性的，不过
+在p_val_adj的层面来看还是有所不同。
+```{r}
+de_markers %>% dplyr::filter(gene %in% target_genes)
+```
+
+
+```{r}
+
+ggplot(de_markers, aes(avg_log2FC, -log10(p_val),color = change)) + 
+  geom_point(size = 0.5, alpha = 0.5) + 
+  geom_vline(xintercept = c(1,-1),linetype = 4)+
+  geom_hline(yintercept = -log10(0.01),linetype = 4)+
+  scale_color_manual(values = c("blue","grey","red"))+
+  theme_bw() +
+  ylab("-log10(unadjusted p-value)")
+```
+
+
+循环跑所有的细胞亚群和分组。
+```{r}
+
+# 获取所有细胞亚群的唯一列表
+cell_types <- unique(pseudo_av$`cell_type`)
+
+# 创建一个空列表来存储每个细胞亚群的差异表达结果
+all_de_results <- list()
+
+# 对每个细胞亚群进行循环分析
+for (cell_type in cell_types) {
+  # 检查该细胞亚群是否同时在IPF和Control组中存在
+  ident1 <- paste0(cell_type, "_IPF")
+  ident2 <- paste0(cell_type, "_Control")
+  
+  # 检查这两个组合是否都存在于数据中
+  if (ident1 %in% unique(pseudo_av$celltype_condition) && 
+      ident2 %in% unique(pseudo_av$celltype_condition)) {
+    
+    # 设置活跃标识
+    Idents(pseudo_av) <- "celltype_condition"
+    
+    # 查找该细胞亚群的差异表达标记
+    tryCatch({
+      message(paste0("分析细胞亚群: ", cell_type, " (", ident1, " vs ", ident2, ")"))
+      de_markers <- FindMarkers(pseudo_av, 
+                              ident.1 = ident1, 
+                              ident.2 = ident2, 
+                              slot = "counts", 
+                              test.use = "DESeq2",
+                              verbose = FALSE
+                              )
+      
+      # 添加细胞亚群信息列
+      de_markers$cell_type <- cell_type
+      
+      # 存储结果
+      all_de_results[[cell_type]] <- de_markers
+      
+      # 保存单个结果到文件(可选)
+      # write.csv(de_markers, file = paste0("./GSE136831/results/DE_", cell_type, "_IPF_vs_Control.csv"))
+      
+    }, error = function(e) {
+      # 如果某个细胞亚群出错，记录错误并继续
+      message(paste0("分析 ", cell_type, " 时出现错误: ", e$message))
+    })
+  } else {
+    message(paste0("跳过 ", cell_type, "，因为IPF或Control组中不存在此亚群"))
+  }
+}
+
+# 合并所有结果为一个数据框
+all_de_combined <- do.call(rbind, all_de_results)
+
+
+```
+
+已经处理好的数据在这里。
+```{r}
+all_de_results <- qs::qread("./GSE136831/all_de_results.qs")
+
+# qs::qsave(all_de_results, "./GSE136831/all_de_results.qs")
+```
+
+
+```{r}
+# 保存总结果
+write.csv(all_de_combined, file = "./GSE136831/results/DE_all_celltypes_IPF_vs_Control.csv")
+
+# 结果概述：每个细胞亚群的显著差异基因数量(p_val_adj < 0.05)
+summary_stats <- data.frame(
+  Cell_Type = names(all_de_results),
+  Total_DEGs = sapply(all_de_results, nrow),
+  Upregulated = sapply(all_de_results, function(x) sum(x$avg_log2FC > 0 & x$p_val_adj < 0.05, na.rm=TRUE)),
+  Downregulated = sapply(all_de_results, function(x) sum(x$avg_log2FC < 0 & x$p_val_adj < 0.05, na.rm=TRUE))
+)
+
+# 打印概述
+print(summary_stats)
+write.csv(summary_stats, file = "./GSE136831/results/DE_summary_by_celltype.csv")
+
+```
+
+
+filter target_genes
+```{r}
+# Assuming target_genes is already defined
+filtered_results <- lapply(all_de_results, function(df) {
+  df[rownames(df) %in% target_genes, ]
+})
+
+lapply(filtered_results, nrow)
+
+# Check which target genes were not found in any cell type
+missing_genes <- setdiff(
+  target_genes,
+  unique(unlist(lapply(filtered_results, rownames)))
+)
+if(length(missing_genes) > 0) {
+  cat("Genes not found in any cell type:", paste(missing_genes, collapse=", "), "\n")
+}
+
+# Combine all filtered results into a single data frame with cell type information
+combined_results <- do.call(rbind, lapply(names(filtered_results), function(ct) {
+  res <- filtered_results[[ct]]
+  if(nrow(res) > 0) {
+    # If gene names are in row names, convert them to a column
+    if (!'gene' %in% colnames(res)) { # Check if a 'gene' column already exists
+      res$gene <- rownames(res)
+    }
+    res$cell_type <- ct  # Add cell type column
+    rownames(res) <- NULL # Remove row names to prevent appending suffixes during rbind
+    return(res)
+  }
+  return(NULL)
+}))
+```
+
+
+```{r}
+head(combined_results)
+```
+
+
+```{r}
+# Load necessary libraries
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+# First, let's properly pivot the data to wide format using dplyr and tidyr
+# Assuming combined_results has columns: gene, cell_type, avg_log2FC, p_val_adj
+
+# If genes are in rownames, first make them a proper column
+if (!"gene" %in% colnames(combined_results)) {
+  combined_results <- combined_results %>%
+    rownames_to_column("gene")
+}
+
+# Create a wide format data frame for log2FC values
+log2fc_wide <- combined_results %>%
+  select(gene, cell_type, avg_log2FC) %>%
+  pivot_wider(
+    names_from = gene,
+    values_from = avg_log2FC
+  )
+
+# Create a wide format data frame for p-values
+pval_wide <- combined_results %>%
+  select(gene, cell_type, p_val_adj) %>%
+  pivot_wider(
+    names_from = gene,
+    values_from = p_val_adj
+  )
+
+# Convert to matrices for heatmap
+# Move cell_type to rownames
+log2fc_matrix <- log2fc_wide %>%
+  column_to_rownames("cell_type") %>%
+  as.matrix()
+
+pval_matrix <- pval_wide %>%
+  column_to_rownames("cell_type") %>%
+  as.matrix()
+
+# Create a significance matrix for asterisks
+sig_matrix <- matrix("", nrow = nrow(pval_matrix), ncol = ncol(pval_matrix))
+rownames(sig_matrix) <- rownames(pval_matrix)
+colnames(sig_matrix) <- colnames(pval_matrix)
+
+sig_matrix[pval_matrix < 0.05] <- "*"
+sig_matrix[pval_matrix < 0.01] <- "**"
+sig_matrix[pval_matrix < 0.001] <- "***"
+
+# Format p-values for display
+format_pval <- function(p) {
+  ifelse(is.na(p), "", 
+         ifelse(p < 0.001, 
+                formatC(p, format = "e", digits = 1),
+                round(p, 3)))
+}
+
+pval_formatted <- matrix(sapply(pval_matrix, format_pval), 
+                         nrow = nrow(pval_matrix),
+                         dimnames = dimnames(pval_matrix))
+
+# Define color mapping for log2FC
+# Find min/max values for symmetrical color scale
+max_abs_log2fc <- max(abs(log2fc_matrix), na.rm = TRUE)
+col_fun <- colorRamp2(
+  c(-max_abs_log2fc, 0, max_abs_log2fc),
+  c("blue", "white", "red")
+)
+
+# Create the heatmap
+ht <- Heatmap(
+  log2fc_matrix,
+  name = "log2FC",
+  col = col_fun,
+  
+  # Add cell labels with p-values and significance stars
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    if (!is.na(log2fc_matrix[i, j])) {
+      # Add significance stars if significant
+      if (sig_matrix[i, j] != "") {
+        grid.text(
+          sig_matrix[i, j],
+          # x = x + width*0.4,  # Position to the right of the cell
+          # y = y + height*0.4, # Position toward the top of the cell
+          x, y, 
+          gp = gpar(fontsize = 10,
+                   col = ifelse(abs(log2fc_matrix[i, j]) > 2, "white", "black"))
+        )
+      }
+      
+      # Show log2FC value in each cell
+      # grid.text(
+      #   sprintf("%.1f", log2fc_matrix[i, j]),
+      #   x, y,
+      #   gp = gpar(fontsize = 9,
+      #            col = ifelse(abs(log2fc_matrix[i, j]) > 2, "white", "black"))
+      # )
+    }
+  },
+  
+  # Row settings (cell types)
+  cluster_rows = FALSE,  # Don't cluster cell types by default
+  row_names_side = "left",
+  row_names_gp = gpar(fontsize = 10, fontface = "bold"),
+  
+  # Column settings (genes)
+  cluster_columns = FALSE,
+  column_names_side = "top",
+  column_names_rot = 45,
+  column_names_gp = gpar(fontsize = 10),
+  
+  # Border settings
+  rect_gp = gpar(col = "white", lwd = 0.5),
+  
+  # Legend settings
+  heatmap_legend_param = list(
+    title = "log2 Fold Change",
+    at = seq(round(-max_abs_log2fc), round(max_abs_log2fc), by = ceiling(max_abs_log2fc/2)),
+    labels_gp = gpar(fontsize = 9),
+    title_gp = gpar(fontsize = 10, fontface = "bold"),
+    legend_height = unit(4, "cm")
+  )
+)
+
+# Add a legend for significance stars
+lgd_stars <- Legend(
+  labels = c("p < 0.05", "p < 0.01", "p < 0.001"),
+  title = "Significance",
+  legend_gp = gpar(fontsize = 9),
+  title_gp = gpar(fontsize = 10, fontface = "bold"),
+  pch = c("*", "**", "***")
+)
+
+# Draw the plot with legends
+draw(ht, annotation_legend_list = list(lgd_stars))
+
+# You can save the plot if needed
+# pdf("gene_expression_heatmap.pdf", width = 10, height = 8)
+# draw(ht, annotation_legend_list = list(lgd_stars))
+# dev.off()
+```
+
+
+
+```{r}
+# 可视化每个细胞亚群的差异表达基因数量
+# 绘制差异基因数量条形图
+p <- ggplot(summary_stats %>% dplyr::mutate(Total_DEGs = Upregulated + Downregulated), 
+            aes(x = reorder(Cell_Type, Total_DEGs), y = Total_DEGs)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  geom_text(aes(label = Total_DEGs), vjust = -0.3, size = 3) +
+  theme_minimal() +
+  labs(title = "Number of DEGs by Cell Type (IPF vs Control)",
+       x = "Cell Type", y = "Number of DEGs") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p)
+ggsave("./GSE136831/results/DEGs_by_celltype.png", p, width = 10, height = 6)
+
+```
+
+
+```{r}
+# 如果需要，可以为每个细胞亚群创建火山图
+for (cell_type in names(all_de_results)) {
+  df <- all_de_results[[cell_type]]
+  
+  # 添加显著性和表达变化方向标签
+  df$diffexpressed <- "Not Sig"
+  df$diffexpressed[df$p_val_adj < 0.05 & df$avg_log2FC > 0] <- "Up"
+  df$diffexpressed[df$p_val_adj < 0.05 & df$avg_log2FC < 0] <- "Down"
+  
+  # 添加标签列
+  df$delabel <- NA
+  top_genes <- head(df[order(df$p_val_adj), ], 10)
+  df$delabel[rownames(df) %in% rownames(top_genes)] <- rownames(top_genes)
+  
+  # 绘制火山图
+  v <- ggplot(df, aes(x = avg_log2FC, y = -log10(p_val_adj), 
+                    col = diffexpressed, label = delabel)) +
+    geom_point() +
+    theme_minimal() +
+    geom_text_repel(max.overlaps = 10) +
+    scale_color_manual(values = c("Down" = "blue", "Not Sig" = "grey", "Up" = "red")) +
+    geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+    labs(title = paste0("Volcano Plot: ", cell_type, " (IPF vs Control)"),
+         x = "log2 Fold Change", y = "-log10 adjusted p-value")
+  
+  print(v)
+  ggsave(paste0("./GSE136831/results/Volcano_", cell_type, ".png"), v, width = 8, height = 6)
+}
+```
+
+
+### 补体系统的高亮
+
+首先收集所谓补体系统相关的基因, complement system.
+
+KEGG: hsa04610, Complement and coagulation cascades - Homo sapiens (human)
+Reactome: R-HSA-166658, Complement cascade
+MSigDB: BIOCARTA_COMP_PATHWAY(Complement Pathway),C2 CP
+
+然后，是这些基因在每种细胞亚群中是否是一个差异基因；
+
+```{r}
+#| include: false
+
+require(GSEABase)
+library(msigdbr)
+```
+
+
+整理MSigDB中的补体相关的一些通路。
+下面有保存好的对象，不需要每次都运行。
+```{r}
+# kegg gene list
+
+# MSigDB gene list
+
+# Fetch MSigDB Gene Sets (Focus on Complement-related pathways)
+cat("Fetching MSigDB gene sets related to complement pathways...\n")
+
+species_name <- "Homo sapiens"
+# org_db_name <- org.Hs.eg.db
+
+# Fetch Hallmark gene sets
+msig_h <- msigdbr(species = species_name, collection = "H")
+complement_h <- msig_h %>% filter(grepl("COMPLEMENT", gs_name, ignore.case = TRUE))
+
+# Fetch C2 KEGG gene sets
+msig_c2_kegg <- msigdbr(species = species_name, collection = "C2", 
+                        subcollection = "CP:KEGG_MEDICUS"
+                        )
+
+complement_c2_kegg <- msig_c2_kegg %>% filter(grepl("COMPLEMENT", gs_name, ignore.case = TRUE))
+
+msig_c2_kegg_Legacy <- msigdbr(species = species_name, collection = "C2", 
+                               subcategory = "CP:KEGG_LEGACY")
+complement_c2_kegg_Legacy <- msig_c2_kegg_Legacy %>%
+  filter(str_detect(gs_name, regex("COMPLEMENT", ignore_case = TRUE)))
+
+# Fetch C5 GO BP (Biological Process) gene sets
+msig_c5_gobp <- msigdbr(species = species_name, collection = "C5", subcollection = "GO:BP")
+complement_c5_gobp <- msig_c5_gobp %>% filter(grepl("COMPLEMENT", gs_name, ignore.case = TRUE) | 
+                                                grepl("COMPLEMENT_ACTIVATION", gs_name, ignore.case = TRUE))
+
+
+# Fetch Reactome
+msig_c2_reactome <- msigdbr(species = species_name, 
+                            collection = "C2", 
+                            subcollection = "CP:REACTOME")
+complement_c2_reactome <- msig_c2_reactome %>%
+  filter(grepl("COMPLEMENT", gs_name, ignore.case = TRUE) |
+         grepl("COMPLEMENT", gs_description, ignore.case = TRUE))
+
+
+# Combine found complement gene sets
+complement_gene_sets_df <- bind_rows(complement_h, complement_c2_kegg, 
+                                     complement_c2_kegg_Legacy, complement_c5_gobp,
+                                     complement_c2_reactome
+                                     ) %>% 
+  dplyr::select(gs_name, gene_symbol) %>% distinct()
+
+if (nrow(complement_gene_sets_df) == 0) {
+  warning("No gene sets explicitly matching 'COMPLEMENT' were found in H, C2:KEGG, C5:GO:BP. 
+           Consider broadening your search terms or checking other MSigDB categories.
+           Using all Hallmark gene sets for demonstration if no complement sets are found.")
+  # Fallback to all Hallmark if no complement sets are found for demonstration
+  if (nrow(complement_gene_sets_df) == 0) {
+    complement_gene_sets_df <- msig_h %>% dplyr::select(gs_name, gene_symbol) %>% distinct()
+  }
+}
+
+# Convert to a list format required by GSVA (list of gene vectors, names are gene set names)
+gsva_gene_sets_list <- split(x = complement_gene_sets_df$gene_symbol, f = complement_gene_sets_df$gs_name)
+
+# Filter gene sets: remove gene sets with fewer than (e.g.) 5 genes present in the expression matrix
+# min_gene_set_size <- 5
+# gsva_gene_sets_list <- lapply(gsva_gene_sets_list, function(genes) {
+#   genes_in_expr <- genes[genes %in% rownames(expr_matrix)]
+#   return(genes_in_expr)
+# })
+# gsva_gene_sets_list <- gsva_gene_sets_list[sapply(gsva_gene_sets_list, length) >= min_gene_set_size]
+
+if (length(gsva_gene_sets_list) == 0) {
+  stop("No gene sets remained after filtering for minimum size and presence in expression data. Cannot proceed with GSVA.")
+}
+cat(length(gsva_gene_sets_list), "complement-related gene sets prepared for GSVA.\n")
+```
+
+
+```{r}
+# qs::qsave(complement_gene_sets_df, file = './complement_gene_sets_df.qs')
+complement_gene_sets_df <- qs::qread('./complement_gene_sets_df.qs')
+
+# qs::qsave(gsva_gene_sets_list, file = './gsva_gene_sets_list.qs')
+gsva_gene_sets_list <- qs::qread('./gsva_gene_sets_list.qs')
+```
+
+
+除了上面整理的complement相关的pathway外，还有必要考虑核心基因的分布。
+```{r}
+# 核心成分基因
+core_components <- c(
+  "C1QA", "C1QB", "C1QC", "C1R", "C1S", "C2", "C3",
+  "C4A", "C4B", "C5", "C6", "C7", "C8A", "C8B", "C8G", "C9"
+)
+
+# 凝集素途径相关基因
+lectin_pathway <- c("MBL2", "MASP1", "MASP2")
+
+# 替代途径相关基因
+alternative_pathway <- c("CFB", "CFD", "CFP")
+
+# 补体调节因子基因
+regulators <- c(
+  "CFH", "CFHR1", "CFHR2", "CFHR3", "CFHR4", "CFHR5", "CFI",
+  "CD46", "CD55", "CD59", "SERPING1", "VTN", "CLUS"
+)
+
+# 补体受体基因
+receptors <- c("CR1", "CR2", "C3AR1", "C5AR1", "C5AR2", "ITGAM", "ITGB2", "ITGAX")
+
+# 合并所有基因为一个总向量
+complement_genes <- c(core_components, lectin_pathway, alternative_pathway, regulators, receptors)
+
+```
+
+
+首先看一下大概的基因表达分布情况：
+```{r}
+SCpubr::do_DotPlot(sample = harmonized_seurat, 
+                        features = complement_genes,
+                        group.by = 'cell_type',
+                        cluster = TRUE
+                        )
+```
+
+#### 补体GSVA分析
+
+```{r}
+require(GSVA)
+require(limma)
+library(ComplexHeatmap)
+library(escape) #Easy single cell analysis platform for enrichment
+```
+
+
+```{r}
+# 对每一个细胞做GSVA分析
+
+# enrichment.scores <- escape::escape.matrix(harmonized_seurat, 
+#                                    gene.sets = gsva_gene_sets_list, 
+#                                    groups = 1000, 
+#                                    min.size = 5, 
+#                                    BPPARAM = SnowParam(workers = 8))
+```
+
+
+对于subject和细胞亚群做aggragate：
+```{r}
+# 计算每个细胞类型和条件组合的平均表达量
+seurat_obj <- subset(harmonized_seurat, group %in% c('Control', 'IPF'))
+
+# 检查数据基本信息
+print(paste("细胞数:", ncol(seurat_obj)))
+print(paste("基因数:", nrow(seurat_obj)))
+
+
+group_by <- "cell_type"      # If using annotated cell types
+
+# Set condition column name
+condition_col <- "group"  # Replace with your actual condition column name
+# 检查condition信息
+if(!"group" %in% colnames(seurat_obj@meta.data)) {
+  stop("请确保meta.data中包含'condition'列！")
+}
+
+# Add combined grouping column (cell type + condition)
+seurat_obj$sample_celltype <- paste(seurat_obj$Subject_Identity, 
+                                      Idents(seurat_obj), 
+                                      sep = "_")
+
+# Set the default assay to RNA
+DefaultAssay(seurat_obj) <- "RNA"
+
+# Calculate average expression for each cell type and condition combination
+Idents(seurat_obj) <- "sample_celltype"
+
+# 
+avg_expr <- AverageExpression(seurat_obj, 
+                              assays = "RNA", 
+                              return.seurat = FALSE, 
+                              group.by = c("sample_celltype"),
+                              layer = "data")  # Use normalized data
+
+# Check the result structure
+print(paste("平均表达矩阵维度:", paste(dim(avg_expr), collapse = " x ")))
+
+print(colnames(avg_expr$RNA)[1:10])  # First few columns
+
+avg_expr <- avg_expr[[1]]
+avg_expr <- avg_expr[rowSums(avg_expr)>0,]  #选取非零基因
+avg_expr <- as.matrix(avg_expr)
+
+avg_expr[1:5, 1:5]
+```
+
+```{r}
+# 分别按condition和celltype计算平均表达（用于后续比较）
+avg_expr_condition <- AverageExpression(
+  seurat_obj,
+  group.by = "group",
+  assays = "RNA",
+  slot = "data",
+  verbose = TRUE
+)
+
+avg_expr_celltype <- AverageExpression(
+  seurat_obj,
+  group.by = "cell_type",  # 或其他细胞类型标识
+  assays = "RNA", 
+  slot = "data",
+  verbose = TRUE
+)
+
+expr_matrix_condition <- as.matrix(avg_expr_condition$RNA)
+expr_matrix_celltype <- as.matrix(avg_expr_celltype$RNA)
+```
+
+
+```{r}
+# 过滤低表达基因
+min_expr_threshold <- 0.1
+min_group_prop <- 0.2
+
+genes_to_keep <- rownames(avg_expr)[
+  rowSums(avg_expr > min_expr_threshold) >= 
+  ncol(avg_expr) * min_group_prop
+]
+
+expr_matrix_filtered <- avg_expr[genes_to_keep, ]
+# expr_matrix_condition_filtered <- expr_matrix_condition[genes_to_keep, ]
+# expr_matrix_celltype_filtered <- expr_matrix_celltype[genes_to_keep, ]
+
+print(paste("过滤前基因数:", nrow(avg_expr)))
+print(paste("过滤后基因数:", nrow(expr_matrix_filtered)))
+
+# 检查基因重叠
+all_geneset_genes <- unique(unlist(gsva_gene_sets_list))
+overlap_genes <- intersect(all_geneset_genes, rownames(expr_matrix_filtered))
+
+print(paste("基因集中的基因数:", length(all_geneset_genes)))
+print(paste("重叠基因数:", length(overlap_genes)))
+print(paste("重叠比例:", round(length(overlap_genes)/length(all_geneset_genes)*100, 2), "%"))
+```
+
+```{r}
+gene_sets <- GeneSetCollection(lapply(names(gsva_gene_sets_list), function(name) {
+  GeneSet(gsva_gene_sets_list[[name]], setName = name)
+}))
+```
+
+
+```{r}
+gsvaPar <- gsvaParam(
+  avg_expr, 
+  gsva_gene_sets_list,
+  maxDiff = TRUE
+)
+```
+
+
+```{r}
+# 运行GSVA分析 - 使用新的语法
+print("开始运行GSVA分析 (subject+celltype)...")
+
+gsva_results <- gsva(gsvaPar,
+                 verbose = TRUE
+                 )
+
+dim(gsva_results)
+```
+
+处理一下GSVA的结果：
+```{r}
+gsva_pb_df <- as.data.frame(t(gsva_results)) %>%
+  rownames_to_column("sample_celltype") %>%
+  tidyr::separate(sample_celltype, into = c("sample_id", "cell_type"), 
+                  sep = "-", 
+                  extra = "merge")
+
+# Add condition information by merging with sample metadata
+sample_metadata <- distinct(seurat_obj@meta.data[, c("Subject_Identity", "group")])
+sample_metadata$Subject_Identity <- paste0('g', sample_metadata$Subject_Identity)
+
+gsva_pb_df <- merge(gsva_pb_df, sample_metadata, by.x = "sample_id", by.y = 'Subject_Identity')
+```
+
+```{r}
+
+```
+
+
+```{r}
+ComplexHeatmap::pheatmap(gsva_results, 
+                         show_colnames = T, 
+                   scale = "row",angle_col = "45",
+                   color = colorRampPalette(c("navy", "white", "firebrick3"))(50)
+                   )
+```
+
+
+```{r}
+gsva_results <- data.frame(Genesets=rownames(gsva_results),
+                           gsva_results, check.names = F)
+
+gsva_long <- pivot_longer(gsva_results, cols = -Genesets)
+
+# 创建气泡图
+ggplot(gsva_long, aes(x = Genesets, y = name, size = value, color = value)) +
+  geom_point(alpha = 0.7) +  # 使用散点图层绘制气泡，alpha设置点的透明度
+  scale_size_continuous(range = c(1, 6)) +  # 设置气泡大小的范围
+  theme_bw() + 
+  scale_color_gradient(low = "#336699", high =  "tomato") +
+  labs(x = "Gene Set", y = "Sample", size = "GSVA Score")+
+  ggtitle("GSVA analysis") +
+  theme(axis.text.x = element_text(angle = 45,vjust = 0.5,hjust = 0.5),
+        plot.title = element_text(hjust = 0.5))
+
+```
+
+This approach treats each sample_celltype combination's score as a data point.
+```{r}
+# This assumes gsva_pb_df is ready from Step 4B
+# We will perform limma analysis for each cell type separately
+# or by including cell type as a factor in a more complex model if appropriate.
+
+all_limma_results <- list()
+
+for (ct in unique(gsva_pb_df$cell_type)) {
+  
+  # cat("cell: ", ct)
+  gsva_subset_ct <- gsva_pb_df %>% filter(cell_type == ct)
+  
+  n_distinct_conditions <- length(unique(gsva_subset_ct$group))
+
+  if (n_distinct_conditions < 2) {
+    message(paste("Skipping cell type '", ct, "' for limma: Fewer than two distinct condition groups are present (e.g., only 'Control' or only 'IPF' samples). Limma requires at least two groups for comparison.", sep=""))
+    next # Skip to the next cell type
+  }
+
+  # Ensure there are enough replicates per condition within this cell type
+  # Typically need at least 2-3 replicates per group for limma
+  if (min(table(gsva_subset_ct$group)) < 2) {
+    message(paste("Skipping cell type", ct, "for limma due to < 2 replicates in a group."))
+    next
+  }
+
+  # Prepare data for limma: rows are pathways, columns are samples for this cell type
+  # Pathway names are in columns like "COMPLEMENT_CLASSICAL_PATHWAY", etc.
+  pathway_cols <- names(gsva_gene_sets_list) # Get the pathway names
+  mat_for_limma <- t(as.matrix(gsva_subset_ct[, pathway_cols]))
+  colnames(mat_for_limma) <- gsva_subset_ct$sample_id # Ensure unique colnames if multiple cell types had same sample_id (not the case here as we subsetted by cell_type)
+
+  # Create design matrix
+  condition <- factor(gsva_subset_ct$group)
+  design <- model.matrix(~0 + condition) # ~0 removes intercept, creates coeffs for each group
+  colnames(design) <- levels(condition) # e.g., "Control", "IPF"
+
+  # Create contrast matrix (e.g., IPF vs Control)
+  # Ensure the levels in contrast_formula match colnames(design)
+  contrast_formula <- paste(levels(condition)[2], levels(condition)[1], sep = "-") # e.g., "IPF-Control"
+  contrast_matrix <- makeContrasts(contrasts = contrast_formula, levels = design)
+
+  # Fit linear model
+  fit <- lmFit(mat_for_limma, design)
+  fit_contrasts <- contrasts.fit(fit, contrast_matrix)
+  fit_ebayes <- eBayes(fit_contrasts)
+
+  # Get results
+  limma_res_ct <- topTable(fit_ebayes, number = Inf, sort.by = "P") %>%
+    rownames_to_column("pathway") %>%
+    mutate(cell_type = ct)
+
+  all_limma_results[[ct]] <- limma_res_ct
+}
+
+# Combine results from all cell types
+if (length(all_limma_results) > 0) {
+  diff_pathway_results_limma <- do.call(rbind, all_limma_results)
+  # Adjust p-values globally or per cell type depending on hypothesis
+  # Global adjustment:
+  diff_pathway_results_limma$padj_global <- p.adjust(diff_pathway_results_limma$P.Value, method = "BH")
+  print(head(diff_pathway_results_limma[order(diff_pathway_results_limma$padj_global), ], 20))
+} else {
+  message("No limma results generated.")
+}
+
+```
+
+```{r}
+# save the results
+diff_pathway_results_limma %>% 
+  as_tibble() %>% 
+  write_excel_csv('./GSE136831/enrich_res/diff_pathway_results_limma.csv')
+```
+
+
+绘制某个细胞的GSVA结果热图：
+```{r}
+# Using Per-Cell GSVA scores (can be very large if many cells)
+# It's often better to plot average scores per sample/celltype or a subset of cells
+# For this example, let's use the pseudo-bulk results for clarity
+target_cell_type <- 'ATII'
+
+if (exists("gsva_pb_df") && nrow(gsva_pb_df) > 0) {
+  # Prepare matrix for heatmap: pathways as rows, sample_celltype as columns
+  # Order columns by condition and cell type for better visualization
+  heatmap_data_pb <- gsva_pb_df %>%
+    arrange(group, cell_type, sample_id) %>%
+    dplyr::select(all_of(c("sample_id", "cell_type", "group", names(gsva_gene_sets_list)))) %>%
+    dplyr::mutate(sample_celltype = paste(sample_id, cell_type, sep="_")) %>% 
+    tibble::column_to_rownames(var = "sample_celltype") # Need to recreate this combined ID if not present or make unique IDs
+
+  # If sample_celltype column was split, recreate it for unique rownames or create unique identifiers
+  gsva_pb_df_heatmap <- gsva_pb_df %>%
+    dplyr::filter(cell_type %in% target_cell_type) %>% 
+    mutate(plot_label = paste(sample_id, cell_type, sep="_")) %>%
+    dplyr::select(plot_label, group, cell_type, all_of(names(gsva_gene_sets_list)))
+
+  heatmap_matrix <- t(as.matrix(gsva_pb_df_heatmap %>% dplyr::select(all_of(names(gsva_gene_sets_list)))))
+  colnames(heatmap_matrix) <- gsva_pb_df_heatmap$plot_label
+
+  # Annotation for columns
+  col_annotation_df <- gsva_pb_df_heatmap %>%
+    dplyr::select(plot_label, group, cell_type) %>%
+    column_to_rownames("plot_label")
+
+  # Order matrix and annotations consistently
+  ordered_cols <- order(col_annotation_df$group, col_annotation_df$cell_type)
+  heatmap_matrix_ordered <- heatmap_matrix[, ordered_cols]
+  col_annotation_df_ordered <- col_annotation_df[ordered_cols, , drop = FALSE]
+
+
+  # Define colors for annotation
+  condition_colors <- c("Control" = "blue", "IPF" = "red") # Adjust as needed
+  if (is.factor(col_annotation_df_ordered$cell_type)) {
+      unique_cell_types_in_plot <- levels(col_annotation_df_ordered$cell_type)
+      # Filter to only those levels actually present in the current data subset, if necessary,
+      # though levels() on the factor from the specific df should be correct.
+      unique_cell_types_in_plot <- intersect(unique_cell_types_in_plot, unique(col_annotation_df_ordered$cell_type))
+  } else {
+      unique_cell_types_in_plot <- unique(col_annotation_df_ordered$cell_type)
+      # Sort them to ensure consistent color mapping if the order might change on different runs
+      unique_cell_types_in_plot <- sort(unique_cell_types_in_plot)
+  }
+  num_cell_types <- length(unique_cell_types_in_plot)
+  # cell_type_colors <- RColorBrewer::brewer.pal(length(unique(col_annotation_df_ordered$cell_type)), "Set3")
+  cell_type_colors <- grDevices::rainbow(n = num_cell_types)
+  names(cell_type_colors) <- unique(col_annotation_df_ordered$cell_type)
+
+  ha_col <- HeatmapAnnotation(
+    Condition = col_annotation_df_ordered$group,
+    CellType = col_annotation_df_ordered$cell_type,
+    col = list(Condition = condition_colors,
+               CellType = cell_type_colors)
+  )
+
+  # Generate heatmap
+  ht_gsva <- Heatmap(
+    heatmap_matrix_ordered,
+    name = "GSVA Score",
+    cluster_rows = TRUE,
+    cluster_columns = FALSE, # Already ordered
+    show_column_names = TRUE,
+    column_names_gp = gpar(fontsize = 8),
+    row_names_gp = gpar(fontsize = 10),
+    top_annotation = ha_col,
+    column_title = "GSVA Scores: Pathways by Sample and Cell Type"
+  )
+  # draw(ht_gsva, heatmap_legend_side = "bottom", annotation_legend_side = "bottom")
+  draw(ht_gsva)
+
+}
+```
+
+针对满足条件的
+
+Myofibroblast中的差异pathway还满多的。
+```{r}
+
+
+if(sum(diff_pathway_results_limma$adj.P.Val < 0.05) > 0) {
+  sig_pathways <- diff_pathway_results_limma %>% as_tibble() %>% 
+    filter(adj.P.Val < 0.05)
+  
+  # 提取显著通路的GSVA得分
+  gsva_sig <- gsva_pb_df %>% 
+    filter(cell_type %in% unique(sig_pathways$cell_type)) %>% 
+    dplyr::select(group, cell_type, all_of(unique(sig_pathways$pathway)))
+  
+  # 创建注释数据框
+  anno_col <- data.frame(Group = target_cells$selected_group)
+  rownames(anno_col) <- colnames(gsva_sig_h)
+  anno_colors <- list(Group = c(Control = "blue", Treatment = "red"))
+  names(anno_colors$Group) <- c(group1, group2)
+  
+  # 生成热图
+  # pdf("Hallmark_significant_pathways_heatmap.pdf", width = 10, height = min(12, 6 + length(sig_pathways_h) * 0.3))
+  pheatmap::pheatmap(gsva_sig_h,
+           annotation_col = anno_col,
+           annotation_colors = anno_colors,
+           show_colnames = FALSE,
+           cluster_rows = TRUE,
+           cluster_cols = TRUE,
+           scale = "row",
+           fontsize_row = 10,
+           main = paste0("Hallmark Gene Sets - ", target_cell_type, "\n", group1, " vs ", group2))
+  # dev.off()
+}
+```
+
+绘制感兴趣通路的foldchange,
+不过似乎不适合这种多个细胞亚群的展示：
+```{r}
+### 画图
+### 筛选显著通路
+draw_result <- sig_pathways %>% dplyr::filter(abs(logFC) > 0.05 & adj.P.Val < 0.05)
+
+draw_result <- draw_result %>% dplyr::mutate(label = if_else(logFC > 0,"up","down")) %>%
+  dplyr::arrange(logFC)
+
+draw_result$label <- factor(draw_result$label)
+
+ggplot(draw_result, aes(reorder(pathway, logFC), logFC,fill=label)) + 
+  geom_bar(stat = 'identity',alpha = 0.7) + 
+  scale_fill_manual(breaks=c("down","up"),values = c("#008020","#08519C"))+
+  labs(x = "Pathways")+
+  coord_flip()+
+  theme_bw()
+```
+
+绘制感兴趣通路的foldchange,
+更为合适的绘图：
+```{r}
+library(RColorBrewer)
+# Use existing data object
+data <- draw_result
+
+# Clean pathway names for better display (remove prefixes and shorten)
+# data$pathway_short <- gsub("^(KEGG_MEDICUS_|GOBP_|REACTOME_)", "", data$pathway)
+data$pathway_short <- data$pathway
+data$pathway_short <- gsub("_", " ", data$pathway_short)
+# data$pathway_short <- tools::toTitleCase(tolower(data$pathway_short))
+
+# Create a custom color palette for cell types
+n_cell_types <- length(unique(data$cell_type))
+colors <- c(brewer.pal(min(11, n_cell_types), "Spectral"),
+            brewer.pal(min(8, max(0, n_cell_types - 11)), "Set2"))
+if (n_cell_types > 19) {
+  colors <- rainbow(n_cell_types)
+}
+
+# Create the main plot
+p1 <- ggplot(data, aes(x = reorder(pathway_short, logFC, median), 
+                       y = logFC, 
+                       fill = cell_type)) +
+  geom_col(position = "dodge", alpha = 0.8, width = 0.8) +
+  scale_fill_manual(values = colors[1:n_cell_types]) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", alpha = 0.5) +
+  labs(
+    title = "GSVA Pathway Analysis Results",
+    subtitle = "Log Fold Change by Pathway and Cell Type",
+    x = "Pathway",
+    y = "Log Fold Change (logFC)",
+    fill = "Cell Type",
+    caption = "Pathways ordered by median logFC; dashed line indicates no change"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y = element_text(size = 10),
+    axis.title = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray40"),
+    legend.title = element_text(size = 11, face = "bold"),
+    legend.text = element_text(size = 9),
+    legend.position = "right",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    plot.margin = margin(20, 20, 20, 20)
+  ) +
+  guides(fill = guide_legend(ncol = 1, override.aes = list(alpha = 1)))
+
+# Display the plot
+print(p1)
+
+# Alternative horizontal version for better pathway name readability
+p2 <- ggplot(data, aes(y = reorder(pathway_short, logFC, median), 
+                       x = logFC, 
+                       fill = cell_type)) +
+  geom_col(position = "dodge", alpha = 0.8, width = 0.8) +
+  scale_fill_manual(values = colors[1:n_cell_types]) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", alpha = 0.5) +
+  labs(
+    title = "GSVA Pathway Analysis Results (Horizontal Layout)",
+    subtitle = "Log Fold Change by Pathway and Cell Type",
+    y = "Pathway",
+    x = "Log Fold Change (logFC)",
+    fill = "Cell Type",
+    caption = "Pathways ordered by median logFC; dashed line indicates no change"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 9),
+    axis.text.x = element_text(size = 10),
+    axis.title = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray40"),
+    legend.title = element_text(size = 11, face = "bold"),
+    legend.text = element_text(size = 9),
+    legend.position = "right",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    plot.margin = margin(20, 20, 20, 20)
+  ) +
+  guides(fill = guide_legend(ncol = 1, override.aes = list(alpha = 1)))
+
+# Display the horizontal version
+print(p2)
+
+# Create a heatmap-style visualization
+p3 <- ggplot(data, aes(x = cell_type, y = reorder(pathway_short, logFC, median), fill = logFC)) +
+  geom_tile(color = "white", size = 0.1) +
+  scale_fill_gradient2(
+    low = "blue", mid = "white", high = "red",
+    midpoint = 0, name = "logFC",
+    guide = guide_colorbar(title.position = "top", title.hjust = 0.5)
+  ) +
+  labs(
+    title = "GSVA Results Heatmap",
+    subtitle = "Log Fold Change Across Cell Types and Pathways",
+    x = "Cell Type",
+    y = "Pathway",
+    caption = "Blue: downregulated, Red: upregulated"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+    axis.text.y = element_text(size = 9),
+    axis.title = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray40"),
+    legend.position = "top",
+    legend.key.width = unit(2, "cm"),
+    panel.grid = element_blank(),
+    plot.margin = margin(20, 20, 20, 20)
+  )
+
+# Display the heatmap
+print(p3)
+
+# Save plots (optional)
+# ggsave("gsva_barplot_vertical.png", p1, width = 14, height = 10, dpi = 300)
+# ggsave("gsva_barplot_horizontal.png", p2, width = 12, height = 14, dpi = 300)
+# ggsave("gsva_heatmap.png", p3, width = 12, height = 10, dpi = 300)
+
+# Summary statistics
+cat("\n=== Data Summary ===\n")
+cat("Number of pathways:", length(unique(data$pathway)), "\n")
+cat("Number of cell types:", length(unique(data$cell_type)), "\n")
+cat("logFC range:", round(min(data$logFC), 3), "to", round(max(data$logFC), 3), "\n")
+cat("Most upregulated:", data$pathway_short[which.max(data$logFC)], 
+    "in", data$cell_type[which.max(data$logFC)], "(logFC =", round(max(data$logFC), 3), ")\n")
+cat("Most downregulated:", data$pathway_short[which.min(data$logFC)], 
+    "in", data$cell_type[which.min(data$logFC)], "(logFC =", round(min(data$logFC), 3), ")\n")
+```
+
+```{r}
+draw_result %>% 
+  write_excel_csv('./GSE136831/enrich_res/gsva_draw_result.csv')
+```
+
+
+
+### 富集分析以及GSEA分析
+
+可以对选择的差异基因基因富集分析，
+也可以采用compareCluster进行分析
+
+```{r}
+#| include: false
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+```
+
+
+#### 针对所有的DEGs
+
+```{r}
+dge_results_list <- all_de_results
+```
+
+
+##### ORA
+
+```{r}
+# 对每一个细胞亚群分别进行富集分析
+
+cat("Starting Gene Set Enrichment Analysis (GO & KEGG) using clusterProfiler...\n")
+
+# Function to create and save plots
+save_enrichment_plots <- function(enrichment_obj, output_directory, prefix, 
+                                  cell_type, plot_width = 10, plot_height = 8) {
+  if (is.null(enrichment_obj) || nrow(as.data.frame(enrichment_obj)) == 0) {
+    return(FALSE)
+  }
+  
+  tryCatch({
+    # Create dotplot
+    p_dot <- dotplot(enrichment_obj, showCategory = 20) +
+      ggtitle(paste(prefix, "Enrichment - Dotplot -", cell_type))
+    ggsave(file.path(output_directory, paste0(prefix, "_dotplot_", cell_type, ".png")), 
+           plot = p_dot, width = plot_width, height = plot_height)
+    
+    # Try simplifying for barplot if applicable (GO only)
+    if (grepl("^GO", prefix)) {
+      enrichment_simplified <- simplify(enrichment_obj, cutoff = 0.7, by = "p.adjust", select_fun = min)
+      if (!is.null(enrichment_simplified) && nrow(as.data.frame(enrichment_simplified)) > 0) {
+        p_bar <- barplot(enrichment_simplified, showCategory = 15, drop = TRUE) +
+          ggtitle(paste(prefix, "Enrichment - Barplot -", cell_type))
+      } else {
+        p_bar <- barplot(enrichment_obj, showCategory = 15, drop = TRUE) +
+          ggtitle(paste(prefix, "Enrichment - Barplot (Original) -", cell_type))
+      }
+    } else {
+      p_bar <- barplot(enrichment_obj, showCategory = 15, drop = TRUE) +
+        ggtitle(paste(prefix, "Enrichment - Barplot -", cell_type))
+    }
+    
+    ggsave(file.path(output_directory, paste0(prefix, "_barplot_", cell_type, ".png")), 
+           plot = p_bar, width = plot_width, height = plot_height)
+    
+    return(TRUE)
+  }, error = function(e) {
+    cat("      Error plotting", prefix, "for", cell_type, ":", e$message, "\n")
+    return(FALSE)
+  })
+}
+
+# Function to perform gene set enrichment analysis
+perform_enrichment <- function(cell_type, degs_df, all_genes_in_subset, org_db_name, species_name, 
+                               output_directory, run_go = TRUE, run_kegg = TRUE, 
+                               p_value_cutoff = 0.05, q_value_cutoff = 0.2) {
+  
+  # Results container for this cell type
+  enrichment_results <- list()
+  
+  # Filter for significant DEGs
+  significant_degs <- degs_df %>% filter(p_val_adj < p_value_cutoff)
+  # 如何确认filter的阈值是一个大问题呀
+  significant_degs <- degs_df %>% filter(p_val < p_value_cutoff)
+  
+  cat("dataframe size after filter", dim(significant_degs))
+  
+  if (nrow(significant_degs) == 0) {
+    cat("    No significant DEGs for enrichment in cell type:", cell_type, "\n")
+    return(list())
+  }
+  
+  # Prepare gene lists
+  # gene_list_symbols <- significant_degs$gene
+  gene_list_symbols <- rownames(significant_degs)
+  # print(head(gene_list_symbols))
+  
+  # 1. GO Enrichment (Biological Process)
+  if (run_go) {
+    cat("    Running GO BP enrichment...\n")
+    ego_bp <- tryCatch({
+      enrichGO(gene          = gene_list_symbols,
+               OrgDb         = org_db_name,
+               keyType       = 'SYMBOL',
+               ont           = "BP",
+               pAdjustMethod = "BH",
+               pvalueCutoff  = p_value_cutoff,
+               qvalueCutoff  = q_value_cutoff,
+               universe      = all_genes_in_subset,
+               readable      = TRUE)
+    }, error = function(e) {
+      cat("      Error in GO enrichment for", cell_type, ":", e$message, "\n")
+      return(NULL)
+    })
+    
+    if (!is.null(ego_bp) && nrow(as.data.frame(ego_bp)) > 0) {
+      enrichment_results[["GOBP"]] <- ego_bp
+      write.csv(as.data.frame(ego_bp), 
+                file.path(output_directory, paste0("Enrichment_GOBP_", cell_type, ".csv")),
+                row.names = FALSE)
+      cat("    GO BP enrichment for", cell_type, "saved.\n")
+      
+      # Plot GO results
+      save_enrichment_plots(ego_bp, output_directory, "Enrichment_GOBP", cell_type)
+    } else {
+      cat("    No significant GO BP terms found for", cell_type, ".\n")
+    }
+  } else {
+    cat("    Skipping GO BP enrichment analysis for", cell_type, "\n")
+  }
+  
+  # 2. KEGG Pathway Enrichment
+  if (run_kegg) {
+    cat("    Running KEGG pathway enrichment...\n")
+    
+    # Map symbols to Entrez IDs
+    entrez_ids <- tryCatch({
+      mapIds(org_db_name, keys = gene_list_symbols, column = "ENTREZID", keytype = "SYMBOL", multiVals = "first")
+    }, error = function(e) { NULL })
+    
+    entrez_ids_universe <- tryCatch({
+      mapIds(org_db_name, keys = all_genes_in_subset, column = "ENTREZID", keytype = "SYMBOL", multiVals = "first")
+    }, error = function(e) { NULL })
+    
+    # Remove NAs from mapping
+    entrez_ids <- entrez_ids[!is.na(entrez_ids)]
+    entrez_ids_universe <- entrez_ids_universe[!is.na(entrez_ids_universe)]
+    
+    # print(head(entrez_ids))
+    
+    if (length(entrez_ids) > 10 && length(entrez_ids_universe) > 10) {
+      # Determine organism code
+      org_code <- ifelse(species_name == "Homo sapiens", "hsa", 
+                      ifelse(species_name == "Mus musculus", "mmu", "hsa"))
+      
+      ekegg <- tryCatch({
+        enrichKEGG(gene         = entrez_ids,
+                   organism     = org_code,
+                   pAdjustMethod = "BH",
+                   # pvalueCutoff  = p_value_cutoff,
+                   # qvalueCutoff  = q_value_cutoff,
+                   pvalueCutoff = 0.5,
+                   qvalueCutoff = 0.5,
+                   universe      = entrez_ids_universe
+                   )
+      }, error = function(e) {
+        cat("      Error in KEGG enrichment for", cell_type, ":", e$message, "\n")
+        return(NULL)
+      })
+      
+      if (!is.null(ekegg) && nrow(as.data.frame(ekegg)) > 0) {
+        # Convert Entrez IDs in results back to symbols for readability
+        ekegg <- setReadable(ekegg, OrgDb = org_db_name, keyType = "ENTREZID")
+        enrichment_results[["KEGG"]] <- ekegg
+        write.csv(as.data.frame(ekegg), 
+                  file.path(output_directory, paste0("Enrichment_KEGG_", cell_type, ".csv")),
+                  row.names = FALSE)
+        cat("    KEGG enrichment for", cell_type, "saved.\n")
+        
+        # Plot KEGG results
+        save_enrichment_plots(ekegg, output_directory, "Enrichment_KEGG", cell_type)
+      } else {
+        cat("    No significant KEGG pathways found for", cell_type, ".\n")
+      }
+    } else {
+      cat("    Not enough mapped Entrez IDs for KEGG analysis in cell type:", cell_type, "\n")
+    }
+  } else {
+    cat("    Skipping KEGG pathway enrichment analysis for", cell_type, "\n")
+  }
+  
+  return(enrichment_results)
+}
+
+# Main execution
+# 将以下代码添加到run_enrichment_analysis函数中
+run_enrichment_analysis <- function(dge_results_list, seu_obj, cell_type_column, org_db_name, 
+                                   species_name, output_directory, run_go = TRUE, run_kegg = TRUE,
+                                   universe_method = "unified") {
+  
+  # 创建输出目录
+  if (!dir.exists(output_directory)) {
+    dir.create(output_directory, recursive = TRUE)
+    cat("Created output directory:", output_directory, "\n")
+  }
+  
+  # 获取背景基因集
+  universe_genes <- NULL
+  if (universe_method == "unified") {
+    # 方法一：统一背景
+    universe_genes <- get_unified_universe(seu_obj)
+    cat("Using unified gene universe with", length(universe_genes), "genes\n")
+  } else if (universe_method == "filtered") {
+    # 方法二：筛选的背景
+    universe_genes <- get_filtered_universe(seu_obj, min_cells_percent = 0.01)
+    cat("Using filtered gene universe with", length(universe_genes), "genes\n")
+  }
+  
+  # 存储富集结果
+  enrichment_results_list <- list()
+  
+  # 处理每个细胞类型
+  for (ct in names(dge_results_list)) {
+    cat("\n=== Processing cell type:", ct, "===\n")
+    degs_df <- dge_results_list[[ct]]
+    
+    # 获取该细胞类型的背景基因
+    all_genes_in_subset <- universe_genes
+    if (universe_method == "celltype_specific") {
+      # 方法三：细胞类型特异的背景
+      all_genes_in_subset <- get_celltype_specific_universe(seu_obj, cell_type_column, ct)
+      cat("  Using cell-type specific universe with", length(all_genes_in_subset), "genes\n")
+    }
+    
+    # 运行富集分析
+    ct_results <- perform_enrichment(
+      cell_type = ct,
+      degs_df = degs_df,
+      all_genes_in_subset = all_genes_in_subset,
+      org_db_name = org_db_name,
+      species_name = species_name,
+      output_directory = output_directory,
+      run_go = run_go,
+      run_kegg = run_kegg
+    )
+    
+    # 存储结果
+    if (length(ct_results) > 0) {
+      for (analysis_type in names(ct_results)) {
+        enrichment_results_list[[paste0(ct, "_", analysis_type)]] <- ct_results[[analysis_type]]
+      }
+    }
+  }
+  
+  cat("\n--- Analysis Script Completed ---\n")
+  cat("All results and plots are saved in the directory:", output_directory, "\n")
+  
+  return(enrichment_results_list)
+}
+
+# 使用示例：
+# enrichment_results <- run_enrichment_analysis(
+#   dge_results_list = dge_results_list,
+#   seu_obj = seu_obj,
+#   cell_type_column = "cell_type", 
+#   org_db_name = org.Hs.eg.db,
+#   species_name = "Homo sapiens",
+#   output_directory = "path/to/output",
+#   run_go = TRUE,
+#   run_kegg = TRUE,
+#   universe_method = "unified"  # 可选: "unified", "filtered", "celltype_specific"
+# )
+
+```
+
+
+```{r}
+enrichment_results <- run_enrichment_analysis(
+  dge_results_list = all_de_results,
+  seu_obj = harmonized_seurat,
+  cell_type_column = "cell_type", 
+  org_db_name = org.Hs.eg.db,
+  species_name = "Homo sapiens",
+  output_directory = "./GSE136831/enrich_res",
+  run_go = FALSE,  # Set to FALSE to skip GO analysis
+  run_kegg = TRUE,  # Set to FALSE to skip KEGG analysis
+  universe_method = "unified"
+)
+```
+
+
+准备一个所有细胞亚群的差异基因list，
+```{r}
+#| include: false
+
+# 创建带有ID转换的ORA基因列表函数，使用bitr进行更安全的ID转换
+prepare_ora_list_with_entrez <- function(de_results_list, 
+                                         organism = "org.Hs.eg.db",
+                                         p_adj_cutoff = 0.05,
+                                         log2fc_cutoff = 0.25,
+                                         direction = "both") {
+  # 初始化结果列表
+  ora_list <- list()
+  
+  # 检查direction参数
+  direction <- match.arg(direction, c("both", "up", "down"))
+  
+  # 遍历每个细胞亚群
+  for (cluster_name in names(de_results_list)) {
+    # 获取当前亚群的差异表达结果
+    de_result <- de_results_list[[cluster_name]]
+    
+    # 确保结果数据框中包含必要的列
+    required_cols <- c("p_val_adj", "avg_log2FC")
+    if (all(required_cols %in% colnames(de_result))) {
+      # 添加基因符号列，确保bitr能正确处理
+      de_data <- de_result
+      de_data$SYMBOL <- rownames(de_data)
+      
+      # 首先移除包含NA值的行
+      de_data_clean <- de_data[
+        !is.na(de_data$p_val_adj) & 
+        !is.na(de_data$avg_log2FC), 
+      ]
+      
+      # 输出清理信息
+      if (nrow(de_data) > nrow(de_data_clean)) {
+        cat(sprintf("Cluster %s: Removed %d rows with NA values\n", 
+                    cluster_name, nrow(de_data) - nrow(de_data_clean)))
+      }
+      
+      # 根据p值和fold change筛选显著差异基因
+      if (direction == "both") {
+        significant_genes <- de_data_clean[
+          de_data_clean$p_val_adj < p_adj_cutoff & 
+          abs(de_data_clean$avg_log2FC) > log2fc_cutoff, 
+        ]
+      } else if (direction == "up") {
+        significant_genes <- de_data_clean[
+          de_data_clean$p_val_adj < p_adj_cutoff & 
+          de_data_clean$avg_log2FC > log2fc_cutoff, 
+        ]
+      } else if (direction == "down") {
+        significant_genes <- de_data_clean[
+          de_data_clean$p_val_adj < p_adj_cutoff & 
+          de_data_clean$avg_log2FC < -log2fc_cutoff, 
+        ]
+      }
+      
+      # 输出筛选信息
+      cat(sprintf("Cluster %s: %d significant genes found (p_adj < %g, |log2FC| > %g)\n", 
+                  cluster_name, nrow(significant_genes), p_adj_cutoff, log2fc_cutoff))
+      
+      # 确保有显著差异基因
+      if (nrow(significant_genes) > 0) {
+        # 使用bitr进行ID转换
+        id_mapping <- bitr(
+          significant_genes$SYMBOL, 
+          fromType = "SYMBOL",
+          toType = "ENTREZID",
+          OrgDb = organism
+        )
+        
+        # 将ID转换结果合并到筛选后的数据
+        significant_genes_mapped <- merge(significant_genes, id_mapping, 
+                                        by = "SYMBOL", all = FALSE)
+        
+        # 输出转换信息
+        cat(sprintf("Cluster %s: %d of %d significant genes successfully mapped to Entrez IDs\n", 
+                    cluster_name, nrow(significant_genes_mapped), nrow(significant_genes)))
+        
+        # 确保有映射成功的基因
+        if (nrow(significant_genes_mapped) > 0) {
+          # 提取Entrez ID列表用于ORA分析
+          gene_list <- significant_genes_mapped$ENTREZID
+          
+          # 将基因列表添加到结果列表
+          ora_list[[cluster_name]] <- gene_list
+        } else {
+          warning(paste("No significant genes could be mapped to Entrez ID in cluster:", cluster_name))
+        }
+      } else {
+        warning(paste("No significant genes found in cluster:", cluster_name))
+      }
+    } else {
+      missing_cols <- setdiff(required_cols, colnames(de_result))
+      warning(paste("Missing required columns in cluster", cluster_name, ":", 
+                   paste(missing_cols, collapse = ", ")))
+    }
+  }
+  
+  return(ora_list)
+}
+
+# 使用示例：
+# 1. 分析所有显著差异基因（上调和下调）
+ck_list_ora_all <- prepare_ora_list_with_entrez(
+  all_de_results, 
+  organism = "org.Hs.eg.db",
+  p_adj_cutoff = 0.05,
+  log2fc_cutoff = 0.25,
+  direction = "both"
+)
+
+# 2. 仅分析上调基因
+# ck_list_ora_up <- prepare_ora_list_with_entrez(
+#   all_de_results, 
+#   organism = "org.Hs.eg.db",
+#   p_adj_cutoff = 0.05,
+#   log2fc_cutoff = 0.25,
+#   direction = "up"
+# )
+
+# 3. 仅分析下调基因
+# ck_list_ora_down <- prepare_ora_list_with_entrez(
+#   all_de_results, 
+#   organism = "org.Hs.eg.db",
+#   p_adj_cutoff = 0.05,
+#   log2fc_cutoff = 0.25,
+#   direction = "down"
+# )
+
+# 如果使用小鼠数据，请将organism改为"org.Mm.eg.db"
+# ck_list_ora <- prepare_ora_list_with_entrez(all_de_results, 
+#                                             organism = "org.Mm.eg.db")
+
+# 使用生成的列表进行ORA分析
+# library(clusterProfiler)
+# ora_results <- compareCluster(
+#   geneClusters = ck_list_ora_all,
+#   fun = "enrichGO",
+#   OrgDb = org.Hs.eg.db,
+#   ont = "BP",
+#   pAdjustMethod = "BH",
+#   pvalueCutoff = 0.05,
+#   qvalueCutoff = 0.2
+# )
+
+```
+
+
+```{r}
+# 过滤掉差异基因数量少于5的细胞亚群
+ck_list_ora_all_filtered <- ck_list_ora_all[lengths(ck_list_ora_all) >= 5]
+
+# 查看过滤前后的比较
+cat("Before filtering:", length(ck_list_ora_all), "clusters\n")
+cat("After filtering:", length(ck_list_ora_all_filtered), "clusters\n")
+
+# 显示每个亚群的基因数量
+cat("\nGene counts per cluster (before filtering):\n")
+print(lengths(ck_list_ora_all))
+
+cat("\nGene counts per cluster (after filtering):\n")
+print(lengths(ck_list_ora_all_filtered))
+
+# 显示被过滤掉的亚群
+filtered_out <- names(ck_list_ora_all)[lengths(ck_list_ora_all) < 5]
+if (length(filtered_out) > 0) {
+  cat("\nFiltered out clusters (< 5 genes):\n")
+  print(filtered_out)
+}
+```
+
+
+准备`compareCluster` 的输入，
+虽然上面的输入也是可以的，但似乎下面的更简单方便：
+```{r}
+all_de_combined <- all_de_results %>%
+  map(~ .x %>% rownames_to_column(var = "gene")) %>%
+  bind_rows(.id = "cluster")
+```
+
+对所谓差异基因的filter是个略显主观的事情：
+```{r}
+all_filted_genes <- all_de_combined %>% 
+  group_by(cell_type) %>% 
+  filter(p_val_adj < 0.05) %>% 
+  ungroup()
+
+gid <- bitr(unique(all_filted_genes$gene), 
+            'SYMBOL', 
+            'ENTREZID', 
+            OrgDb= 'org.Hs.eg.db')
+
+all_filted_genes <- full_join(all_filted_genes, 
+                              gid, 
+                              by=c('gene' = 'SYMBOL')) %>% 
+  drop_na(ENTREZID)
+```
+
+
+```{r}
+ck <- compareCluster(ENTREZID ~ cluster,
+  data = all_filted_genes,
+  fun = "enrichKEGG",
+  pvalueCutoff = 0.1,
+  qvalueCutoff = 0.1,
+  minGSSize = 5,
+  maxGSSize = 500
+)
+
+ck <- setReadable(ck, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+```
+
+
+```{r}
+dotplot(ck, label_format=40) + 
+  theme(axis.text.x = element_text(angle=45, 
+                                   hjust=1)
+        ) 
+```
+
+检查补体通路的存在与否
+```{r}
+ck@compareClusterResult %>% 
+  filter(str_detect(Description, regex('Complement', 
+                                       ignore_case = TRUE)))
+```
+
+```{r}
+# ck@compareClusterResult %>% 
+#   write_excel_csv('./GSE136831/enrich_res/ora_kegg_result.csv')
+```
+
+
+```{r}
+ck2 <- compareCluster(ENTREZID ~ cluster,
+  data = all_filted_genes,
+  fun = "enrichPathway",
+  pvalueCutoff = 0.1,
+  qvalueCutoff = 0.1,
+  organism = "human",
+  minGSSize = 5,
+  maxGSSize = 500,
+  readable = TRUE
+)
+
+# ck2 <- setReadable(ck2, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+```
+
+
+```{r}
+ck2@compareClusterResult %>% 
+  filter(str_detect(Description, regex('Complement', 
+                                       ignore_case = TRUE)))
+```
+
+```{r}
+ck2@compareClusterResult %>% 
+  write_excel_csv('./GSE136831/enrich_res/ora_Reactome_result.csv')
+```
+
+
+```{r}
+ck3 <- compareCluster(
+  ENTREZID ~ cluster,
+  data = all_filted_genes,
+  fun = "enrichGO",
+  ont = 'BP',
+  OrgDb = org.Hs.eg.db,
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.2,
+  pAdjustMethod = "BH",
+  readable = TRUE
+)
+```
+
+```{r}
+ck3@compareClusterResult %>% 
+  filter(str_detect(Description, regex('Complement', 
+                                       ignore_case = TRUE)))
+```
+
+```{r}
+ck3@compareClusterResult %>% 
+  write_excel_csv('./GSE136831/enrich_res/ora_GOBP_result.csv')
+```
+
+
+##### GSEA算法的富集分析：
+
+首先是对所有的细胞类型整理成适合`gsea`输入的格式：
+```{r}
+# 创建带有ID转换的GSEA基因列表函数，使用bitr进行更安全的ID转换
+prepare_gsea_list_with_entrez <- function(de_results_list, organism = "org.Hs.eg.db") {
+  # 初始化结果列表
+  gsea_list <- list()
+
+  # 遍历每个细胞亚群
+  for (cluster_name in names(de_results_list)) {
+    # 获取当前亚群的差异表达结果
+    de_result <- de_results_list[[cluster_name]]
+
+    # 确保结果数据框中包含avg_log2FC列
+    if ("avg_log2FC" %in% colnames(de_result)) {
+      # 添加基因符号列，确保bitr能正确处理
+      de_data <- de_result
+      de_data$SYMBOL <- rownames(de_data)
+
+      # 使用bitr进行ID转换
+      id_mapping <- bitr(
+        de_data$SYMBOL,
+        fromType = "SYMBOL",
+        toType = "ENTREZID",
+        OrgDb = organism
+      )
+
+      # 将ID转换结果合并到原始数据
+      # de_data_mapped <- merge(de_data, id_mapping, by = "SYMBOL", all = FALSE)
+      de_data_mapped <- de_data %>%
+        left_join(id_mapping, by = "SYMBOL") |>
+        dplyr::filter(!is.na(ENTREZID)) |>
+        dplyr::select(ENTREZID, avg_log2FC) %>%
+        drop_na(avg_log2FC) %>%
+        group_by(ENTREZID) %>%
+        slice_max(order_by = avg_log2FC, n = 1) %>%
+        ungroup() %>%
+        arrange(desc(avg_log2FC))
+
+      # 输出转换信息
+      cat(sprintf(
+        "Cluster %s: %d of %d genes successfully mapped to Entrez IDs\n",
+        cluster_name, nrow(de_data_mapped), nrow(de_data)
+      ))
+
+      # 确保有映射成功的基因
+      if (nrow(de_data_mapped) > 0) {
+        # 提取基因列表
+        gene_list <- de_data_mapped$avg_log2FC
+        names(gene_list) <- de_data_mapped$ENTREZID
+
+        # 排序基因列表，从高到低
+        gene_list <- sort(gene_list, decreasing = TRUE)
+
+        # 将排序后的基因列表添加到结果列表
+        gsea_list[[cluster_name]] <- gene_list
+      } else {
+        warning(paste("No genes could be mapped to Entrez ID in cluster:", cluster_name))
+      }
+    } else {
+      warning(paste("No avg_log2FC column found in cluster:", cluster_name))
+    }
+  }
+
+  return(gsea_list)
+}
+
+# 应用函数创建GSEA基因列表，转换为Entrez ID
+# 如果使用小鼠数据，请将organism改为"org.Mm.eg.db"
+ck_list_gsea <- prepare_gsea_list_with_entrez(all_de_results, 
+                                              organism = "org.Hs.eg.db")
+
+
+```
+
+
+`compareCluster`是非常易于使用的。great!
+```{r}
+# 现在可以使用ck_list_gsea进行compareCluster分析
+ck_gsea <- compareCluster(
+  geneClusters = ck_list_gsea,
+  fun = "gseKEGG",
+  pvalueCutoff = 0.1,
+  seed = TRUE,
+  exponent = 1,
+  minGSSize = 10,
+  maxGSSize = 500,
+  organism = "hsa"  # 人类用"hsa"，小鼠用"mmu"
+)
+
+ck_gsea <- setReadable(ck_gsea, OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+```
+
+
+```{r}
+
+p.adjust_cutoff <- 0.05
+ck_f <- ck_gsea %>% dplyr::filter(p.adjust < {{ p.adjust_cutoff }})
+
+enrichplot::dotplot(ck_f,
+    label_format = 40,
+    showCategory = 15,
+    group = F,
+    color = "p.adjust",
+    by = "geneRatio",
+    size = "geneRatio",
+    title = glue::glue("P<{p.adjust_cutoff}"),
+    font.size = 6
+    # label_format = f
+  ) +
+    theme(
+      axis.text.x = element_text(angle = 90),
+      # axis.text.y = element_markdown()
+    ) +
+    scale_fill_gradientn(
+      colors = RColorBrewer::brewer.pal(11, "RdBu"),
+      breaks = c(0, 0.025, 0.05),
+      limits = c(0, 0.05)
+    )
+```
+
+```{r}
+ck_gsea@compareClusterResult %>% 
+  filter(str_detect(Description, regex('Complement', ignore_case = TRUE)))
+```
+
+保存分析的结果：
+```{r}
+write_delim(ck_gsea@compareClusterResult,
+  file = file.path(
+    './GSE136831/enrich_res',
+    paste0("gsea_kegg.txt")
+  ),
+  delim = "\t"
+)
+```
+
+
+或许也可以直接用上面整理好的complement相关的基因集,
+不过geneid不匹配。
+
+```{r}
+entrez_df <- bitr(complement_gene_sets_df$gene_symbol,
+                  fromType = "SYMBOL",
+                  toType = "ENTREZID",
+                  OrgDb = org.Hs.eg.db)
+
+# 合并回原始数据
+geneset_entrez <- merge(complement_gene_sets_df, entrez_df, 
+                        by.x = "gene_symbol", by.y = "SYMBOL")
+
+# 构造 TERM2GENE 格式
+term2gene <- geneset_entrez[, c("gs_name", "ENTREZID")]
+colnames(term2gene) <- c("term", "gene")
+```
+
+```{r}
+ck_own <- compareCluster(
+  geneClusters = ck_list_gsea,
+  fun = "GSEA",
+  pvalueCutoff = 0.1,
+  seed = TRUE,
+  TERM2GENE = term2gene
+)
+
+```
+
+
+
+```{r}
+ck_own@compareClusterResult %>% 
+  filter(str_detect(Description, regex('Complement', ignore_case = TRUE)))
+```
+
+```{r}
+write_delim(ck_own@compareClusterResult,
+  file = file.path(
+    './GSE136831/enrich_res',
+    paste0("gsea_kegg_diy.txt")
+  ),
+  delim = "\t"
+)
+```
+
+
+#### 针对FindAllMarkers的结果
+
+针对`FindAllMarkers`的结果直接进行富集分析,
+利用compareCluster函数还是很简单的。
+
+```{r}
+markers <- cluster_markers |> group_by(cluster) |>
+    filter(p_val_adj < 0.001) |>
+    ungroup()
+
+gid <- bitr(unique(markers$gene), 'SYMBOL', 'ENTREZID', OrgDb= 'org.Hs.eg.db')
+markers <- full_join(markers, gid, by=c('gene' = 'SYMBOL'))
+```
+
+
+```{r}
+x = compareCluster(ENTREZID ~ cluster, data = markers, fun='enrichKEGG')
+```
+
+
+```{r}
+dotplot(x, label_format=40) + 
+  theme(axis.text.x = element_text(angle=45, 
+                                   hjust=1)
+        ) 
+```
+
+
+#### GSVA Anayslis
+
+GSVA分析可以在cell层面或者aggregate后的样本层面对每一个pathway
+提供一个
+
+```{r}
+library(GSVA)
+library(GSEABase)
+library(limma)
+library(BiocParallel)
+```
+
+
+
+
+
+
+
+
+
