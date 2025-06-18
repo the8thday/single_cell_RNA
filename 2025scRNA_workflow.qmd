@@ -23,6 +23,7 @@ library(SingleCellExperiment)
 library(Seurat)
 # library(BPCells) # Efficient storage of single cell datasets via bitpacking compression
 # library(SeuratWrappers)
+library(SeuratExtend)
 
 # library(miloR)
 # library(ROGUE) # 一万年没更新了
@@ -35,8 +36,11 @@ library(SCpubr)
 #LLM
 # library(ceLLama)
 # library(Azimuth)
+# library(mLLMCelltype)
+# library(CASSIA)
 library(SingleR)
 
+library(BiocParallel)
 library(patchwork)
 library(viridis)
 library(qs)
@@ -1130,6 +1134,115 @@ DimPlot_scCustom(harmonized_seurat,
         split.by = "Disease_Identity",
         split_seurat = TRUE
         )  + NoLegend()
+```
+
+#### SingleR or Celltypist
+
+```{r}
+require(Azimuth)
+require(SingleR)
+library(celldex)
+```
+
+
+```{r}
+DefaultAssay(harmonized_seurat) <- 'RNA'
+harmonized_seurat <- JoinLayers(harmonized_seurat)
+```
+
+
+```{r}
+# For Seurat v5, use the RNA assay
+counts_matrix <- GetAssayData(harmonized_seurat, assay = "RNA", layer = "data")
+
+# Get human reference datasets from celldex
+ref_hpca <- HumanPrimaryCellAtlasData()  # Human Primary Cell Atlas
+ref_blueprint <- BlueprintEncodeData()   # Blueprint/ENCODE
+ref_monaco <- MonacoImmuneData()         # Monaco Immune cells (good for immune cells)
+
+# Run SingleR annotation
+pred_hpca <- SingleR(test = counts_matrix, 
+                     ref = ref_hpca, 
+                     labels = ref_hpca$label.main)
+
+pred_blueprint <- SingleR(test = counts_matrix, 
+                          ref = ref_blueprint, 
+                          labels = ref_blueprint$label.main)
+
+# For IPF samples, Monaco might be particularly useful for immune cells
+pred_monaco <- SingleR(test = counts_matrix, 
+                       ref = ref_monaco, 
+                       labels = ref_monaco$label.main)
+```
+
+
+```{r}
+# Add SingleR predictions to Seurat metadata
+harmonized_seurat$SingleR_HPCA <- pred_hpca$labels
+harmonized_seurat$SingleR_Blueprint <- pred_blueprint$labels
+harmonized_seurat$SingleR_Monaco <- pred_monaco$labels
+
+# Add confidence scores
+# seurat_obj$SingleR_HPCA_score <- pred_hpca$scores[cbind(1:nrow(pred_hpca$scores), 
+#                                                         match(pred_hpca$labels, colnames(pred_hpca$scores)))]
+```
+
+
+```{r}
+DimPlot_scCustom(harmonized_seurat, group.by = "SingleR_HPCA", label = TRUE, repel = TRUE) + 
+  NoLegend() +
+  ggtitle("SingleR HPCA Annotations")
+```
+
+```{r}
+plotScoreHeatmap(pred_hpca)
+```
+
+
+#### Celltypist
+
+```{r}
+# 小数据集可以考虑用网页版
+# 生成网页版的输入
+
+GetAssayData(harmonized_seurat,
+             assay = 'RNA',
+             layer = 'counts'
+) %>% 
+  as.matrix() %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "gene_symbol") %>% 
+  readr::write_excel_csv('./GSE141939/raw_counts.csv')
+```
+
+
+```{r}
+celltypist_results <- read_csv(
+  './GSE141939/predicted_labels.csv'
+)
+```
+
+```{r}
+celltypist_df <- data.frame(
+  barcode = celltypist_results$...1,
+  predicted_type = celltypist_results$majority_voting
+)
+rownames(celltypist_df) <- celltypist_df$barcode
+```
+
+```{r}
+harmonized_seurat <- AddMetaData(
+  object = harmonized_seurat,
+  metadata = celltypist_df["predicted_type"]  # 只提取预测列
+)
+```
+
+
+```{r}
+DimPlot_scCustom(harmonized_seurat, 
+        reduction = "umap", 
+        group.by  = "predicted_type",
+        label = T)
 ```
 
 
