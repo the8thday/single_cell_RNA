@@ -1,0 +1,369 @@
+---
+title: "GSVA Pathway Enrichment Analysis"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+---
+
+
+## Introduction
+
+GSVA (Gene Set Variation Analysis) 基于表达矩阵计算每个样本中基因集的富集变异分数，无需预先做差异分析。与 GSEA 不同，GSVA 适用于多分组、多样本的复杂实验设计。
+
+对于单细胞数据，推荐使用 **pseudobulk** 策略：先按 cell_type + sample 聚合为伪批量表达矩阵，再跑 GSVA + limma 差异分析。这比逐细胞跑 GSVA 更快、统计上更合理（避免伪重复问题）。
+
+
+## Setup
+
+```{r}
+#| include: false
+
+library(Seurat)
+library(GSVA)
+library(GSEABase)
+library(limma)
+library(msigdbr)
+library(tidyverse)
+library(ComplexHeatmap)
+library(circlize)
+library(patchwork)
+library(ggpubr)
+library(qs2)
+
+options(future.globals.maxSize = 40 * 1024^3)
+```
+
+
+## Load Data
+
+```{r}
+seurat_obj <- qs2::qs_read("datasets/harmonized_seurat.qs")
+
+table(seurat_obj$cell_type)
+table(seurat_obj$group)
+table(seurat_obj$cell_type, seurat_obj$group)
+```
+
+
+## Prepare Gene Sets
+
+```{r}
+# Hallmark
+hallmark_sets <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# KEGG 通路
+kegg_sets <- msigdbr(species = "Homo sapiens", category = "C2", subcollection = "CP:KEGG") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# Reactome 通路（比 KEGG 更新更全）
+reactome_sets <- msigdbr(species = "Homo sapiens", category = "C2", subcollection = "CP:REACTOME") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# 合并基因集
+gene_sets <- c(hallmark_sets, kegg_sets, reactome_sets)
+length(gene_sets)
+```
+
+
+## Pseudobulk GSVA（推荐方法）
+
+将单细胞按 cell_type × sample 聚合为伪批量表达矩阵，避免伪重复，统计更稳健。
+
+### 构建伪批量矩阵
+
+```{r}
+# 创建 sample_id 列（如果没有的话，用 group 代替）
+# 如果有 orig.ident 或其他 sample 标识，建议使用真实 sample_id
+seurat_obj$sample_id <- seurat_obj$orig.ident
+
+# 按 cell_type + sample 聚合
+pseudo_bulk <- AggregateExpression(
+  seurat_obj,
+  assays = "RNA",
+  group.by = c("cell_type", "sample_id"),
+  return.seurat = FALSE
+)$RNA
+
+# 查看伪批量矩阵维度
+dim(pseudo_bulk)
+colnames(pseudo_bulk)[1:10]
+```
+
+### 运行 GSVA
+
+```{r}
+# GSVA 新版 API（>= 1.46.0）
+gsva_param <- gsvaParam(
+  exprData = as.matrix(pseudo_bulk),
+  geneSets = gene_sets,
+  kcdf = "Poisson",   # counts 数据用 Poisson
+  minSize = 10,
+  maxSize = 500
+)
+
+gsva_es <- gsva(gsva_param)
+dim(gsva_es)
+```
+
+### 解析 metadata
+
+```{r}
+# 从列名中解析 cell_type 和 sample_id
+# AggregateExpression 的列名格式为 "celltype_sampleid"
+col_info <- data.frame(
+  sample_col = colnames(gsva_es)
+) %>%
+  separate(sample_col, into = c("cell_type", "sample_id"),
+           sep = "_", extra = "merge", remove = FALSE) %>%
+  left_join(
+    seurat_obj@meta.data %>%
+      select(sample_id = orig.ident, group) %>%
+      distinct(),
+    by = "sample_id"
+  )
+
+rownames(col_info) <- col_info$sample_col
+col_info
+```
+
+
+## 差异富集分析（limma）
+
+对每个细胞类型，比较 Normal vs Treatment 组间的通路活性差异。
+
+```{r}
+cell_types <- unique(col_info$cell_type)
+
+diff_results <- lapply(cell_types, function(ct) {
+  # 筛选当前细胞类型的样本
+  idx <- col_info$cell_type == ct
+
+  if (sum(idx) < 2) return(NULL)
+
+  mat <- gsva_es[, col_info$sample_col[idx]]
+  grp <- factor(col_info$group[idx])
+
+  if (nlevels(grp) < 2) return(NULL)
+
+  # limma 差异分析
+  design <- model.matrix(~ 0 + grp)
+  colnames(design) <- levels(grp)
+
+  fit <- lmFit(mat, design)
+
+  # 构建对比：Treatment vs Normal
+  treatment_name <- setdiff(levels(grp), "Normal")
+  contrast_str <- paste0(treatment_name, " - Normal")
+  contrast_mat <- makeContrasts(contrasts = contrast_str, levels = design)
+
+  fit2 <- contrasts.fit(fit, contrast_mat)
+  fit2 <- eBayes(fit2)
+
+  topTable(fit2, number = Inf) %>%
+    rownames_to_column("pathway") %>%
+    mutate(cell_type = ct) %>%
+    arrange(adj.P.Val)
+}) %>%
+  bind_rows()
+
+# 显著结果概览
+diff_results %>%
+  filter(adj.P.Val < 0.05) %>%
+  count(cell_type) %>%
+  arrange(desc(n))
+```
+
+
+## Visualizations
+
+### Heatmap：显著通路的 GSVA 得分
+
+```{r}
+#| fig-width: 14
+#| fig-height: 10
+
+# 选取 top 显著通路
+sig_pathways <- diff_results %>%
+  filter(adj.P.Val < 0.05) %>%
+  group_by(pathway) %>%
+  summarise(min_padj = min(adj.P.Val), .groups = "drop") %>%
+  slice_min(min_padj, n = 30) %>%
+  pull(pathway)
+
+if (length(sig_pathways) > 0) {
+  # 计算每个 cell_type 的平均 GSVA 分数
+  mean_gsva <- sapply(cell_types, function(ct) {
+    idx <- col_info$cell_type == ct
+    if (sum(idx) > 1) {
+      rowMeans(gsva_es[sig_pathways, col_info$sample_col[idx], drop = FALSE])
+    } else {
+      gsva_es[sig_pathways, col_info$sample_col[idx]]
+    }
+  })
+
+  Heatmap(
+    t(scale(t(mean_gsva))),
+    name = "Scaled\nGSVA Score",
+    row_names_gp = gpar(fontsize = 7),
+    column_names_gp = gpar(fontsize = 10),
+    column_names_rot = 45,
+    col = colorRamp2(c(-2, 0, 2), c("blue", "white", "red")),
+    show_row_dend = TRUE,
+    show_column_dend = TRUE
+  )
+}
+```
+
+### Dot Plot：显著通路 logFC + 显著性
+
+```{r}
+#| fig-width: 12
+#| fig-height: 10
+
+top_diff <- diff_results %>%
+  filter(adj.P.Val < 0.05) %>%
+  group_by(cell_type) %>%
+  slice_min(adj.P.Val, n = 10) %>%
+  ungroup()
+
+if (nrow(top_diff) > 0) {
+  top_diff %>%
+    mutate(
+      pathway_short = str_replace(pathway, "^HALLMARK_|^KEGG_", ""),
+      pathway_short = str_replace_all(pathway_short, "_", " "),
+      pathway_short = str_trunc(pathway_short, 40),
+      sig_label = case_when(
+        adj.P.Val < 0.001 ~ "***",
+        adj.P.Val < 0.01  ~ "**",
+        adj.P.Val < 0.05  ~ "*",
+        TRUE ~ "ns"
+      )
+    ) %>%
+    ggplot(aes(x = cell_type, y = reorder(pathway_short, logFC))) +
+    geom_point(aes(size = -log10(adj.P.Val), color = logFC)) +
+    scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+    scale_size_continuous(range = c(2, 6)) +
+    theme_classic() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.text.y = element_text(size = 7)
+    ) +
+    labs(x = "Cell Type", y = "", color = "logFC", size = "-log10(padj)")
+}
+```
+
+### Delta Heatmap：Treatment vs Normal 差异
+
+```{r}
+#| fig-width: 14
+#| fig-height: 10
+
+# 使用 limma 的 logFC 构建 delta 矩阵
+delta_mat <- diff_results %>%
+  filter(pathway %in% sig_pathways) %>%
+  select(pathway, cell_type, logFC) %>%
+  pivot_wider(names_from = cell_type, values_from = logFC) %>%
+  column_to_rownames("pathway") %>%
+  as.matrix()
+
+max_abs <- max(abs(delta_mat), na.rm = TRUE)
+
+Heatmap(
+  delta_mat,
+  name = "logFC\n(Treatment - Normal)",
+  col = colorRamp2(c(-max_abs, 0, max_abs), c("blue", "white", "red")),
+  row_names_gp = gpar(fontsize = 7),
+  column_names_gp = gpar(fontsize = 10),
+  column_names_rot = 45,
+  na_col = "grey90"
+)
+```
+
+### Box Plots：分组比较（top 通路）
+
+```{r}
+#| fig-width: 16
+#| fig-height: 12
+
+top4 <- diff_results %>%
+  filter(adj.P.Val < 0.05) %>%
+  slice_min(adj.P.Val, n = 4) %>%
+  pull(pathway)
+
+if (length(top4) > 0) {
+  p_list <- lapply(top4, function(pw) {
+    plot_df <- data.frame(
+      gsva_score = gsva_es[pw, ],
+      cell_type = col_info$cell_type,
+      group = col_info$group
+    )
+
+    ggplot(plot_df, aes(x = cell_type, y = gsva_score, fill = group)) +
+      geom_boxplot(outlier.size = 0.5) +
+      theme_classic() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      ggtitle(str_replace(pw, "^HALLMARK_|^KEGG_", "")) +
+      labs(y = "GSVA Score")
+  })
+
+  wrap_plots(p_list, ncol = 2)
+}
+```
+
+
+## 单细胞水平 GSVA（可选）
+
+对特定细胞类型直接在单细胞上跑 GSVA。适合细胞量较少或需要在 UMAP 上展示的场景。
+
+```{r}
+#| eval: false
+
+# 选择目标细胞类型
+target_ct <- "T cells"  # 替换为实际细胞类型
+cells_sub <- subset(seurat_obj, cell_type == target_ct)
+
+# 提取表达矩阵
+expr_mat <- as.matrix(GetAssayData(cells_sub, assay = "RNA", layer = "data"))
+
+# GSVA（单细胞水平，较慢）
+gsva_sc_param <- gsvaParam(
+  exprData = expr_mat,
+  geneSets = hallmark_sets,
+  kcdf = "Gaussian",  # 归一化后的数据用 Gaussian
+  minSize = 10,
+  maxSize = 500
+)
+
+gsva_sc <- gsva(gsva_sc_param)
+
+# 添加到 Seurat metadata
+gsva_df <- as.data.frame(t(gsva_sc))
+colnames(gsva_df) <- make.names(colnames(gsva_df)) %>% gsub("-", "_", .)
+cells_sub <- AddMetaData(cells_sub, gsva_df)
+
+# UMAP 可视化
+FeaturePlot(cells_sub, features = "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",
+            reduction = "umap") +
+  scale_color_viridis_c(option = "inferno") +
+  theme_classic()
+```
+
+
+## Save Results
+
+```{r}
+# 差异分析结果
+write.csv(diff_results, "Results/GSVA_diff_results.csv", row.names = FALSE)
+
+# 显著结果
+diff_results %>%
+  filter(adj.P.Val < 0.05) %>%
+  write.csv("Results/GSVA_significant_pathways.csv", row.names = FALSE)
+
+# GSVA 得分矩阵（pseudobulk）
+write.csv(as.data.frame(gsva_es), "Results/GSVA_pseudobulk_scores.csv", row.names = TRUE)
+
+message("GSVA 分析完成！")
+```

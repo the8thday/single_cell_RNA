@@ -1,0 +1,439 @@
+---
+title: "AUCell Pathway Activity Analysis"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+---
+
+
+## Introduction
+
+AUCell (Area Under the Curve for Cell) 是一种基于排名的通路活性评估方法，适用于单细胞RNA-seq数据。与GSVA不同，AUCell不依赖于跨细胞的归一化，而是在每个细胞内部独立计算基因集的富集程度。其核心思想是：如果一个通路中的基因在某个细胞的表达排名中集中出现在前5%，则认为该通路在该细胞中是活跃的。
+
+优点：
+
+- 不受dropout影响（基于排名而非绝对表达量）
+- 每个细胞独立评估，无需跨细胞比较
+- 计算结果可直接作为metadata添加到Seurat对象中
+
+
+## Setup
+
+```{r}
+#| include: false
+
+library(AUCell)
+library(GSEABase)
+library(Seurat)
+library(tidyverse)
+library(msigdbr)
+library(patchwork)
+library(viridis)
+library(ComplexHeatmap)
+library(circlize)
+library(ggridges)
+library(ggpubr)
+library(qs2)
+
+options(future.globals.maxSize = 40 * 1024^3)
+```
+
+
+## Load Data
+
+```{r}
+seurat_obj <- qs2::qs_read("datasets/harmonized_seurat.qs")
+
+# 查看细胞类型和分组分布
+table(seurat_obj$cell_type)
+table(seurat_obj$group)
+table(seurat_obj$cell_type, seurat_obj$group)
+```
+
+
+## Prepare Gene Sets
+
+### MSigDB: Hallmark + KEGG + Reactome
+
+```{r}
+# Hallmark gene sets（炎症、免疫、信号通路等核心集）
+hallmark_sets <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# KEGG 通路
+kegg_sets <- msigdbr(species = "Homo sapiens", category = "C2", subcollection = "CP:KEGG") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# Reactome 通路（比 KEGG 更新更全）
+reactome_sets <- msigdbr(species = "Homo sapiens", category = "C2", subcollection = "CP:REACTOME") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# 合并
+gene_sets <- c(hallmark_sets, kegg_sets, reactome_sets)
+```
+
+### Custom Gene Sets（自定义通路，自免相关）
+
+```{r}
+custom_sets <- list(
+  Th1_signature = c("TBX21", "IFNG", "TNF", "IL2", "STAT1", "STAT4",
+                     "CXCR3", "CCR5", "IL12RB1", "IL12RB2"),
+  Th2_signature = c("GATA3", "IL4", "IL5", "IL13", "STAT6",
+                     "CCR4", "CCR3", "IL4R", "IL33"),
+  Th17_signature = c("RORC", "IL17A", "IL17F", "IL22", "IL23R",
+                      "CCR6", "STAT3", "IL6R", "IL21"),
+  Treg_signature = c("FOXP3", "IL2RA", "CTLA4", "TIGIT", "IL10",
+                      "TGFB1", "IKZF2", "TNFRSF18", "LRRC32"),
+  Inflammatory_signature = c("IL1B", "IL6", "TNF", "CXCL8", "CCL2",
+                              "NFKB1", "PTGS2", "MMP9", "ICAM1", "VCAM1")
+)
+
+gene_sets <- c(gene_sets, custom_sets)
+```
+
+### GMT File（可选）
+
+```{r}
+#| eval: false
+
+# 从GMT文件读取基因集
+# gmt_lines <- readLines("path/to/your_gene_sets.gmt")
+# gmt_sets <- lapply(gmt_lines, function(line) {
+#   fields <- strsplit(line, "\t")[[1]]
+#   genes <- fields[3:length(fields)]
+#   genes <- genes[genes != ""]
+#   return(genes)
+# })
+# names(gmt_sets) <- sapply(gmt_lines, function(line) strsplit(line, "\t")[[1]][1])
+# gene_sets <- c(gene_sets, gmt_sets)
+```
+
+### Convert to GeneSetCollection
+
+```{r}
+# 转换为GeneSetCollection对象
+gene_set_collection <- lapply(names(gene_sets), function(name) {
+  GeneSet(gene_sets[[name]], setName = name)
+})
+gene_set_collection <- GeneSetCollection(gene_set_collection)
+```
+
+
+## Build Expression Rankings
+
+```{r}
+# 使用RNA counts矩阵（非SCT），AUCell内部会自行排名
+exprMatrix <- GetAssayData(seurat_obj, assay = "RNA", layer = "counts")
+
+# 构建排名矩阵（139K cells，需要较大内存）
+cells_rankings <- AUCell_buildRankings(exprMatrix, nCores = 4, plotStats = TRUE)
+```
+
+
+## Calculate AUC Scores
+
+```{r}
+# 计算AUC分数，aucMaxRank设为top 5%
+cells_AUC <- AUCell_calcAUC(
+  gene_set_collection,
+  cells_rankings,
+  aucMaxRank = nrow(cells_rankings) * 0.05
+)
+```
+
+
+## Explore Thresholds
+
+```{r}
+#| fig-width: 12
+#| fig-height: 8
+
+# 自动探索阈值（选取前几个通路展示）
+set.seed(42)
+example_sets <- head(names(gene_sets), 6)
+cells_assignment <- AUCell_exploreThresholds(
+  cells_AUC[example_sets, ],
+  plotHist = TRUE,
+  assign = TRUE
+)
+```
+
+
+## Add AUC to Seurat Metadata
+
+```{r}
+# 提取AUC矩阵
+auc_matrix <- getAUC(cells_AUC)
+
+# 清理通路名称，确保可以作为metadata列名
+rownames(auc_matrix) <- rownames(auc_matrix) %>%
+  make.names() %>%
+  gsub("-", "_", .)
+
+# 转置后添加到Seurat metadata
+auc_df <- as.data.frame(t(auc_matrix))
+seurat_obj <- AddMetaData(seurat_obj, metadata = auc_df)
+```
+
+
+## Visualizations
+
+### UMAP Overlay
+
+```{r}
+#| fig-width: 16
+#| fig-height: 12
+
+# 选取免疫相关 Hallmark 通路展示
+immune_pathways <- c(
+  "HALLMARK_INFLAMMATORY_RESPONSE",
+  "HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+  "HALLMARK_IL6_JAK_STAT3_SIGNALING",
+  "HALLMARK_INTERFERON_GAMMA_RESPONSE"
+) %>% make.names() %>% gsub("-", "_", .)
+
+show_pathways <- intersect(immune_pathways, colnames(seurat_obj@meta.data))
+
+p_list <- lapply(show_pathways, function(pw) {
+  FeaturePlot(seurat_obj, features = pw, reduction = "umap") +
+    scale_color_viridis(option = "inferno") +
+    theme_classic() +
+    ggtitle(gsub("HALLMARK_", "", pw))
+})
+
+wrap_plots(p_list, ncol = 2)
+```
+
+### Violin Plots
+
+```{r}
+#| fig-width: 16
+#| fig-height: 12
+
+p_vln <- lapply(show_pathways, function(pw) {
+  VlnPlot(seurat_obj, features = pw, group.by = "cell_type", pt.size = 0) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    ggtitle(gsub("HALLMARK_", "", pw)) +
+    NoLegend()
+})
+
+wrap_plots(p_vln, ncol = 2)
+```
+
+### Heatmap（平均AUC per cell type）
+
+```{r}
+#| fig-width: 14
+#| fig-height: 10
+
+# 计算每个细胞类型的平均AUC
+auc_cols <- intersect(colnames(auc_df), colnames(seurat_obj@meta.data))
+
+mean_auc <- seurat_obj@meta.data %>%
+  select(cell_type, all_of(auc_cols)) %>%
+  group_by(cell_type) %>%
+  summarise(across(everything(), mean)) %>%
+  column_to_rownames("cell_type") %>%
+  as.matrix()
+
+# 选取变异最大的前30个通路
+pathway_var <- apply(mean_auc, 2, var)
+top30 <- names(sort(pathway_var, decreasing = TRUE))[1:min(30, length(pathway_var))]
+mat <- t(scale(mean_auc[, top30]))
+
+Heatmap(
+  mat,
+  name = "Scaled AUC",
+  show_row_dend = TRUE,
+  show_column_dend = TRUE,
+  row_names_gp = gpar(fontsize = 8),
+  column_names_gp = gpar(fontsize = 10),
+  column_names_rot = 45,
+  col = colorRamp2(c(-2, 0, 2), c("blue", "white", "red"))
+)
+```
+
+### Dot Plot
+
+```{r}
+#| fig-width: 14
+#| fig-height: 10
+
+# 计算每个细胞类型中通路的平均AUC和活跃比例
+# 使用top30通路
+dot_data <- seurat_obj@meta.data %>%
+  select(cell_type, all_of(top30)) %>%
+  pivot_longer(-cell_type, names_to = "pathway", values_to = "auc") %>%
+  group_by(cell_type, pathway) %>%
+  summarise(
+    mean_auc = mean(auc),
+    pct_active = mean(auc > quantile(auc, 0.75)) * 100,  # 高于75%分位数视为活跃
+    .groups = "drop"
+  )
+
+ggplot(dot_data, aes(x = cell_type, y = pathway)) +
+  geom_point(aes(size = pct_active, color = mean_auc)) +
+  scale_color_viridis(option = "inferno") +
+  scale_size_continuous(range = c(1, 6)) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 7)
+  ) +
+  labs(x = "Cell Type", y = "Pathway", color = "Mean AUC", size = "% Active")
+```
+
+### Box Plots（分组比较）
+
+```{r}
+#| fig-width: 16
+#| fig-height: 12
+
+p_box <- lapply(show_pathways, function(pw) {
+  seurat_obj@meta.data %>%
+    ggplot(aes(x = cell_type, y = .data[[pw]], fill = group)) +
+    geom_boxplot(outlier.size = 0.3) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    ggtitle(gsub("HALLMARK_", "", pw)) +
+    labs(y = "AUC Score")
+})
+
+wrap_plots(p_box, ncol = 2)
+```
+
+### Ridge Plots
+
+```{r}
+#| fig-width: 14
+#| fig-height: 10
+
+p_ridge <- lapply(show_pathways[1:2], function(pw) {
+  seurat_obj@meta.data %>%
+    ggplot(aes(x = .data[[pw]], y = cell_type, fill = cell_type)) +
+    geom_density_ridges(scale = 1.5, alpha = 0.7) +
+    theme_classic() +
+    ggtitle(gsub("HALLMARK_", "", pw)) +
+    labs(x = "AUC Score", y = "") +
+    NoLegend()
+})
+
+wrap_plots(p_ridge, ncol = 2)
+```
+
+
+## Statistical Comparison
+
+```{r}
+# 每个细胞类型、每个通路进行Wilcoxon检验（Normal vs Treatment）
+stat_results <- seurat_obj@meta.data %>%
+  select(cell_type, group, all_of(auc_cols)) %>%
+  pivot_longer(-c(cell_type, group), names_to = "pathway", values_to = "auc") %>%
+  group_by(cell_type, pathway) %>%
+  summarise(
+    p_value = tryCatch(
+      wilcox.test(auc ~ group)$p.value,
+      error = function(e) NA_real_
+    ),
+    mean_normal = mean(auc[group == "Normal"]),
+    mean_treatment = mean(auc[group != "Normal"]),
+    log2FC = log2((mean_treatment + 1e-10) / (mean_normal + 1e-10)),
+    .groups = "drop"
+  ) %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH")) %>%
+  arrange(p_adj)
+
+# 查看显著结果
+stat_results %>%
+  filter(p_adj < 0.05) %>%
+  head(20)
+```
+
+### Box Plots with Statistics
+
+```{r}
+#| fig-width: 16
+#| fig-height: 12
+
+# 选取最显著的4个通路
+top_sig <- stat_results %>%
+  filter(p_adj < 0.05) %>%
+  slice_head(n = 4) %>%
+  pull(pathway) %>%
+  unique()
+
+if (length(top_sig) > 0) {
+  p_stat <- lapply(top_sig, function(pw) {
+    seurat_obj@meta.data %>%
+      ggplot(aes(x = cell_type, y = .data[[pw]], fill = group)) +
+      geom_boxplot(outlier.size = 0.3) +
+      stat_compare_means(aes(group = group), method = "wilcox.test",
+                         label = "p.signif", size = 3) +
+      theme_classic() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      ggtitle(pw) +
+      labs(y = "AUC Score")
+  })
+
+  wrap_plots(p_stat, ncol = 2)
+}
+```
+
+
+## Delta AUC Heatmap
+
+```{r}
+#| fig-width: 14
+#| fig-height: 10
+
+# 计算每个细胞类型中Treatment vs Normal的AUC差值
+delta_auc <- seurat_obj@meta.data %>%
+  select(cell_type, group, all_of(top30)) %>%
+  pivot_longer(-c(cell_type, group), names_to = "pathway", values_to = "auc") %>%
+  group_by(cell_type, group, pathway) %>%
+  summarise(mean_auc = mean(auc), .groups = "drop") %>%
+  pivot_wider(names_from = group, values_from = mean_auc)
+
+# 获取分组名称
+group_levels <- unique(seurat_obj$group)
+treatment_group <- setdiff(group_levels, "Normal")
+
+delta_mat <- delta_auc %>%
+  mutate(delta = .data[[treatment_group]] - Normal) %>%
+  select(cell_type, pathway, delta) %>%
+  pivot_wider(names_from = cell_type, values_from = delta) %>%
+  column_to_rownames("pathway") %>%
+  as.matrix()
+
+# 蓝-白-红配色
+max_abs <- max(abs(delta_mat), na.rm = TRUE)
+
+Heatmap(
+  delta_mat,
+  name = "Delta AUC\n(Treatment - Normal)",
+  col = colorRamp2(c(-max_abs, 0, max_abs), c("blue", "white", "red")),
+  show_row_dend = TRUE,
+  show_column_dend = TRUE,
+  row_names_gp = gpar(fontsize = 8),
+  column_names_gp = gpar(fontsize = 10),
+  column_names_rot = 45
+)
+```
+
+
+## Save Results
+
+```{r}
+# 保存更新后的Seurat对象
+qs2::qs_save(seurat_obj, "datasets/harmonized_seurat_AUCell.qs")
+
+# 导出统计结果
+write.csv(stat_results, "Results/AUCell_stat_results.csv", row.names = FALSE)
+
+# 导出AUC矩阵
+write.csv(auc_df, "Results/AUCell_auc_matrix.csv", row.names = TRUE)
+
+message("AUCell分析完成！结果已保存。")
+```
