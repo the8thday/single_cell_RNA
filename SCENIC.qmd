@@ -1,0 +1,594 @@
+---
+title: "SCENIC Gene Regulatory Network Analysis"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+---
+
+
+## Introduction
+
+SCENIC (Single-Cell rEgulatory Network Inference and Clustering) 通过三个核心步骤推断基因调控网络：
+
+1. **GENIE3** — 基于随机森林推断转录因子（TF）与靶基因的共表达关系
+2. **RcisTarget** — 利用 cisTarget 数据库进行 motif 富集分析，筛选具有直接调控证据的 TF-靶基因关系，形成 regulon
+3. **AUCell** — 对每个细胞评估每个 regulon 的活性（AUC 分数）
+
+**注意事项：**
+
+- GENIE3 极耗计算资源，大数据集建议降采样（~5,000-10,000 cells）或使用 pySCENIC（速度快 10-100 倍）
+- cisTarget 数据库需要提前下载（~1GB/文件），支持 hg38（人）和 mm10（鼠）
+- 数据库下载地址：<https://resources.aertslab.org/cistarget/>
+
+本文件基于 harmonized_seurat 对象，所有 chunk 设为 `eval: false`，适合交互式分析。
+
+
+## Configuration
+
+集中管理所有参数，方便一次性调整。
+
+```{r}
+#| label: configuration
+#| eval: false
+
+# === A. 输入/输出路径 ===
+SEURAT_PATH    <- "datasets/harmonized_seurat.qs2"
+SCENIC_DIR     <- "SCENIC"
+
+# === B. cisTarget 数据库 ===
+DB_DIR <- file.path(SCENIC_DIR, "cisTarget")
+
+# 小鼠数据用 "mgi"，人类数据用 "hgnc"
+ORGANISM <- "mgi"
+
+# 数据库文件名（需提前下载至 DB_DIR）
+# 小鼠：
+DB_FILES <- c(
+  "500bp" = "mm10__refseq-r80__500bp_up_and_100bp_down_tss.mc9nr.feather",
+  "10kb"  = "mm10__refseq-r80__10kb_up_and_down_tss.mc9nr.feather"
+)
+# 人类（如需切换取消注释）：
+# DB_FILES <- c(
+#   "500bp" = "hg38__refseq-r80__500bp_up_and_100bp_down_tss.mc9nr.feather",
+#   "10kb"  = "hg38__refseq-r80__10kb_up_and_down_tss.mc9nr.feather"
+# )
+
+# === C. 元数据列名 ===
+CELL_TYPE_COL <- "cell_type"
+SAMPLE_COL    <- "sample"
+GROUP_COL     <- "group"
+
+# === D. 并行计算 ===
+N_CORES <- 8
+
+# === E. 降采样（可选） ===
+# SCENIC 对大数据集极耗资源，建议降采样
+SUBSAMPLE <- TRUE
+SUBSAMPLE_N <- 5000
+```
+
+
+## Setup
+
+```{r}
+#| label: load-packages
+#| include: false
+
+library(Seurat)
+library(SCENIC)
+library(AUCell)
+library(GENIE3)
+library(dplyr)
+library(tidyverse)
+library(patchwork)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+library(qs2)
+
+options(future.globals.maxSize = 40 * 1024^3)
+set.seed(42)
+```
+
+
+```{r}
+#| label: setup-parallel
+#| eval: false
+
+library(future)
+if (N_CORES > 1) {
+  plan("multicore", workers = N_CORES)
+  message("Parallel: ", N_CORES, " cores")
+} else {
+  plan("sequential")
+}
+```
+
+
+## Load Data
+
+```{r}
+#| label: load-data
+#| eval: false
+
+seurat_obj <- qs2::qs_read(SEURAT_PATH)
+
+seurat_obj
+table(seurat_obj[[CELL_TYPE_COL]])
+table(seurat_obj[[GROUP_COL]])
+```
+
+
+```{r}
+#| label: subsample
+#| eval: false
+
+# 对大数据集降采样以减少 GENIE3 计算时间
+if (SUBSAMPLE && ncol(seurat_obj) > SUBSAMPLE_N) {
+  # 按细胞类型分层采样，保留各类型的代表性
+  cells_use <- seurat_obj@meta.data %>%
+    tibble::rownames_to_column("cell_id") %>%
+    group_by(across(all_of(CELL_TYPE_COL))) %>%
+    slice_sample(prop = SUBSAMPLE_N / ncol(seurat_obj)) %>%
+    pull(cell_id)
+
+  seurat_sub <- subset(seurat_obj, cells = cells_use)
+  cat("Subsampled:", ncol(seurat_sub), "cells\n")
+} else {
+  seurat_sub <- seurat_obj
+}
+
+table(seurat_sub[[CELL_TYPE_COL]])
+```
+
+
+## Prepare Input
+
+```{r}
+#| label: prepare-cellinfo
+#| eval: false
+
+# 构建细胞注释表
+cell_info <- seurat_sub@meta.data %>%
+  tibble::rownames_to_column("Cell") %>%
+  select(Cell,
+         sample   = all_of(SAMPLE_COL),
+         celltype = all_of(CELL_TYPE_COL),
+         group    = all_of(GROUP_COL))
+
+dir.create(file.path(SCENIC_DIR, "int"), showWarnings = FALSE, recursive = TRUE)
+write_tsv(cell_info, file.path(SCENIC_DIR, "int", "cell_info.tsv"))
+```
+
+
+```{r}
+#| label: prepare-expression
+#| eval: false
+
+# 提取 raw counts 矩阵（genes × cells）
+DefaultAssay(seurat_sub) <- "RNA"
+expr_matrix <- GetAssayData(seurat_sub, assay = "RNA", layer = "counts")
+expr_matrix <- as.matrix(expr_matrix)
+
+dim(expr_matrix)
+```
+
+
+## Initialize SCENIC
+
+```{r}
+#| label: check-databases
+#| eval: false
+
+# 检查数据库文件是否存在
+full_db_paths <- file.path(DB_DIR, DB_FILES)
+missing_dbs <- full_db_paths[!file.exists(full_db_paths)]
+
+if (length(missing_dbs) > 0) {
+  stop("缺少 cisTarget 数据库文件:\n",
+       paste("  -", missing_dbs, collapse = "\n"),
+       "\n请从 https://resources.aertslab.org/cistarget/ 下载并放入 '", DB_DIR, "' 目录")
+} else {
+  message("所有数据库文件已就绪")
+}
+```
+
+
+```{r}
+#| label: init-scenic
+#| eval: false
+
+scenic_options <- initializeScenic(
+  org = ORGANISM,
+  dbDir = DB_DIR,
+  dbs = DB_FILES,
+  datasetTitle = "SCENIC Analysis",
+  nCores = N_CORES
+)
+
+saveRDS(scenic_options, file.path(SCENIC_DIR, "int", "scenic_options.rds"))
+```
+
+
+## Gene Filtering & Network Inference
+
+### Gene Filtering
+
+```{r}
+#| label: gene-filtering
+#| eval: false
+
+# 过滤低表达基因
+genes_kept <- geneFiltering(
+  exprMat = expr_matrix,
+  scenicOptions = scenic_options,
+  minCountsPerGene = 3 * 0.01 * ncol(expr_matrix),
+  minSamples = ncol(expr_matrix) * 0.01
+)
+
+expr_filtered <- expr_matrix[genes_kept, ]
+cat("Genes kept:", length(genes_kept), "/", nrow(expr_matrix), "\n")
+```
+
+
+### Co-expression Correlation
+
+```{r}
+#| label: run-correlation
+#| eval: false
+
+runCorrelation(expr_filtered, scenic_options)
+```
+
+
+### GENIE3 Network Inference
+
+```{r}
+#| label: run-genie3
+#| eval: false
+#| message: false
+
+# GENIE3 是最耗时的步骤（几小时到几天）
+# nParts: 将基因分成多个子集并行处理
+ptm <- Sys.time()
+
+expr_log <- log2(expr_filtered + 1)
+runGenie3(expr_log, scenic_options, nParts = 10)
+
+cat("GENIE3 elapsed:", round(difftime(Sys.time(), ptm, units = "hours"), 1), "hours\n")
+```
+
+
+## Build Regulons
+
+```{r}
+#| label: build-regulons
+#| eval: false
+
+# 基于 GENIE3 共表达结果 + RcisTarget motif 富集，构建 regulons
+# scenic_options <- readRDS(file.path(SCENIC_DIR, "int", "scenic_options.rds"))
+runSCENIC_1_coexNetwork2modules(scenic_options)
+runSCENIC_2_createRegulons(scenic_options)
+```
+
+
+## Score Regulon Activity (AUCell)
+
+```{r}
+#| label: score-cells
+#| eval: false
+
+# 对所有细胞（不仅是降采样的）评估 regulon 活性
+# 如果做了降采样，这里用全部细胞的表达矩阵
+expr_full <- GetAssayData(seurat_obj, assay = "RNA", layer = "counts")
+expr_full_log <- log2(as.matrix(expr_full) + 1)
+
+runSCENIC_3_scoreCells(scenic_options, exprMat = expr_full_log)
+```
+
+
+```{r}
+#| label: binarize-activity
+#| eval: false
+
+# （可选）二值化 regulon 活性：ON/OFF
+runSCENIC_4_aucell_binarize(scenic_options)
+```
+
+
+## Load Results
+
+```{r}
+#| label: load-results
+#| eval: false
+
+# 加载 regulon AUC 矩阵
+regulon_auc <- loadInt(scenic_options, "aucell_regulonAUC")
+regulon_auc_mat <- as.matrix(getAUC(regulon_auc))
+
+# 仅保留与 seurat_obj 共有的细胞
+common_cells <- intersect(colnames(regulon_auc_mat), colnames(seurat_obj))
+regulon_auc_mat <- regulon_auc_mat[, common_cells]
+
+dim(regulon_auc_mat)
+head(rownames(regulon_auc_mat), 20)
+```
+
+
+## Visualization
+
+### Add Regulon Scores to Seurat
+
+```{r}
+#| label: add-to-seurat
+#| eval: false
+
+# 将 regulon AUC 添加到 Seurat 元数据
+seurat_obj <- AddMetaData(
+  seurat_obj,
+  metadata = as.data.frame(t(regulon_auc_mat[, colnames(seurat_obj)]))
+)
+```
+
+
+### Feature Plot
+
+```{r}
+#| label: regulon-featureplot
+#| eval: false
+
+# 选择感兴趣的 regulons 在 UMAP 上可视化
+# 替换为实际的 regulon 名称
+regulons_show <- rownames(regulon_auc_mat)[1:4]
+
+p0 <- DimPlot(seurat_obj, group.by = CELL_TYPE_COL, label = TRUE, repel = TRUE) +
+  NoLegend() + ggtitle("Cell Type")
+
+p1 <- FeaturePlot(seurat_obj,
+                   features = regulons_show,
+                   min.cutoff = "q05", max.cutoff = "q95",
+                   cols = c("lightgrey", "darkred"))
+
+p0 | p1
+```
+
+
+### Regulon Activity Heatmap
+
+```{r}
+#| label: regulon-heatmap
+#| eval: false
+
+# 按细胞类型计算平均 regulon 活性
+cell_types <- seurat_obj@meta.data[[CELL_TYPE_COL]][match(common_cells, colnames(seurat_obj))]
+
+avg_auc <- sapply(unique(cell_types), function(ct) {
+  cells <- common_cells[cell_types == ct]
+  rowMeans(regulon_auc_mat[, cells, drop = FALSE])
+})
+
+# 选择变异最大的 top regulons
+regulon_var <- apply(avg_auc, 1, var)
+top_regulons <- names(sort(regulon_var, decreasing = TRUE))[1:30]
+
+# ComplexHeatmap
+Heatmap(avg_auc[top_regulons, ],
+        name = "AUC",
+        col = colorRamp2(c(0, median(avg_auc[top_regulons, ]), max(avg_auc[top_regulons, ])),
+                         c("navy", "white", "firebrick3")),
+        cluster_columns = TRUE,
+        cluster_rows = TRUE,
+        row_names_gp = gpar(fontsize = 8),
+        column_names_gp = gpar(fontsize = 8),
+        column_title = "Regulon Activity by Cell Type")
+```
+
+
+### Regulon Specificity Score (RSS)
+
+RSS 量化每个 regulon 对特定细胞类型的特异性，基于 Jensen-Shannon 散度。
+
+```{r}
+#| label: regulon-rss
+#| eval: false
+
+# 计算 RSS
+rss <- calcRSS(
+  AUC = getAUC(regulon_auc)[, common_cells],
+  cellAnnotation = cell_types
+)
+
+# 可视化每种细胞类型的 top 特异性 regulons
+plotRSS(rss)
+```
+
+
+```{r}
+#| label: rss-specific
+#| eval: false
+
+# 对特定细胞类型展示 top regulons
+# 替换为实际的细胞类型名称
+plotRSS(rss, cluster_columns = FALSE,
+        order_rows = TRUE,
+        thr.val = 0.01)  # RSS 阈值
+
+# 提取每种细胞类型的 top5 特异性 regulons
+rss_df <- as.data.frame(rss)
+top_regulons_per_type <- lapply(colnames(rss_df), function(ct) {
+  head(rownames(rss_df)[order(rss_df[[ct]], decreasing = TRUE)], 5)
+})
+names(top_regulons_per_type) <- colnames(rss_df)
+top_regulons_per_type
+```
+
+
+### Regulon Activity by Group
+
+比较不同实验条件下 regulon 活性的差异。
+
+```{r}
+#| label: regulon-by-group
+#| eval: false
+
+# 按 group 和 cell_type 计算平均活性
+meta <- seurat_obj@meta.data[common_cells, ]
+
+avg_by_group <- meta %>%
+  mutate(cell = rownames(.)) %>%
+  group_by(across(all_of(c(CELL_TYPE_COL, GROUP_COL)))) %>%
+  summarise(
+    cells = list(cell),
+    n = n(),
+    .groups = "drop"
+  )
+
+# 构建热图矩阵（group_celltype × regulon）
+group_labels <- paste(avg_by_group[[CELL_TYPE_COL]],
+                      avg_by_group[[GROUP_COL]], sep = "_")
+avg_mat <- sapply(seq_len(nrow(avg_by_group)), function(i) {
+  cells <- avg_by_group$cells[[i]]
+  rowMeans(regulon_auc_mat[top_regulons, cells, drop = FALSE])
+})
+colnames(avg_mat) <- group_labels
+
+Heatmap(avg_mat,
+        name = "AUC",
+        col = colorRamp2(c(min(avg_mat), median(avg_mat), max(avg_mat)),
+                         c("navy", "white", "firebrick3")),
+        cluster_columns = TRUE,
+        row_names_gp = gpar(fontsize = 8),
+        column_names_gp = gpar(fontsize = 6),
+        column_title = "Regulon Activity: Cell Type × Group")
+```
+
+
+### Violin Plot
+
+```{r}
+#| label: regulon-violin
+#| eval: false
+
+# 对感兴趣的 regulon 做小提琴图（按 group 着色）
+regulon_of_interest <- regulons_show[1]  # 替换为实际 regulon
+
+VlnPlot(seurat_obj,
+        features = regulon_of_interest,
+        group.by = CELL_TYPE_COL,
+        split.by = GROUP_COL,
+        pt.size = 0)
+```
+
+
+## Differential Regulon Activity
+
+识别不同条件间差异激活的 regulons。
+
+```{r}
+#| label: diff-regulon
+#| eval: false
+
+# Wilcoxon 检验比较两组间的 regulon 活性
+groups <- unique(meta[[GROUP_COL]])
+stopifnot(length(groups) >= 2)
+
+diff_results <- lapply(rownames(regulon_auc_mat), function(reg) {
+  g1_cells <- common_cells[meta[[GROUP_COL]] == groups[1]]
+  g2_cells <- common_cells[meta[[GROUP_COL]] == groups[2]]
+
+  wt <- wilcox.test(
+    regulon_auc_mat[reg, g1_cells],
+    regulon_auc_mat[reg, g2_cells]
+  )
+
+  data.frame(
+    regulon = reg,
+    mean_g1 = mean(regulon_auc_mat[reg, g1_cells]),
+    mean_g2 = mean(regulon_auc_mat[reg, g2_cells]),
+    log2FC = log2(mean(regulon_auc_mat[reg, g2_cells]) /
+                  mean(regulon_auc_mat[reg, g1_cells])),
+    p_value = wt$p.value
+  )
+}) %>% bind_rows()
+
+diff_results$p_adj <- p.adjust(diff_results$p_value, method = "BH")
+diff_results <- diff_results %>% arrange(p_adj)
+
+colnames(diff_results)[2:3] <- paste0("mean_", groups[1:2])
+
+head(diff_results, 20)
+write.csv(diff_results, "Results/SCENIC_diff_regulons.csv", row.names = FALSE)
+```
+
+
+```{r}
+#| label: diff-volcano
+#| eval: false
+
+# 火山图展示差异 regulon
+diff_results %>%
+  mutate(sig = ifelse(p_adj < 0.05, "Significant", "NS")) %>%
+  ggplot(aes(x = log2FC, y = -log10(p_adj), color = sig)) +
+  geom_point(size = 2) +
+  geom_text(data = . %>% filter(p_adj < 0.01),
+            aes(label = regulon), size = 3, vjust = -0.5) +
+  scale_color_manual(values = c("Significant" = "firebrick", "NS" = "grey60")) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  geom_vline(xintercept = c(-0.1, 0.1), linetype = "dashed", color = "grey40") +
+  labs(title = paste("Differential Regulon Activity:", groups[2], "vs", groups[1]),
+       x = "log2 Fold Change (AUC)", y = "-log10(FDR)") +
+  theme_classic() +
+  theme(legend.title = element_blank())
+```
+
+
+## Save Results
+
+```{r}
+#| label: save-results
+#| eval: false
+
+results_dir <- file.path(SCENIC_DIR, "results")
+dir.create(results_dir, showWarnings = FALSE, recursive = TRUE)
+
+saveRDS(scenic_options, file.path(SCENIC_DIR, "int", "scenic_options.rds"))
+saveRDS(regulon_auc_mat, file.path(results_dir, "regulon_auc_matrix.rds"))
+qs2::qs_save(seurat_obj, "datasets/seurat_with_regulons.qs2")
+```
+
+
+## pySCENIC Alternative
+
+对于大数据集（>10,000 cells），R 版 SCENIC 的 GENIE3 步骤极慢。推荐使用 pySCENIC 作为替代方案，速度快 10-100 倍。
+
+```{r}
+#| label: pyscenic-export
+#| eval: false
+
+# 导出 loom 文件供 pySCENIC 使用
+# 需要安装 loomR 或 SCopeLoomR
+
+# library(SCopeLoomR)
+# loom <- build_loom(
+#   file.name = file.path(SCENIC_DIR, "input.loom"),
+#   dgem = expr_matrix,
+#   title = "SCENIC input"
+# )
+# close_loom(loom)
+
+# pySCENIC 命令行流程：
+# pyscenic grn input.loom tf_list.txt -o adj.csv --num_workers 8
+# pyscenic ctx adj.csv db.feather --annotations_fname motifs.tbl \
+#   --expression_mtx_fname input.loom -o regulons.csv
+# pyscenic aucell input.loom regulons.csv -o output.loom --num_workers 8
+```
+
+
+## Session Info
+
+```{r}
+#| label: session-info
+
+sessionInfo()
+```

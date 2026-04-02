@@ -1,0 +1,274 @@
+---
+title: "Untitled"
+format: html
+---
+
+
+# for Seurat
+
+```{r}
+library(Seurat)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+```
+
+
+
+```{r}
+# 1. Get current gene symbols
+current_symbols <- rownames(seurat_obj[["RNA"]]$counts)
+
+# 2. Map Symbols to Ensembl IDs
+# We'll use multiVals="list" to see all mappings, then manually select a unique set.
+# This helps in debugging and ensuring a 1:1 mapping is established.
+gene_map_list <- mapIds(org.Hs.eg.db, 
+                        keys = current_symbols, 
+                        column = "ENSEMBL", 
+                        keytype = "SYMBOL", 
+                        multiVals = "list")
+
+# Convert list output to a simple vector, discarding multi-mappings and unmapped
+gene_map_vector <- unlist(lapply(gene_map_list, function(x) if(length(x) == 1) x else NA))
+
+# 3. Align the matrix and names
+
+# Filter the original gene symbols to only keep those that successfully mapped (and mapped uniquely)
+mapped_symbols <- names(gene_map_vector[!is.na(gene_map_vector)])
+
+# Extract the new Ensembl IDs
+new_ensembl_ids <- gene_map_vector[mapped_symbols]
+
+# Extract the count data for the successfully mapped genes
+mapped_counts <- seurat_obj[["RNA"]]$counts[mapped_symbols, ]
+
+# 4. Final safety check and assignment
+# Check 1: Ensure the count matrix and name vector have the same length
+if (length(new_ensembl_ids) != nrow(mapped_counts)) {
+  stop("Error: Count matrix rows and new Ensembl IDs do not match in length.")
+}
+
+# Check 2: Ensure the new Ensembl IDs are unique (should be after multiVals="list" check)
+if (any(duplicated(new_ensembl_ids))) {
+  # If duplicates still exist (e.g., Symbol to same Ensembl), we use make.unique
+  # but this should be rare if only 1:1 mappings are kept.
+  warning("Duplicates found in Ensembl IDs. Applying make.unique.")
+  new_ensembl_ids <- make.unique(new_ensembl_ids)
+}
+
+# Assign the new Ensembl IDs to the matrix
+rownames(mapped_counts) <- new_ensembl_ids
+```
+
+
+```{r}
+# 5. Create the new Seurat Object
+seurat_ensembl <- CreateSeuratObject(counts = mapped_counts, 
+                                     project = "Ensembl_Version_Fixed",
+                                     meta.data = seurat_obj@meta.data) # Cell metadata is not filtered here
+
+# Final verification
+head(rownames(seurat_ensembl))
+```
+
+
+# for Anndata
+
+
+### use mygene
+
+```{python}
+import scanpy as sc
+import mygene
+import pandas as pd
+```
+
+
+```{python}
+
+def map_and_filter_genes(adata, target_vocab_genes):
+    """
+    1. Auto-detects gene symbol column.
+    2. Maps Symbols -> Ensembl IDs (handling aliases & list/dict returns).
+    3. Filters adata based on valid IDs and target vocabulary.
+    """
+    
+    # --- 1. Auto-detect Source Column ---
+    # 优先检查常见列名，如果没有则使用 Index
+    if 'feature_name' in adata.var.columns:
+        source_col = 'feature_name'
+        gene_symbols = adata.var['feature_name']
+    elif 'gene_ids' in adata.var.columns:
+        source_col = 'gene_ids'
+        gene_symbols = adata.var['gene_ids']
+    else:
+        source_col = 'index (var_names)'
+        gene_symbols = adata.var_names.to_series()
+
+    print(f"Detected gene symbols in: '{source_col}'")
+    
+    # --- 2. Query MyGene ---
+    unique_symbols = gene_symbols.astype(str).unique().tolist()
+    
+    mg = mygene.MyGeneInfo()
+    # scopes='symbol,alias': crucial for finding genes even if old names are used
+    results = mg.querymany(unique_symbols, scopes='symbol,alias', fields='ensembl.gene', species='human', verbose=True)
+    
+    # --- 3. Build Mapping Dict (Robust) ---
+    symbol_to_ensembl = {}
+    for res in results:
+        if 'ensembl' not in res: continue
+        
+        query = res['query']
+        entry = res['ensembl']
+        
+        # CRITICAL FIX: Handle list (multiple matches) vs dict (single match)
+        if isinstance(entry, list):
+            symbol_to_ensembl[query] = entry[0]['gene']
+        elif isinstance(entry, dict):
+            symbol_to_ensembl[query] = entry['gene']
+
+    # --- 4. Map & Filter ---
+    # Map symbols to new column
+    adata.var['ensembl_id'] = gene_symbols.map(symbol_to_ensembl)
+    
+    # Filter A: Remove genes that failed to map (NaN)
+    n_before = adata.n_vars
+    adata = adata[:, adata.var['ensembl_id'].notna()]
+    print(f"Dropped {n_before - adata.n_vars} unmapped genes.")
+    
+    # Filter B: Keep only genes in your model vocabulary
+    adata = adata[:, adata.var['ensembl_id'].isin(target_vocab_genes)]
+    
+    return adata
+
+# ================= 使用示例 =================
+
+adata = sc.read_h5ad('./my_data_for_scGPT.h5ad')
+
+# 假设 genes 是你的模型词汇表 list (e.g., ['ENSG0001', ...])
+adata = map_and_filter_genes(adata, genes)
+
+print(f"Final shape: {adata.shape}")
+```
+
+
+
+### use pybiomart
+
+```{python}
+import scanpy as sc
+import pandas as pd
+import pybiomart
+import numpy as np
+```
+
+
+```{python}
+
+def convert_symbols_to_ensembl(adata, gene_column=None, drop_unmapped=False, verbose=True):
+    """
+    Converts adata.var_names (Gene Symbols) to Ensembl IDs using PyBiomart.
+    
+    Parameters:
+    -----------
+    adata : AnnData
+        The annotated data matrix.
+    gene_column : str, optional
+        If the symbols are in a column of adata.var instead of the index, specify it here.
+        If None, uses adata.var_names.
+    drop_unmapped : bool, optional
+        If True, genes that cannot be mapped to an Ensembl ID are removed from the object.
+        If False, unmapped genes keep their original Symbol in the index.
+    verbose : bool
+        Print status updates.
+
+    Returns:
+    --------
+    adata : AnnData
+        The modified AnnData object with Ensembl IDs as the index.
+    """
+    
+    if verbose: print("--- Starting Gene Symbol to Ensembl Conversion ---")
+    
+    # 1. Identify the input symbols
+    if gene_column:
+        gene_symbols = adata.var[gene_column].astype(str).values
+    else:
+        gene_symbols = adata.var_names.astype(str).values
+        # Save original symbols to a new column before overwriting index
+        adata.var['gene_symbols'] = adata.var_names
+
+    # 2. Connect to Ensembl Biomart
+    if verbose: print("Querying Ensembl Biomart server (this may take a moment)...")
+    
+    try:
+        dataset = pybiomart.Dataset(name='hsapiens_gene_ensembl', host='http://www.ensembl.org')
+        
+        # Query for both ID and Symbol
+        # Note: 'external_gene_name' is the standard attribute for Symbols in Ensembl
+        mapping = dataset.query(attributes=['ensembl_gene_id', 'external_gene_name'])
+        
+    except Exception as e:
+        raise ConnectionError(f"Failed to connect to Biomart. Server might be down. Error: {e}")
+
+    # 3. Clean the mapping table
+    # Remove entries without an Ensembl ID
+    mapping = mapping.dropna(subset=['Gene stable ID'])
+    
+    # Create a dictionary for mapping: Symbol -> Ensembl ID
+    # Note: If a symbol maps to multiple Ensembl IDs, this simple dict keeps the last one.
+    # For single-cell, usually 1-to-1 or keeping the primary is sufficient.
+    symbol_to_ensembl = dict(zip(mapping['Gene name'], mapping['Gene stable ID']))
+
+    # 4. Perform the mapping
+    if verbose: print("Mapping genes...")
+    
+    # Map symbols to IDs. If not found, returns NaN
+    new_ids = [symbol_to_ensembl.get(sym, np.nan) for sym in gene_symbols]
+    
+    # 5. Handle Unmapped Genes
+    mapped_count = sum(pd.notna(new_ids))
+    total_count = len(gene_symbols)
+    
+    if verbose:
+        print(f"Successfully mapped {mapped_count} out of {total_count} genes ({mapped_count/total_count:.1%}).")
+
+    if drop_unmapped:
+        # Create a boolean mask for genes that were successfully mapped
+        mask = pd.notna(new_ids)
+        adata = adata[:, mask].copy()
+        new_ids = [i for i in new_ids if pd.notna(i)]
+        if verbose: print(f"Removed {total_count - mapped_count} unmapped genes.")
+    else:
+        # Fill NaN values with the original symbol so the index doesn't break
+        new_ids = [new_id if pd.notna(new_id) else original 
+                   for new_id, original in zip(new_ids, gene_symbols)]
+        if verbose: print("Unmapped genes retained with original symbols.")
+
+    # 6. Assign new Index and make unique
+    adata.var_names = new_ids
+    
+    # Ensembl IDs should be unique, but if unmapped symbols caused duplicates 
+    # or mapping resulted in duplicates, this ensures technical validity.
+    adata.var_names_make_unique()
+
+    if verbose: print("--- Conversion Complete ---")
+    
+    return adata
+
+# --- USAGE EXAMPLE ---
+# adata = sc.read_h5ad("my_data.h5ad")
+# adata = convert_symbols_to_ensembl(adata, drop_unmapped=False)
+```
+
+
+
+```{python}
+# --- USAGE EXAMPLE ---
+adata = sc.read_h5ad("my_data.h5ad")
+adata = convert_symbols_to_ensembl(adata, drop_unmapped=False)
+```
+
+
+
+

@@ -1,0 +1,750 @@
+---
+title: "NicheNet Ligand-Target Analysis"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+---
+
+## Introduction
+
+NicheNet 用先验的 ligand-receptor-signaling-target 网络来回答一个比 CellChat 更偏“机制”的问题：
+
+- 哪些 sender 细胞分泌的 ligand 最可能驱动 receiver 细胞中的目标基因变化？
+- 这些 ligand 可能通过哪些 receptor 发挥作用？
+- 它们最可能调控哪些 downstream target genes？
+
+与主要关注“通讯网络拓扑”的 CellChat 不同，NicheNet 的核心输出是：
+
+- **ligand activity ranking**：按预测能力对候选 ligand 排序
+- **ligand-receptor support**：这些 ligand 在哪些 sender 中表达、与 receiver 的哪些 receptor 匹配
+- **ligand-target links**：每个高优先级 ligand 最可能驱动的 target genes
+
+本文件参考官方 [saeyslab/nichenetr](https://github.com/saeyslab/nichenetr) 与 [saeyslab/nichenet_protocol](https://github.com/saeyslab/nichenet_protocol) 的 receiver-centric workflow，默认基于 `harmonized_seurat.qs2` 进行分析。所有分析 chunk 默认设为 `eval: false`，适合在 RStudio 中逐步交互运行。
+
+::: {.callout-note}
+## 何时优先用 NicheNet？
+
+- 已知一个 **receiver cell type**，并且你关心该细胞群在某条件下上调/下调的基因由谁驱动
+- 想从“差异基因”反推上游 ligand，而不是只看 L-R 配对是否存在
+- 需要给 CellChat / CellPhoneDB 的结果增加 target-level 机制支持
+
+**不适用或需谨慎的场景：**
+
+- 没有明确的 receiver 细胞群
+- receiver 的 DE gene set 很弱或强烈受细胞组成变化影响
+- 没有生物学重复，但又想把结果当作严格统计推断
+:::
+
+
+## Setup
+
+```{r}
+#| label: load-packages
+#| include: false
+
+library(Seurat)
+library(nichenetr)
+library(tidyverse)
+library(patchwork)
+library(qs2)
+library(pheatmap)
+library(ComplexHeatmap)
+
+options(future.globals.maxSize = 40 * 1024^3)
+set.seed(42)
+```
+
+
+## Installation and Prior Model Files
+
+```{r}
+#| label: install-nichenet
+#| eval: false
+
+# 如果尚未安装
+# install.packages(c("remotes", "tidyverse", "patchwork", "pheatmap", "ComplexHeatmap", "qs"))
+# remotes::install_github("saeyslab/nichenetr")
+```
+
+::: {.callout-important}
+## 关于 prior model 文件
+
+NicheNet 运行依赖预先构建好的知识网络对象，常见包括：
+
+- `ligand_target_matrix`
+- `lr_network`
+- `weighted_networks`
+
+建议从官方 protocol / Zenodo 下载后存到本地，例如：
+
+- `resources/nichenet/mouse/ligand_target_matrix.rds`
+- `resources/nichenet/mouse/lr_network.rds`
+- `resources/nichenet/mouse/weighted_networks.rds`
+
+这样 notebook 不依赖临时网络连接，也更容易复现。
+:::
+
+
+## Load Data
+
+```{r}
+#| label: load-data
+#| eval: false
+
+seurat_obj <- qs2::qs_read("datasets/harmonized_seurat.qs2")
+
+# 移除技术伪影
+seurat_obj <- subset(seurat_obj, cell_type != "Multiplets")
+
+# NicheNet 需要 normalized RNA expression 来判断表达与做 receiver DE。
+# 如果上游没有对 RNA assay 做 NormalizeData()，需先在这里补充。
+DefaultAssay(seurat_obj) <- "RNA"
+
+seurat_obj
+colnames(seurat_obj@meta.data)
+table(seurat_obj$cell_type)
+table(seurat_obj$group)
+table(seurat_obj$orig.ident)
+```
+
+
+## Analysis Design
+
+先明确 4 个核心元素：
+
+1. **receiver cell type**：谁在响应？
+2. **condition of interest**：receiver 在哪个条件下发生转录变化？
+3. **reference condition**：和谁比较？
+4. **sender cells**：谁可能释放 ligand？
+
+```{r}
+#| label: define-design
+#| eval: false
+
+# === 数据设计 ===
+species <- "mouse"  # "mouse" or "human"
+receiver_ct <- "Alveolar Macrophages"
+sender_celltypes <- c("AT1", "AT2", "Fibroblasts", "Endothelial", "Monocytes")
+
+condition_col <- "group"
+sample_col <- "orig.ident"
+celltype_col <- "cell_type"
+
+condition_oi <- "Model"
+condition_ref <- "Normal"
+
+# === 分析阈值 ===
+expression_pct_cutoff <- 0.10
+logfc_cutoff <- 0.15
+adj_p_cutoff <- 0.05
+top_n_ligands <- 20
+top_n_targets_per_ligand <- 50
+```
+
+::: {.callout-tip}
+## sender 的两种定义策略
+
+- **sender-agnostic**：除 receiver 外，所有细胞都可作为潜在 sender
+- **sender-focused**：只分析你明确指定的 sender 细胞群
+
+推荐先做 sender-agnostic 看全局，再做 sender-focused 精炼候选 ligand。
+:::
+
+
+## Sanity Checks Before Running NicheNet
+
+```{r}
+#| label: sanity-checks
+#| eval: false
+
+table(seurat_obj[[celltype_col, drop = TRUE]])
+table(seurat_obj[[condition_col, drop = TRUE]])
+table(seurat_obj[[celltype_col, drop = TRUE]], seurat_obj[[condition_col, drop = TRUE]])
+
+stopifnot(receiver_ct %in% unique(seurat_obj[[celltype_col, drop = TRUE]]))
+stopifnot(all(c(condition_oi, condition_ref) %in% unique(seurat_obj[[condition_col, drop = TRUE]])))
+stopifnot(all(sender_celltypes %in% unique(seurat_obj[[celltype_col, drop = TRUE]])))
+```
+
+
+## Load NicheNet Prior Model
+
+```{r}
+#| label: load-prior-model
+#| eval: false
+
+model_dir <- file.path("resources", "nichenet", species)
+
+ligand_target_matrix <- readRDS(file.path(model_dir, "ligand_target_matrix.rds"))
+lr_network <- readRDS(file.path(model_dir, "lr_network.rds"))
+weighted_networks <- readRDS(file.path(model_dir, "weighted_networks.rds"))
+
+dim(ligand_target_matrix)
+dplyr::glimpse(lr_network)
+names(weighted_networks)
+```
+
+
+## Prepare Seurat Object
+
+```{r}
+#| label: prepare-seurat
+#| eval: false
+
+Idents(seurat_obj) <- seurat_obj[[celltype_col, drop = TRUE]]
+
+# 仅保留本次分析相关条件
+keep_cells <- rownames(seurat_obj@meta.data)[
+  seurat_obj[[condition_col, drop = TRUE]] %in% c(condition_ref, condition_oi)
+]
+seurat_use <- seurat_obj[, keep_cells]
+
+table(seurat_use[[celltype_col, drop = TRUE]])
+table(seurat_use[[condition_col, drop = TRUE]])
+```
+
+
+## Step 1: Define Receiver Gene Set of Interest
+
+NicheNet 的输入不是“全部 DE 基因”，而是你认为最能代表 receiver 响应的一组 geneset。
+
+最常见做法：
+
+- 在 **receiver cell type** 内比较 `condition_oi` vs `condition_ref`
+- 取上调基因作为 `geneset_oi`
+- 以 receiver 中表达的全部基因作为 background
+
+::: {.callout-warning}
+## 统计解释
+
+如果你有多个生物学重复，建议优先用 pseudobulk / sample-level DE 生成 `geneset_oi`，再把显著基因喂给 NicheNet。
+
+下面的 `FindMarkers()` 更适合：
+
+- 探索性分析
+- 快速生成 receiver gene program
+- 与 Seurat 工作流保持一致
+:::
+
+```{r}
+#| label: receiver-de
+#| eval: false
+
+receiver_cells <- rownames(seurat_use@meta.data)[
+  seurat_use[[celltype_col, drop = TRUE]] == receiver_ct
+]
+receiver_obj <- seurat_use[, receiver_cells]
+
+Idents(receiver_obj) <- receiver_obj[[condition_col, drop = TRUE]]
+
+receiver_de <- FindMarkers(
+  object = receiver_obj,
+  ident.1 = condition_oi,
+  ident.2 = condition_ref,
+  assay = "RNA",
+  slot = "data",
+  logfc.threshold = 0,
+  min.pct = expression_pct_cutoff,
+  test.use = "wilcox"
+) %>%
+  rownames_to_column("gene")
+
+receiver_de_sig <- receiver_de %>%
+  filter(p_val_adj < adj_p_cutoff, avg_log2FC > logfc_cutoff) %>%
+  arrange(desc(avg_log2FC))
+
+geneset_oi <- receiver_de_sig$gene
+
+length(geneset_oi)
+head(receiver_de_sig, 20)
+```
+
+
+## Step 2: Define Expressed Genes in Receiver and Senders
+
+```{r}
+#| label: expressed-genes
+#| eval: false
+
+Idents(seurat_use) <- seurat_use[[celltype_col, drop = TRUE]]
+
+expressed_genes_receiver <- get_expressed_genes(
+  receiver_ct,
+  seurat_use,
+  pct = expression_pct_cutoff,
+  assay_oi = "RNA"
+)
+
+expressed_genes_senders <- sender_celltypes %>%
+  set_names() %>%
+  map(~ get_expressed_genes(.x, seurat_use, pct = expression_pct_cutoff, assay_oi = "RNA"))
+
+background_expressed_genes <- expressed_genes_receiver
+
+length(expressed_genes_receiver)
+map_int(expressed_genes_senders, length)
+```
+
+
+## Step 3: Define Candidate Ligands
+
+### 3A. Sender-Agnostic Candidate Ligands
+
+候选 ligand = 任意细胞中可能表达，且其 receptor 在 receiver 中表达的 ligand。
+
+```{r}
+#| label: sender-agnostic-ligands
+#| eval: false
+
+potential_ligands_agnostic <- lr_network %>%
+  filter(to %in% expressed_genes_receiver) %>%
+  pull(from) %>%
+  unique()
+
+length(potential_ligands_agnostic)
+head(sort(potential_ligands_agnostic))
+```
+
+
+### 3B. Sender-Focused Candidate Ligands
+
+候选 ligand = 指定 sender 中表达，且其 receptor 在 receiver 中表达的 ligand。
+
+```{r}
+#| label: sender-focused-ligands
+#| eval: false
+
+sender_ligand_tbl <- imap_dfr(expressed_genes_senders, function(gene_vec, sender_nm) {
+  tibble(sender = sender_nm, ligand = gene_vec)
+})
+
+potential_ligands_focused <- lr_network %>%
+  filter(from %in% sender_ligand_tbl$ligand, to %in% expressed_genes_receiver) %>%
+  pull(from) %>%
+  unique()
+
+length(potential_ligands_focused)
+head(sort(potential_ligands_focused))
+```
+
+
+## Step 4: Run Ligand Activity Analysis
+
+推荐两套都跑：
+
+- `ligand_activities_agnostic`
+- `ligand_activities_focused`
+
+重点看两者重叠的高排名 ligand，它们通常更稳健。
+
+```{r}
+#| label: ligand-activity
+#| eval: false
+
+ligand_activities_agnostic <- predict_ligand_activities(
+  geneset = geneset_oi,
+  background_expressed_genes = background_expressed_genes,
+  ligand_target_matrix = ligand_target_matrix,
+  potential_ligands = potential_ligands_agnostic
+) %>%
+  arrange(desc(aupr_corrected))
+
+ligand_activities_focused <- predict_ligand_activities(
+  geneset = geneset_oi,
+  background_expressed_genes = background_expressed_genes,
+  ligand_target_matrix = ligand_target_matrix,
+  potential_ligands = potential_ligands_focused
+) %>%
+  arrange(desc(aupr_corrected))
+
+top_ligands_agnostic <- ligand_activities_agnostic %>%
+  slice_head(n = top_n_ligands) %>%
+  pull(test_ligand)
+
+top_ligands_focused <- ligand_activities_focused %>%
+  slice_head(n = top_n_ligands) %>%
+  pull(test_ligand)
+
+top_ligands_consensus <- intersect(top_ligands_agnostic, top_ligands_focused)
+
+head(ligand_activities_focused, 20)
+top_ligands_consensus
+```
+
+
+## Step 5: Visualize Top Ligand Activities
+
+```{r}
+#| label: plot-ligand-activity
+#| eval: false
+
+p1 <- ligand_activities_agnostic %>%
+  slice_head(n = top_n_ligands) %>%
+  mutate(test_ligand = forcats::fct_reorder(test_ligand, aupr_corrected)) %>%
+  ggplot(aes(x = test_ligand, y = aupr_corrected)) +
+  geom_col(fill = "#4C78A8") +
+  coord_flip() +
+  labs(title = "Top ligands (sender-agnostic)",
+       x = NULL, y = "Corrected AUPR") +
+  theme_classic()
+
+p2 <- ligand_activities_focused %>%
+  slice_head(n = top_n_ligands) %>%
+  mutate(test_ligand = forcats::fct_reorder(test_ligand, aupr_corrected)) %>%
+  ggplot(aes(x = test_ligand, y = aupr_corrected)) +
+  geom_col(fill = "#F58518") +
+  coord_flip() +
+  labs(title = "Top ligands (sender-focused)",
+       x = NULL, y = "Corrected AUPR") +
+  theme_classic()
+
+p1 + p2
+```
+
+
+## Step 6: Map Top Ligands Back to Sender Cell Types
+
+这一步回答：高优先级 ligand 主要由哪些 sender 细胞群提供？
+
+```{r}
+#| label: map-ligands-to-senders
+#| eval: false
+
+top_ligands_use <- if (length(top_ligands_consensus) >= 5) {
+  top_ligands_consensus
+} else {
+  top_ligands_focused
+}
+
+sender_ligand_support <- sender_ligand_tbl %>%
+  filter(ligand %in% top_ligands_use) %>%
+  distinct(sender, ligand) %>%
+  arrange(ligand, sender)
+
+sender_ligand_support
+```
+
+
+```{r}
+#| label: sender-ligand-expression-heatmap
+#| eval: false
+
+avg_expr_sender <- AverageExpression(
+  seurat_use,
+  assays = "RNA",
+  group.by = celltype_col,
+  layer = "data",
+  features = unique(top_ligands_use)
+)$RNA
+
+avg_expr_sender <- avg_expr_sender[
+  rownames(avg_expr_sender) %in% unique(top_ligands_use),
+  colnames(avg_expr_sender) %in% sender_celltypes,
+  drop = FALSE
+]
+
+pheatmap::pheatmap(
+  avg_expr_sender,
+  scale = "row",
+  clustering_method = "ward.D2",
+  color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+  main = "Ligand expression across sender cell types"
+)
+```
+
+
+## Step 7: Identify Ligand-Receptor Support in Receiver
+
+这一步回答：top ligands 在 receiver 中有哪些可表达 receptor 支持？
+
+```{r}
+#| label: ligand-receptor-support
+#| eval: false
+
+top_ligand_receptor_tbl <- lr_network %>%
+  filter(from %in% top_ligands_use, to %in% expressed_genes_receiver) %>%
+  distinct(from, to)
+
+if ("lr_sig" %in% names(weighted_networks)) {
+  top_ligand_receptor_tbl <- weighted_networks$lr_sig %>%
+    filter(from %in% top_ligands_use, to %in% expressed_genes_receiver) %>%
+    distinct(from, to, weight) %>%
+    arrange(desc(weight))
+}
+
+head(top_ligand_receptor_tbl, 30)
+```
+
+
+```{r}
+#| label: ligand-receptor-heatmap
+#| eval: false
+
+lr_binary_mat <- top_ligand_receptor_tbl %>%
+  mutate(value = 1) %>%
+  pivot_wider(names_from = to, values_from = value, values_fill = 0) %>%
+  column_to_rownames("from") %>%
+  as.matrix()
+
+pheatmap::pheatmap(
+  lr_binary_mat,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  color = c("white", "#E45756"),
+  legend_breaks = c(0, 1),
+  main = "Ligand-receptor support"
+)
+```
+
+
+```{r}
+#| label: receiver-receptor-expression
+#| eval: false
+
+receiver_receptors <- unique(top_ligand_receptor_tbl$to)
+
+receiver_subset <- seurat_use[, seurat_use[[celltype_col, drop = TRUE]] == receiver_ct]
+
+DotPlot(
+  receiver_subset,
+  features = receiver_receptors,
+  group.by = condition_col,
+  assay = "RNA"
+) +
+  RotatedAxis() +
+  labs(title = paste("Receiver receptor expression:", receiver_ct))
+```
+
+
+## Step 8: Infer Downstream Target Genes of Top Ligands
+
+这一步是 NicheNet 最有价值的部分之一：把“哪个 ligand 最可能是 driver”进一步展开为“它可能调控了哪些 receiver target genes”。
+
+```{r}
+#| label: ligand-target-links
+#| eval: false
+
+active_ligand_target_links_df <- bind_rows(
+  lapply(top_ligands_use, function(ligand_oi) {
+    get_weighted_ligand_target_links(
+      ligand = ligand_oi,
+      geneset = geneset_oi,
+      ligand_target_matrix = ligand_target_matrix,
+      n = top_n_targets_per_ligand
+    )
+  })
+)
+
+head(active_ligand_target_links_df, 30)
+```
+
+
+```{r}
+#| label: ligand-target-heatmap
+#| eval: false
+
+ligand_target_vis_mat <- prepare_ligand_target_visualization(
+  active_ligand_target_links_df,
+  ligand_target_matrix,
+  cutoff = 0.25
+)
+
+pheatmap::pheatmap(
+  ligand_target_vis_mat,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  color = colorRampPalette(c("white", "#FDB863", "#B2182B"))(100),
+  main = "Top ligand-target regulatory potential"
+)
+```
+
+
+## Step 9: Overlay Predicted Targets with Receiver DE Results
+
+这一步用于把 NicheNet 预测和实际 receiver DE 结果合并，筛出“既是预测 target，又在 receiver 中显著变化”的高可信基因。
+
+```{r}
+#| label: merge-targets-with-de
+#| eval: false
+
+ligand_target_with_de <- active_ligand_target_links_df %>%
+  left_join(
+    receiver_de %>% select(gene, avg_log2FC, p_val_adj),
+    by = c("target" = "gene")
+  ) %>%
+  arrange(ligand, desc(weight))
+
+head(ligand_target_with_de, 30)
+```
+
+
+```{r}
+#| label: plot-top-targets
+#| eval: false
+
+top_targets_plot_df <- ligand_target_with_de %>%
+  group_by(ligand) %>%
+  slice_max(order_by = weight, n = 10) %>%
+  ungroup()
+
+ggplot(top_targets_plot_df,
+       aes(x = forcats::fct_reorder(target, weight), y = weight, fill = ligand)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~ ligand, scales = "free_y") +
+  labs(title = "Top predicted target genes per ligand",
+       x = NULL, y = "Regulatory potential") +
+  theme_classic()
+```
+
+
+## Step 10: Prioritize Final Ligands for Interpretation
+
+综合以下证据进行优先级排序：
+
+- ligand activity 分数高
+- sender 中表达明确
+- receiver 中有 receptor 支持
+- 能连接到 biologically relevant targets
+- 与已知生物学一致
+
+```{r}
+#| label: final-prioritization
+#| eval: false
+
+ligand_summary <- ligand_activities_focused %>%
+  filter(test_ligand %in% top_ligands_use) %>%
+  select(test_ligand, aupr_corrected, pearson) %>%
+  rename(ligand = test_ligand) %>%
+  left_join(
+    sender_ligand_support %>%
+      count(ligand, name = "n_supporting_senders"),
+    by = "ligand"
+  ) %>%
+  left_join(
+    top_ligand_receptor_tbl %>%
+      count(from, name = "n_supported_receptors") %>%
+      rename(ligand = from),
+    by = "ligand"
+  ) %>%
+  left_join(
+    active_ligand_target_links_df %>%
+      count(ligand, name = "n_predicted_targets"),
+    by = "ligand"
+  ) %>%
+  arrange(desc(aupr_corrected), desc(n_supported_receptors))
+
+ligand_summary
+```
+
+
+## Optional: Compare Multiple Receiver Cell Types
+
+如果你想系统比较多个 receiver，可以把上面的流程包装成函数，对多个 receiver 分别运行。
+
+```{r}
+#| label: multi-receiver-template
+#| eval: false
+
+receiver_candidates <- c("Alveolar Macrophages", "AT2", "Endothelial")
+
+run_nichenet_receiver <- function(receiver_ct_oi) {
+  receiver_obj <- seurat_use[, seurat_use[[celltype_col, drop = TRUE]] == receiver_ct_oi]
+  Idents(receiver_obj) <- receiver_obj[[condition_col, drop = TRUE]]
+
+  receiver_de <- FindMarkers(
+    receiver_obj,
+    ident.1 = condition_oi,
+    ident.2 = condition_ref,
+    assay = "RNA",
+    slot = "data",
+    logfc.threshold = 0,
+    min.pct = expression_pct_cutoff
+  ) %>%
+    rownames_to_column("gene")
+
+  geneset_oi <- receiver_de %>%
+    filter(p_val_adj < adj_p_cutoff, avg_log2FC > logfc_cutoff) %>%
+    pull(gene)
+
+  expressed_receiver <- get_expressed_genes(
+    receiver_ct_oi,
+    seurat_use,
+    pct = expression_pct_cutoff,
+    assay_oi = "RNA"
+  )
+
+  potential_ligands <- lr_network %>%
+    filter(from %in% sender_ligand_tbl$ligand, to %in% expressed_receiver) %>%
+    pull(from) %>%
+    unique()
+
+  predict_ligand_activities(
+    geneset = geneset_oi,
+    background_expressed_genes = expressed_receiver,
+    ligand_target_matrix = ligand_target_matrix,
+    potential_ligands = potential_ligands
+  ) %>%
+    mutate(receiver = receiver_ct_oi) %>%
+    arrange(desc(aupr_corrected))
+}
+
+multi_receiver_results <- map_dfr(receiver_candidates, run_nichenet_receiver)
+multi_receiver_results
+```
+
+
+## Export Results
+
+```{r}
+#| label: save-results
+#| eval: false
+
+dir.create("Results", showWarnings = FALSE)
+dir.create(file.path("Results", "nichenet"), showWarnings = FALSE)
+
+write.csv(receiver_de, file.path("Results", "nichenet", "receiver_de_all.csv"), row.names = FALSE)
+write.csv(receiver_de_sig, file.path("Results", "nichenet", "receiver_de_sig.csv"), row.names = FALSE)
+write.csv(ligand_activities_agnostic, file.path("Results", "nichenet", "ligand_activities_agnostic.csv"), row.names = FALSE)
+write.csv(ligand_activities_focused, file.path("Results", "nichenet", "ligand_activities_focused.csv"), row.names = FALSE)
+write.csv(sender_ligand_support, file.path("Results", "nichenet", "sender_ligand_support.csv"), row.names = FALSE)
+write.csv(top_ligand_receptor_tbl, file.path("Results", "nichenet", "ligand_receptor_support.csv"), row.names = FALSE)
+write.csv(active_ligand_target_links_df, file.path("Results", "nichenet", "ligand_target_links.csv"), row.names = FALSE)
+write.csv(ligand_target_with_de, file.path("Results", "nichenet", "ligand_target_with_de.csv"), row.names = FALSE)
+write.csv(ligand_summary, file.path("Results", "nichenet", "ligand_summary.csv"), row.names = FALSE)
+
+saveRDS(
+  list(
+    receiver_de = receiver_de,
+    receiver_de_sig = receiver_de_sig,
+    ligand_activities_agnostic = ligand_activities_agnostic,
+    ligand_activities_focused = ligand_activities_focused,
+    sender_ligand_support = sender_ligand_support,
+    ligand_receptor_support = top_ligand_receptor_tbl,
+    ligand_target_links = active_ligand_target_links_df,
+    ligand_summary = ligand_summary
+  ),
+  file = file.path("Results", "nichenet", "nichenet_results.rds")
+)
+```
+
+
+## Interpretation Checklist
+
+在汇报结果前，建议逐项检查：
+
+- receiver 的 `geneset_oi` 是否真的代表该细胞群的生物学响应，而不是混入了 composition artifact
+- top ligands 是否在 sender 中真实表达，而不只是知识网络里存在
+- receiver 的 receptor 是否表达，且最好在相关条件下有合理变化
+- ligand-target links 是否能解释关键 marker / pathway
+- 多个候选 ligand 是否指向同一 biological program
+
+
+## Session Info
+
+```{r}
+#| label: session-info
+
+sessionInfo()
+```

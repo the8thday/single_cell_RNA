@@ -1,0 +1,1100 @@
+---
+title: "Monocle3 Trajectory Analysis"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+---
+
+## Introduction
+
+Monocle3 通过在 UMAP 空间中构建主图（principal graph）来推断细胞发育轨迹，并基于此为每个细胞分配拟时序（pseudotime）值。与早期版本相比，monocle3 的核心优势在于：
+
+- **可继承 Seurat 的降维结果** — 支持使用 harmony 批次校正后的 UMAP 坐标，使轨迹分析与聚类结果保持一致（注意：批次校正可能同时抹除与条件相关的生物学变异，当 condition 与 trajectory 高度耦合时建议与未校正嵌入对比验证）
+- **自动分区（partition）** — 对不连通的细胞群自动划分独立轨迹
+- **支持多起点** — 允许从多个生物学上合理的起始点开始排序
+- **Moran's I 统计** — 通过空间自相关检验发现沿轨迹变化的基因
+
+**分析策略：** 轨迹分析应在生物学上相关的细胞亚群中进行（如免疫细胞谱系、内皮细胞谱系），而非全部细胞。本文件基于预处理的 harmonized_seurat 对象（139,412 cells），需先提取目标细胞亚群再进行轨迹分析。
+
+
+## Setup
+
+```{r}
+#| label: load-packages
+#| include: false
+
+library(Seurat)
+library(monocle3)
+library(tidyverse)
+library(patchwork)
+library(viridis)
+library(ggridges)
+library(qs2)
+library(pheatmap)
+
+options(future.globals.maxSize = 40 * 1024^3)
+set.seed(42)
+```
+
+
+## Load Data
+
+```{r}
+#| label: load-data
+#| eval: false
+
+seurat_obj <- qs2::qs_read("datasets/harmonized_seurat.qs2")
+
+# 查看数据基本信息
+seurat_obj
+
+# 查看元数据列
+colnames(seurat_obj@meta.data)
+
+# 查看细胞类型和分组分布
+table(seurat_obj$cell_type)
+table(seurat_obj$group)
+table(seurat_obj$level1)
+table(seurat_obj$cell_type, seurat_obj$group)
+```
+
+
+## Subset Cells for Trajectory
+
+轨迹分析应聚焦于具有发育关系的细胞亚群。直接对全部 139K 细胞做轨迹分析既不合理也极耗资源。根据研究问题选择合适的细胞子集。
+
+```{r}
+#| label: subset-cells
+#| eval: false
+
+# === 方案1：按大类提取（如免疫细胞） ===
+seurat_sub <- subset(seurat_obj, subset = level1 == "Immune")
+
+# === 方案2：按具体细胞类型提取（如髓系细胞谱系） ===
+# myeloid_types <- c("Alveolar Macrophages", "Interstitial Macrophages",
+#                    "MregDC", "Monocytes")
+# seurat_sub <- subset(seurat_obj, subset = cell_type %in% myeloid_types)
+
+# === 方案3：按特定样本/条件提取 ===
+# seurat_sub <- subset(seurat_obj, subset = group %in% c("Normal", "Treatment"))
+
+table(seurat_sub$cell_type)
+table(seurat_sub$group)
+```
+
+
+```{r}
+#| label: reprocess-subset
+#| eval: false
+
+# 对子集重新降维（可选，二选一）
+# 方案A：保留原始 harmony 嵌入（推荐，subset后Seurat会自动保留对应细胞的embedding）
+# 方案B：重新降维（适用于子集较小、需要更精细轨迹的情况）
+
+# === 方案A：直接使用原始 harmony UMAP，无需重新计算 ===
+# seurat_sub 已经保留了 subset 前的 harmony 和 umap embeddings
+DimPlot(seurat_sub, group.by = "cell_type", label = TRUE, repel = TRUE) +
+  NoLegend()
+
+# === 方案B：重新降维（如需要，取消注释以下代码） ===
+# seurat_sub <- FindVariableFeatures(seurat_sub, nfeatures = 3000)
+# seurat_sub <- ScaleData(seurat_sub)
+# seurat_sub <- RunPCA(seurat_sub, npcs = 30)
+# # 如果需要重新批次校正，需先 RunHarmony：
+# # seurat_sub <- harmony::RunHarmony(seurat_sub, group.by.vars = "orig.ident")
+# # seurat_sub <- RunUMAP(seurat_sub, reduction = "harmony", dims = 1:30)
+# # 如果不需要批次校正，直接用 PCA：
+# seurat_sub <- RunUMAP(seurat_sub, reduction = "pca", dims = 1:30)
+# DimPlot(seurat_sub, group.by = "cell_type", label = TRUE, repel = TRUE) +
+#   NoLegend()
+```
+
+
+## Seurat to Monocle3 Conversion
+
+手动构建 CDS 对象，兼容 Seurat v5 的 layer 架构。
+
+```{r}
+#| label: create-cds
+#| eval: false
+
+# 提取counts矩阵和元数据
+data <- GetAssayData(seurat_sub, assay = "RNA", layer = "counts")
+cell_metadata <- seurat_sub@meta.data
+gene_metadata <- data.frame(
+  gene_short_name = rownames(data),
+  row.names = rownames(data)
+)
+
+# 创建CDS对象
+cds <- new_cell_data_set(
+  expression_data = data,
+  cell_metadata = cell_metadata,
+  gene_metadata = gene_metadata
+)
+
+cds
+```
+
+
+## Preprocess & Transfer Embeddings
+
+先用 monocle3 内部流程预处理，再将 Seurat 的 harmony UMAP 坐标转移过来，确保轨迹分析基于批次校正后的降维结果。
+
+```{r}
+#| label: preprocess-cds
+#| eval: false
+
+# Monocle3 内部预处理（normalize + PCA）
+# 注意：此步的 PCA 结果仅用于满足 reduce_dimension 的前置要求，
+# 最终轨迹基于下一步转移的 Seurat UMAP 坐标，这里的 PCA 不影响轨迹结果
+cds <- preprocess_cds(cds, num_dim = 50, method = "PCA", norm_method = "log")
+
+# 检查PC方差解释（仅供参考）
+plot_pc_variance_explained(cds)
+```
+
+
+```{r}
+#| label: transfer-umap
+#| eval: false
+
+# 先生成monocle自身的UMAP（作为占位）
+cds <- reduce_dimension(cds,
+                        reduction_method = "UMAP",
+                        preprocess_method = "PCA")
+
+# 比较 monocle 自身 UMAP vs Seurat UMAP
+p1 <- plot_cells(cds, reduction_method = "UMAP",
+                 color_cells_by = "cell_type") +
+  ggtitle("Monocle3 UMAP")
+
+# 将 Seurat 的 UMAP 坐标转移到 CDS 对象
+# 确保细胞顺序一致
+seurat_umap <- Embeddings(seurat_sub, reduction = "umap")
+seurat_umap <- seurat_umap[colnames(cds), ]
+cds@int_colData@listData$reducedDims$UMAP <- seurat_umap
+
+p2 <- plot_cells(cds, reduction_method = "UMAP",
+                 color_cells_by = "cell_type") +
+  ggtitle("Seurat UMAP (transferred)")
+
+p1 + p2
+```
+
+
+## Cluster & Learn Trajectory
+
+```{r}
+#| label: cluster-cells
+#| eval: false
+
+# Monocle3 聚类（基于转移的UMAP坐标）
+cds <- cluster_cells(cds)
+
+p1 <- plot_cells(cds, show_trajectory_graph = FALSE) +
+  ggtitle("Cluster")
+p2 <- plot_cells(cds, color_cells_by = "partition",
+                 show_trajectory_graph = FALSE) +
+  ggtitle("Partition")
+p3 <- plot_cells(cds, color_cells_by = "cell_type",
+                 show_trajectory_graph = FALSE,
+                 label_cell_groups = FALSE) +
+  ggtitle("Cell Type")
+
+p1 + p2 + p3 + plot_layout(ncol = 3)
+```
+
+```{r}
+#| label: learn-graph
+#| eval: false
+
+# 学习轨迹图
+# use_partition = TRUE: 每个partition独立构建轨迹
+# close_loop = TRUE: 检测并闭合环路
+cds <- learn_graph(cds, use_partition = TRUE, close_loop = TRUE)
+
+plot_cells(cds,
+           color_cells_by = "cell_type",
+           label_groups_by_cluster = FALSE,
+           label_leaves = TRUE,
+           label_branch_points = TRUE,
+           graph_label_size = 3)
+```
+
+
+## Root Cell Selection
+
+选择轨迹起始点是拟时序分析中最关键的步骤，需要结合生物学先验知识。
+
+> **注意：** 如果上一步 `learn_graph(use_partition = TRUE)` 产生了多个 partition，`order_cells()` 仅为包含指定 root 的 partition 计算有效 pseudotime，其余 partition 的细胞将保留 `Inf`（后续会被过滤掉）。如果只关心某一条谱系，建议先 subset 到目标 partition 再做 root 选择；如果需要分析所有 partition，需为每个 partition 分别指定 root。
+
+### 方法1：交互式选择
+
+```{r}
+#| label: root-interactive
+#| eval: false
+
+# 在RStudio中运行，会弹出交互界面让你点击选择起始节点
+cds <- order_cells(cds)
+```
+
+
+### 方法2：基于细胞类型自动选择
+
+```{r}
+#| label: root-by-celltype
+#| eval: false
+
+# 辅助函数：根据细胞类型找到最近的主图节点作为根节点
+get_earliest_principal_node <- function(cds, cell_type_col, target_type) {
+  cell_ids <- which(colData(cds)[[cell_type_col]] == target_type)
+
+  closest_vertex <- cds@principal_graph_aux[["UMAP"]]$pr_graph_cell_proj_closest_vertex
+  closest_vertex <- as.matrix(closest_vertex[colnames(cds), ])
+
+  root_pr_nodes <- igraph::V(principal_graph(cds)[["UMAP"]])$name[
+    as.numeric(names(which.max(table(closest_vertex[cell_ids, ]))))
+  ]
+
+  root_pr_nodes
+}
+
+# 根据先验知识选择起始细胞类型
+# 例如：干细胞/祖细胞作为起始点
+root_node <- get_earliest_principal_node(cds,
+                                          cell_type_col = "cell_type",
+                                          target_type = "Naive T")  # 替换为实际的起始细胞类型
+
+cds <- order_cells(cds, root_pr_nodes = root_node)
+```
+
+
+### 方法3：基于 UMAP 坐标选择
+
+```{r}
+#| label: root-by-coordinates
+#| eval: false
+
+# 先查看UMAP分布，确定起始区域
+plot_cells(cds, color_cells_by = "cell_type",
+           label_cell_groups = TRUE)
+
+# 基于UMAP坐标范围筛选根细胞
+umap_coords <- Embeddings(seurat_sub, reduction = "umap")
+umap_df <- as.data.frame(umap_coords)
+
+# 根据UMAP图调整坐标范围
+root_cells <- rownames(umap_df)[
+  umap_df[, 1] > -10 & umap_df[, 1] < -5 &
+  umap_df[, 2] > 2 & umap_df[, 2] < 6
+]
+
+length(root_cells)  # 检查选中的细胞数量
+cds <- order_cells(cds, root_cells = root_cells)
+```
+
+
+## Pseudotime Visualization
+
+```{r}
+#| label: plot-pseudotime
+#| eval: false
+
+# 拟时序着色
+p1 <- plot_cells(cds,
+                 color_cells_by = "pseudotime",
+                 label_cell_groups = FALSE,
+                 label_leaves = FALSE,
+                 label_branch_points = FALSE) +
+  scale_color_viridis_c()
+
+# 按细胞类型着色
+p2 <- plot_cells(cds,
+                 color_cells_by = "cell_type",
+                 label_groups_by_cluster = FALSE,
+                 label_leaves = FALSE,
+                 label_branch_points = TRUE)
+
+# 按实验分组着色
+p3 <- plot_cells(cds,
+                 color_cells_by = "group",
+                 label_groups_by_cluster = FALSE,
+                 label_leaves = FALSE,
+                 label_branch_points = FALSE)
+
+p1 + p2 + p3 + plot_layout(ncol = 3)
+```
+
+```{r}
+#| label: plot-pseudotime-custom
+#| eval: false
+
+# 自定义分组颜色
+cds$group <- as.factor(cds$group)
+# 根据实际分组调整颜色（支持任意数量的分组）
+group_colors <- c("Normal" = "#1F77B4", "Model" = "#FF7F0E", "Treatment" = "#2CA02C")
+
+p_group <- plot_cells(cds,
+                      color_cells_by = "group",
+                      label_groups_by_cluster = FALSE,
+                      label_leaves = FALSE,
+                      label_branch_points = FALSE) +
+  scale_color_manual(values = group_colors) +
+  theme_classic() +
+  theme(legend.position = c(0.85, 0.2))
+
+p_group
+```
+
+
+## Trajectory DEG Analysis
+
+使用 `graph_test()` 基于 Moran's I 空间自相关统计量发现沿轨迹变化的基因。
+
+**注意：** `graph_test` 计算量极大，建议使用多核并行，且在细胞数 <50K 时运行。
+
+```{r}
+#| label: graph-test
+#| eval: false
+#| message: false
+#| warning: false
+
+# 寻找沿轨迹显著变化的基因
+# neighbor_graph = "principal_graph": 沿轨迹方向检测基因变化（适合拟时序分析）
+# 另一选项 "knn" 基于KNN图检测局部空间模式，更适合发现cluster-specific marker
+# morans_I: 空间自相关系数，0表示无空间效应，1表示高度空间相关
+Track_genes <- graph_test(cds,
+                          neighbor_graph = "principal_graph",
+                          cores = 4)
+
+# 按q值和Moran's I筛选显著基因
+Track_genes_sig <- Track_genes %>%
+  filter(q_value < 0.05) %>%
+  arrange(desc(morans_I))
+
+head(Track_genes_sig, 20)
+
+# 保存完整结果
+dir.create("Results", showWarnings = FALSE)
+write.csv(Track_genes, "Results/trajectory_DEG_graph_test.csv")
+```
+
+
+## Gene Expression in Pseudotime
+
+```{r}
+#| label: plot-genes-pseudotime
+#| eval: false
+
+# 选择top基因可视化
+top_genes <- Track_genes_sig %>%
+  head(10) %>%
+  pull(gene_short_name) %>%
+  as.character()
+
+# 基因表达随拟时序的变化趋势
+plot_genes_in_pseudotime(cds[top_genes, ],
+                         color_cells_by = "cell_type",
+                         min_expr = 0.5,
+                         ncol = 2)
+```
+
+```{r}
+#| label: plot-genes-umap
+#| eval: false
+
+# 在UMAP上展示top基因的表达
+plot_cells(cds,
+           genes = top_genes[1:6],
+           show_trajectory_graph = FALSE,
+           label_cell_groups = FALSE,
+           label_leaves = FALSE)
+```
+
+```{r}
+#| label: plot-specific-genes
+#| eval: false
+
+# 可视化特定的感兴趣基因
+# 替换为实际研究中关注的基因
+genes_of_interest <- c("Gene1", "Gene2", "Gene3", "Gene4")
+
+plot_genes_in_pseudotime(cds[genes_of_interest, ],
+                         color_cells_by = "group",
+                         min_expr = 0.5,
+                         ncol = 2)
+```
+
+
+## Co-expression Module Analysis
+
+将沿轨迹变化的基因聚类为共表达模块，揭示协同调控的基因程序。
+
+```{r}
+#| label: gene-modules
+#| eval: false
+#| message: false
+
+# 提取显著的轨迹相关基因
+module_genes <- Track_genes_sig %>%
+  filter(q_value < 0.01, morans_I > 0.1) %>%
+  pull(gene_short_name) %>%
+  as.character()
+
+length(module_genes)
+
+# 寻找共表达基因模块
+# resolution 控制模块粒度：值越小模块越少越大，值越大模块越多越细
+# 建议根据 table() 结果调整，使每个模块包含合理数量的基因（通常10-200个）
+set.seed(42)
+gene_module_df <- find_gene_modules(cds[module_genes, ],
+                                     resolution = 1e-2,
+                                     cores = 4)
+
+# 检查模块数量和大小，如果模块过少/过大可尝试增大 resolution（如 1e-1, 5e-1）
+table(gene_module_df$module)
+```
+
+
+```{r}
+#| label: plot-module-heatmap
+#| eval: false
+
+# 模块聚合表达热图（按细胞类型）
+cell_group <- tibble::tibble(
+  cell = rownames(colData(cds)),
+  cell_group = colData(cds)$cell_type
+)
+
+agg_mat <- aggregate_gene_expression(cds, gene_module_df, cell_group)
+rownames(agg_mat) <- paste0("Module ", rownames(agg_mat))
+
+pheatmap::pheatmap(agg_mat,
+                   scale = "row",
+                   clustering_method = "ward.D2",
+                   fontsize_row = 8,
+                   color = colorRampPalette(c("navy", "white", "firebrick3"))(100))
+```
+
+
+```{r}
+#| label: plot-module-by-group
+#| eval: false
+
+# 模块聚合表达热图（按实验分组）
+cell_group_condition <- tibble::tibble(
+  cell = rownames(colData(cds)),
+  cell_group = paste(colData(cds)$cell_type, colData(cds)$group, sep = "_")
+)
+
+agg_mat2 <- aggregate_gene_expression(cds, gene_module_df, cell_group_condition)
+rownames(agg_mat2) <- paste0("Module ", rownames(agg_mat2))
+
+pheatmap::pheatmap(agg_mat2,
+                   scale = "row",
+                   clustering_method = "ward.D2",
+                   fontsize_row = 8,
+                   fontsize_col = 6,
+                   color = colorRampPalette(c("navy", "white", "firebrick3"))(100))
+```
+
+
+## Module Enrichment Analysis
+
+对每个共表达模块进行 GO/KEGG 富集分析，揭示各模块代表的生物学功能。
+
+### 方式1：对特定 module 做富集
+
+```{r}
+#| label: module-enrichment-single
+#| eval: false
+
+library(clusterProfiler)
+library(org.Mm.eg.db)
+
+# 选择感兴趣的 module（根据热图结果替换编号）
+target_module <- "1"
+
+target_genes <- gene_module_df %>%
+  filter(module == target_module) %>%
+  pull(id)
+
+eg <- bitr(target_genes, fromType = "SYMBOL", toType = "ENTREZID",
+           OrgDb = org.Mm.eg.db)
+
+go_result <- enrichGO(gene = eg$ENTREZID,
+                      OrgDb = org.Mm.eg.db,
+                      ont = "BP",
+                      pAdjustMethod = "BH",
+                      pvalueCutoff = 0.05,
+                      readable = TRUE)
+
+# 出版级别 dotplot 主题
+theme_dotplot <- function() {
+  theme_bw(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+      axis.text.y = element_text(size = 11, color = "black"),
+      axis.text.x = element_text(size = 10, color = "black"),
+      axis.title = element_text(size = 12),
+      legend.title = element_text(size = 11),
+      legend.text = element_text(size = 10),
+      panel.grid.major.y = element_line(color = "grey90", linewidth = 0.3),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(color = "black", linewidth = 0.8)
+    )
+}
+
+dotplot(go_result, showCategory = 15) +
+  scale_color_gradient(low = "firebrick3", high = "steelblue", name = "p.adjust") +
+  labs(title = paste0("Module ", target_module, " — GO Biological Process"),
+       x = "Gene Count", size = "Gene Count") +
+  theme_dotplot()
+
+# KEGG
+kegg_result <- enrichKEGG(gene = eg$ENTREZID,
+                          organism = "mmu",
+                          pAdjustMethod = "BH",
+                          pvalueCutoff = 0.05)
+
+dotplot(kegg_result, showCategory = 15) +
+  scale_color_gradient(low = "firebrick3", high = "steelblue", name = "p.adjust") +
+  labs(title = paste0("Module ", target_module, " — KEGG Pathway"),
+       x = "Gene Count") +
+  theme_dotplot()
+
+# Reactome
+library(ReactomePA)
+
+reactome_result <- enrichPathway(gene = eg$ENTREZID,
+                                 organism = "mouse",
+                                 pAdjustMethod = "BH",
+                                 pvalueCutoff = 0.05,
+                                 readable = TRUE)
+
+dotplot(reactome_result, showCategory = 15) +
+  scale_color_gradient(low = "firebrick3", high = "steelblue", name = "p.adjust") +
+  labs(title = paste0("Module ", target_module, " — Reactome Pathway"),
+       x = "Gene Count") +
+  theme_dotplot()
+```
+
+### 方式2：compareCluster 一次性比较所有 module
+
+```{r}
+#| label: module-enrichment-compare
+#| eval: false
+
+# 构建 module 基因列表（Entrez ID）
+module_list <- split(gene_module_df$id, gene_module_df$module)
+
+module_entrez <- lapply(module_list, function(genes) {
+  eg <- bitr(genes, fromType = "SYMBOL", toType = "ENTREZID",
+             OrgDb = org.Mm.eg.db)
+  eg$ENTREZID
+})
+
+# compareCluster 一步完成所有 module 的富集比较
+cc_go <- compareCluster(geneClusters = module_entrez,
+                        fun = "enrichGO",
+                        OrgDb = org.Mm.eg.db,
+                        ont = "BP",
+                        pAdjustMethod = "BH",
+                        pvalueCutoff = 0.05,
+                        readable = TRUE)
+
+dotplot(cc_go, showCategory = 5) +
+  scale_color_gradient(low = "firebrick3", high = "steelblue", name = "p.adjust") +
+  labs(title = "GO Biological Process — All Modules") +
+  theme_dotplot() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10))
+
+# KEGG
+cc_kegg <- compareCluster(geneClusters = module_entrez,
+                          fun = "enrichKEGG",
+                          organism = "mmu",
+                          pAdjustMethod = "BH",
+                          pvalueCutoff = 0.05)
+
+dotplot(cc_kegg, showCategory = 5) +
+  scale_color_gradient(low = "firebrick3", high = "steelblue", name = "p.adjust") +
+  labs(title = "KEGG Pathway — All Modules") +
+  theme_dotplot() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10))
+
+# Reactome
+library(ReactomePA)
+
+cc_reactome <- compareCluster(geneClusters = module_entrez,
+                              fun = "enrichPathway",
+                              organism = "mouse",
+                              pAdjustMethod = "BH",
+                              pvalueCutoff = 0.05,
+                              readable = TRUE)
+
+dotplot(cc_reactome, showCategory = 5) +
+  scale_color_gradient(low = "firebrick3", high = "steelblue", name = "p.adjust") +
+  labs(title = "Reactome Pathway — All Modules") +
+  theme_dotplot() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10))
+```
+
+
+## Pseudotime GSEA
+
+利用基因表达与 pseudotime 的相关性作为排序指标，通过 GSEA 找到沿轨迹整体上调或下调的通路。与 module 富集分析互补：module 富集是无方向的共表达模块功能注释，pseudotime GSEA 能揭示通路随分化的方向性变化趋势。
+
+> **注意：** 通路的"上调/下调"方向依赖于 pseudotime 方向（即 root 的选择），并非数据驱动的方向推断。
+
+```{r}
+#| label: pseudotime-gsea-cor
+#| eval: false
+
+# 获取 pseudotime，去除 NA 和 Inf
+pt <- pseudotime(cds)
+pt <- pt[!is.na(pt) & !is.infinite(pt)]
+
+# 获取表达矩阵（monocle3 CDS 只有 counts，需要 log-normalize）
+raw_counts <- counts(cds)[, names(pt)]
+
+# 过滤低表达基因：至少在 5% 的细胞中有表达
+min_cells <- ncol(raw_counts) * 0.05
+gene_filter <- Matrix::rowSums(raw_counts > 0) >= min_cells
+raw_counts <- raw_counts[gene_filter, ]
+
+# log-normalize
+lib_size <- Matrix::colSums(raw_counts)
+expr_mat <- log1p(sweep(raw_counts, 2, lib_size, "/") * 1e4)
+
+# 计算每个基因与 pseudotime 的 Spearman 相关性
+cor_vec <- apply(expr_mat, 1, function(x) {
+  cor(as.numeric(x), pt, method = "spearman")
+})
+
+# 去除 NA，按相关性从大到小排序
+cor_vec <- cor_vec[!is.na(cor_vec)]
+cor_vec <- sort(cor_vec, decreasing = TRUE)
+
+# 转换为 Entrez ID
+gene_symbols <- names(cor_vec)
+id_map <- bitr(gene_symbols, fromType = "SYMBOL", toType = "ENTREZID",
+               OrgDb = org.Mm.eg.db)
+
+# 去重：同一 Entrez ID 保留相关性绝对值最大的
+id_map$cor <- cor_vec[id_map$SYMBOL]
+id_map <- id_map %>%
+  group_by(ENTREZID) %>%
+  slice_max(abs(cor), n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# 构建排序向量并重新排序
+cor_entrez <- id_map$cor
+names(cor_entrez) <- id_map$ENTREZID
+cor_entrez <- sort(cor_entrez, decreasing = TRUE)
+```
+
+```{r}
+#| label: pseudotime-gsea-go
+#| eval: false
+
+# GO BP GSEA
+gsea_go <- gseGO(geneList = cor_entrez,
+                 OrgDb = org.Mm.eg.db,
+                 ont = "BP",
+                 minGSSize = 15,
+                 maxGSSize = 500,
+                 pvalueCutoff = 0.05,
+                 verbose = FALSE)
+
+# 查看结果
+gsea_go_df <- as.data.frame(gsea_go) %>%
+  arrange(p.adjust)
+
+head(gsea_go_df, 20)
+```
+
+```{r}
+#| label: pseudotime-gsea-kegg
+#| eval: false
+
+# KEGG GSEA
+gsea_kegg <- gseKEGG(geneList = cor_entrez,
+                     organism = "mmu",
+                     minGSSize = 15,
+                     maxGSSize = 500,
+                     pvalueCutoff = 0.05,
+                     verbose = FALSE)
+
+gsea_kegg_df <- as.data.frame(gsea_kegg) %>%
+  arrange(p.adjust)
+
+head(gsea_kegg_df, 20)
+```
+
+```{r}
+#| label: pseudotime-gsea-reactome
+#| eval: false
+
+# Reactome GSEA
+library(ReactomePA)
+
+gsea_reactome <- gsePathway(geneList = cor_entrez,
+                            organism = "mouse",
+                            minGSSize = 15,
+                            maxGSSize = 500,
+                            pvalueCutoff = 0.05,
+                            verbose = FALSE)
+
+gsea_reactome_df <- as.data.frame(gsea_reactome) %>%
+  arrange(p.adjust)
+
+head(gsea_reactome_df, 20)
+```
+
+```{r}
+#| label: pseudotime-gsea-plot
+#| eval: false
+
+# 可视化 top 通路
+# NES > 0: 沿 pseudotime 上调的通路; NES < 0: 沿 pseudotime 下调的通路
+library(enrichplot)
+
+# GO dotplot：分别展示上调和下调通路
+dotplot(gsea_go, showCategory = 10, split = ".sign") +
+  facet_grid(~ .sign) +
+  scale_color_gradient(low = "firebrick3", high = "steelblue", name = "p.adjust") +
+  labs(title = "GO Biological Process — Pseudotime GSEA") +
+  theme_dotplot() +
+  theme(strip.text = element_text(face = "bold", size = 12))
+
+# KEGG dotplot
+dotplot(gsea_kegg, showCategory = 10, split = ".sign") +
+  facet_grid(~ .sign) +
+  scale_color_gradient(low = "firebrick3", high = "steelblue", name = "p.adjust") +
+  labs(title = "KEGG Pathway — Pseudotime GSEA") +
+  theme_dotplot() +
+  theme(strip.text = element_text(face = "bold", size = 12))
+
+# Reactome dotplot
+dotplot(gsea_reactome, showCategory = 10, split = ".sign") +
+  facet_grid(~ .sign) +
+  scale_color_gradient(low = "firebrick3", high = "steelblue", name = "p.adjust") +
+  labs(title = "Reactome Pathway — Pseudotime GSEA") +
+  theme_dotplot() +
+  theme(strip.text = element_text(face = "bold", size = 12))
+
+# 单条通路的 enrichment plot（替换为感兴趣的通路）
+gseaplot2(gsea_go, geneSetID = 1:3, pvalue_table = TRUE)
+```
+
+
+## Group Comparison
+
+比较不同实验分组（如 Normal vs Treatment）在拟时序轨迹上的分布差异。
+
+> **注意：** 直接对所有细胞做分组检验会将每个细胞视为独立样本，大样本量下极易产生虚假显著性，且容易被细胞类型组成差异混淆。推荐在同一细胞类型内、汇总到样本级别后再进行统计检验。
+
+```{r}
+#| label: pseudotime-density
+#| eval: false
+
+# 构建拟时序数据框
+pseudotime_df <- data.frame(
+  pseudotime = pseudotime(cds),
+  group = colData(cds)$group,
+  cell_type = colData(cds)$cell_type,
+  sample = colData(cds)$orig.ident
+) %>% filter(!is.infinite(pseudotime))
+
+# 密度图：分组比较（仅作可视化探索）
+ggplot(pseudotime_df, aes(x = pseudotime, fill = group)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("Normal" = "cornflowerblue",
+                                "Treatment" = "firebrick")) +
+  labs(title = "Pseudotime Distribution by Group",
+       x = "Pseudotime", y = "Density") +
+  theme_classic()
+```
+
+
+```{r}
+#| label: pseudotime-boxplot-cell
+#| eval: false
+
+# === 视角1：细胞级别检验（样本量大，容易显著，仅作参考） ===
+wt_cell <- wilcox.test(pseudotime ~ group, data = pseudotime_df)
+p_label_cell <- paste0("Wilcoxon p = ", formatC(wt_cell$p.value, format = "e", digits = 2),
+                       " (n=", nrow(pseudotime_df), " cells)")
+
+ggplot(pseudotime_df, aes(x = group, y = pseudotime, fill = group)) +
+  geom_boxplot(outlier.size = 0.5, alpha = 0.7) +
+  annotate("text", x = 1.5, y = max(pseudotime_df$pseudotime) * 0.95,
+           label = p_label_cell, size = 4) +
+  scale_fill_manual(values = c("Normal" = "cornflowerblue",
+                                "Treatment" = "firebrick")) +
+  labs(title = "Pseudotime Comparison (cell-level)",
+       subtitle = "⚠ 细胞级检验易受大样本量和细胞组成差异影响，结果需谨慎解读") +
+  theme_classic() +
+  theme(legend.position = "none")
+```
+
+
+```{r}
+#| label: pseudotime-boxplot-sample
+#| eval: false
+
+# === 视角2：样本级别检验（推荐，以生物学重复为统计单元） ===
+sample_summary <- pseudotime_df %>%
+  group_by(sample, cell_type, group) %>%
+  summarise(median_pseudotime = median(pseudotime),
+            n_cells = n(),
+            .groups = "drop")
+
+# 选择目标细胞类型（替换为实际细胞类型）
+target_ct <- "Naive T"
+ct_data <- sample_summary %>% filter(cell_type == target_ct)
+
+wt_sample <- wilcox.test(median_pseudotime ~ group, data = ct_data)
+p_label_sample <- paste0("Wilcoxon p = ", formatC(wt_sample$p.value, format = "e", digits = 2),
+                         " (n=", nrow(ct_data), " samples)")
+
+ggplot(ct_data, aes(x = group, y = median_pseudotime, fill = group)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.1, size = 2) +
+  annotate("text", x = 1.5, y = max(ct_data$median_pseudotime) * 0.95,
+           label = p_label_sample, size = 4) +
+  scale_fill_manual(values = c("Normal" = "cornflowerblue",
+                                "Treatment" = "firebrick")) +
+  labs(title = paste0("Pseudotime Comparison: ", target_ct, " (sample-level)"),
+       subtitle = "Each point = one biological replicate (sample median)",
+       y = "Median Pseudotime") +
+  theme_classic() +
+  theme(legend.position = "none")
+```
+
+
+```{r}
+#| label: pseudotime-facet
+#| eval: false
+
+# 按细胞类型分面展示拟时序分布
+ggplot(pseudotime_df, aes(x = pseudotime, fill = group)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~ cell_type, scales = "free_y") +
+  scale_fill_manual(values = c("Normal" = "cornflowerblue",
+                                "Treatment" = "firebrick")) +
+  labs(title = "Pseudotime Distribution by Cell Type and Group") +
+  theme_classic() +
+  theme(strip.text = element_text(size = 8))
+```
+
+
+```{r}
+#| label: pseudotime-ridge
+#| eval: false
+
+# 山脊图：按细胞类型展示拟时序分布
+ggplot(pseudotime_df, aes(x = pseudotime, y = cell_type, fill = after_stat(x))) +
+  geom_density_ridges_gradient(scale = 3, rel_min_height = 0.01) +
+  scale_fill_viridis_c(name = "Pseudotime", option = "C") +
+  labs(title = "Pseudotime Distribution Across Cell Types") +
+  theme_classic()
+```
+
+
+## Trajectory Vertex Age/Group Analysis
+
+分析轨迹主图上每个节点附近的分组组成，揭示轨迹中哪些分支偏向特定分组。
+Vertex Analysis 是看轨迹图上每个节点（vertex）处，三组（Normal/Model/Treatment）的细胞比例各占多少。
+比如在轨迹末端（Pro-fibrotic 方向）的节点上，如果 Model 组细胞占比特别高而 Normal 很低，说明 BLM 处理推动细胞向那个方向分化。Drug 组如果在那些节点上占比下降，就说明药物阻止了这个过程。
+
+```{r}
+#| label: vertex-group-analysis
+#| eval: false
+
+# 获取每个细胞到主图最近顶点的映射
+closest_vertex <- as.character(
+  cds@principal_graph_aux$UMAP$pr_graph_cell_proj_closest_vertex[, 1]
+)
+
+# 统计每个顶点附近的分组分布
+vertex_group_counts <- table(closest_vertex, colData(cds)$group)
+vertex_group_prop <- prop.table(vertex_group_counts, margin = 1)
+
+# 获取顶点坐标
+vertex_coords <- t(cds@principal_graph_aux$UMAP$dp_mst)
+colnames(vertex_coords) <- c("x", "y")
+
+# 构建可视化数据框
+vertex_df <- as.data.frame(vertex_group_prop)
+colnames(vertex_df) <- c("vertex", "group", "proportion")
+vertex_df$vertex <- as.character(vertex_df$vertex)
+vertex_df$x <- vertex_coords[vertex_df$vertex, 1]
+vertex_df$y <- vertex_coords[vertex_df$vertex, 2]
+
+# 在轨迹图上展示特定分组的比例
+# 替换 "Treatment" 为实际的分组名称
+ggplot(vertex_df %>% filter(group == "Normal"),
+       aes(x = x, y = y, size = proportion, color = proportion)) +
+  geom_point() +
+  scale_color_gradient(low = "yellow", high = "red") +
+  ggtitle("Proportion of Normal cells at each trajectory vertex") +
+  theme_classic()
+```
+
+
+## Trajectory Gene Reversal Analysis
+
+在 `graph_test()` 显著基因中，筛选被药物逆转的基因：BLM 相对 Normal 发生变化，Drug 相对 BLM 方向相反。这一分析将轨迹变化基因与药物疗效关联起来。
+
+```{r}
+#| label: reversal-gene-calc
+#| eval: false
+
+# graph_test 显著基因
+sig_genes <- Track_genes_sig %>%
+  filter(q_value < 0.01, morans_I > 0.25) %>%
+  pull(gene_short_name) %>%
+  as.character()
+
+# 每个基因在三组中的平均表达（样本级别汇总更稳健）
+expr_mat <- AggregateExpression(seurat_sub,
+                                features = sig_genes,
+                                group.by = "group",
+                                assays = "RNA")$RNA
+
+# 计算变化方向
+gene_dynamics <- data.frame(
+  gene = rownames(expr_mat),
+  Normal = expr_mat[, "Normal"],
+  BLM = expr_mat[, "Model"],
+  Drug = expr_mat[, "Treatment"]
+) %>%
+  mutate(
+    Model_vs_Normal = Model - Normal,
+    Drug_vs_Model = Drug - Model,
+    # BLM 和 Drug 方向相反 = 逆转
+    reversed = sign(Model_vs_Normal) != sign(Drug_vs_Model) &
+               sign(Drug_vs_Model) != 0,
+    # 逆转程度：Drug 把 BLM 的变化拉回了多少比例
+    reversal_ratio = ifelse(Model_vs_Normal != 0,
+                            -Drug_vs_Model / Model_vs_Normal, 0),
+    # 分类
+    category = case_when(
+      !reversed ~ "Not reversed",
+      Model_vs_Normal > 0 & Drug_vs_Model < 0 ~ "Model up -> Drug down",
+      Model_vs_Normal < 0 & Drug_vs_Model > 0 ~ "Model down -> Drug up"
+    )
+  )
+
+reversed_genes <- gene_dynamics %>%
+  filter(reversed) %>%
+  arrange(desc(abs(Model_vs_Normal)))
+
+cat("Total trajectory genes:", length(sig_genes), "\n")
+cat("Reversed by Drug:", sum(gene_dynamics$reversed), "\n")
+table(reversed_genes$category)
+```
+
+```{r}
+#| label: reversal-gene-heatmap
+#| eval: false
+
+# 热图：展示 top 逆转基因在三组中的表达
+top_reversed <- reversed_genes %>%
+  slice_max(abs(Model_vs_Normal), n = 50)
+
+# 提取表达矩阵并 scale
+heatmap_mat <- expr_mat[top_reversed$gene, c("Normal", "Model", "Treatment")]
+heatmap_mat_scaled <- t(scale(t(heatmap_mat)))
+
+# 行注释：逆转类型
+row_anno <- data.frame(
+  Category = top_reversed$category,
+  row.names = top_reversed$gene
+)
+
+pheatmap::pheatmap(heatmap_mat_scaled,
+                   cluster_cols = FALSE,
+                   annotation_row = row_anno,
+                   clustering_method = "ward.D2",
+                   color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+                   main = "Top 50 Reversed Trajectory Genes",
+                   fontsize_row = 7)
+```
+
+```{r}
+#| label: reversal-gene-enrichment
+#| eval: false
+
+# 对逆转基因分类做富集分析
+# Model 上调 → Drug 下调的基因（如纤维化相关）
+blm_up_drug_down <- reversed_genes %>%
+  filter(category == "Model up -> Drug down") %>%
+  pull(gene)
+
+eg_up <- bitr(blm_up_drug_down, fromType = "SYMBOL", toType = "ENTREZID",
+              OrgDb = org.Mm.eg.db)
+
+go_up <- enrichGO(gene = eg_up$ENTREZID,
+                  OrgDb = org.Mm.eg.db,
+                  ont = "BP",
+                  pAdjustMethod = "BH",
+                  pvalueCutoff = 0.05,
+                  readable = TRUE)
+
+# Model 下调 → Drug 上调的基因（如正常功能恢复）
+blm_down_drug_up <- reversed_genes %>%
+  filter(category == "Model down -> Drug up") %>%
+  pull(gene)
+
+eg_down <- bitr(blm_down_drug_up, fromType = "SYMBOL", toType = "ENTREZID",
+                OrgDb = org.Mm.eg.db)
+
+go_down <- enrichGO(gene = eg_down$ENTREZID,
+                    OrgDb = org.Mm.eg.db,
+                    ont = "BP",
+                    pAdjustMethod = "BH",
+                    pvalueCutoff = 0.05,
+                    readable = TRUE)
+
+# 可视化
+p1 <- dotplot(go_up, showCategory = 10) +
+  scale_color_gradient(low = "firebrick3", high = "steelblue", name = "p.adjust") +
+  labs(title = "Model up \u2192 Drug down (e.g. fibrosis genes)") +
+  theme_dotplot()
+
+p2 <- dotplot(go_down, showCategory = 10) +
+  scale_color_gradient(low = "firebrick3", high = "steelblue", name = "p.adjust") +
+  labs(title = "Model down \u2192 Drug up (e.g. restored genes)") +
+  theme_dotplot()
+
+p1 / p2
+```
+
+
+## Save Results
+
+```{r}
+#| label: save-results
+#| eval: false
+
+# 保存CDS对象，方便后续分析
+qs2::qs_save(cds, "datasets/monocle3_cds.qs2")
+
+# 保存包含拟时序信息的Seurat对象元数据
+seurat_sub$pseudotime <- pseudotime(cds)[colnames(seurat_sub)]
+qs2::qs_save(seurat_sub, "datasets/seurat_with_pseudotime.qs2")
+```
+
+
+## Session Info
+
+```{r}
+#| label: session-info
+
+sessionInfo()
+```

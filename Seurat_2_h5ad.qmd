@@ -1,0 +1,196 @@
+---
+title: "Untitled"
+format: html
+execute:
+  python: "./.venv/bin/python"
+---
+
+
+目前需要对整理好的raw counts data, 转换成scanpy可以读取的格式，注意⚠️此脚本目前只转raw counts数据。
+
+
+```{r}
+library(Seurat)
+library(DropletUtils)
+library(Matrix)
+library(data.table)
+```
+
+
+`scGPT`（以及 scVI 等高级模型）通常假设输入数据服从 负二项分布 (Negative Binomial) 或 泊松分布 (Poisson)。这些统计分布模型是专门针对**离散的计数数据（整数）**设计的。
+
+
+### use mtx
+
+
+第一步，存储成mtx对象：
+```{r}
+
+# 1. 准备工作：如果你是 Seurat V5，建议先合并 Layers (非常重要！)
+# 这样能确保你导出的是完整的 counts 矩阵
+seurat_obj <- JoinLayers(seurat_obj)
+
+# 2. 提取 Raw Counts (原始计数矩阵)
+# scGPT 模型训练和微调通常推荐使用 raw counts
+counts_matrix <- GetAssayData(seurat_obj, layer = "counts", assay = "RNA")
+
+# 3. 提取元数据 (Metadata)
+# 包含 cell_type, batch, condition 等，scGPT 可能会用到这些做 prompt
+metadata <- seurat_obj@meta.data
+# 把行名（Barcode）变成一列，防止读写时乱序
+metadata$barcode <- rownames(metadata)
+
+# 4. 提取基因注释信息 (Features) - 保留更多信息
+# 获取 Seurat V5 的 feature metadata
+feature_meta <- seurat_obj[["RNA"]][[]]  # V5 方式获取 feature metadata
+if (nrow(feature_meta) == 0) {
+  # 如果没有额外的 feature metadata，创建基本信息
+  feature_meta <- data.frame(
+    gene_symbol = rownames(counts_matrix),
+    row.names = rownames(counts_matrix)
+  )
+}
+# 确保有 gene_symbol 列
+feature_meta$gene_symbol <- rownames(feature_meta)
+# 添加 feature_name 列（与 gene_symbol 相同，方便后续使用）
+feature_meta$feature_name <- feature_meta$gene_symbol
+
+# 5. 写出文件到磁盘 (创建一个 output 文件夹)
+if (!dir.exists("seurat_export")) dir.create("seurat_export")
+
+# 写出稀疏矩阵 (.mtx 格式，压缩且通用)
+writeMM(counts_matrix, file = "seurat_export/matrix.mtx")
+
+# 写出基因注释 (包含多列信息)
+write.csv(feature_meta, file = "seurat_export/features.csv", row.names = TRUE)
+
+# 写出元数据 (barcodes + meta)
+write.csv(metadata, file = "seurat_export/metadata.csv", row.names = FALSE)
+
+# 写出 Barcodes (用于核对)
+write.table(colnames(counts_matrix), file = "seurat_export/barcodes.tsv", 
+            row.names = FALSE, col.names = FALSE, quote = FALSE)
+
+message("导出完成！请切换到 Python 环境。")
+```
+
+
+第二步，重新读成anndata格式：
+```{python}
+
+import scanpy as sc
+import pandas as pd
+import os
+
+```
+
+
+```{python}
+
+# 1. 设置路径
+data_dir = "seurat_export"
+
+# 2. 读取稀疏矩阵
+# Scanpy 读取 mtx
+adata = sc.read_mtx(os.path.join(data_dir, "matrix.mtx")).T  # 注意：.T 是转置，因为 scanpy 是 (cell x gene)
+
+# 3. 读取基因注释 (包含 gene_symbol, feature_name 等)
+features = pd.read_csv(os.path.join(data_dir, "features.csv"), index_col=0)
+barcodes = pd.read_csv(os.path.join(data_dir, "barcodes.tsv"), header=None)[0].values
+
+# 赋值给 adata
+adata.var_names = features.index.values  # gene symbols 作为 index
+adata.obs_names = barcodes
+
+# 4. 将基因注释信息添加到 adata.var
+# 包含 feature_name 和其他从 Seurat 导出的基因元信息
+adata.var = features.reindex(adata.var_names)
+print(f"adata.var columns: {adata.var.columns.tolist()}")
+
+# 5. 读取细胞元数据并合并
+meta = pd.read_csv(os.path.join(data_dir, "metadata.csv"))
+meta.index = meta['barcode']
+# 使用 reindex 安全对齐，避免 KeyError
+adata.obs = meta.reindex(adata.obs_names)
+# 删除冗余的 barcode 列
+adata.obs = adata.obs.drop(columns=['barcode'])
+
+# 6. 检查数据 (Raw Counts 应该是整数)
+print(f"Data type: {adata.X.dtype}")
+print(f"Sample values:\n{adata.X[:5, :5].toarray()}")
+
+
+```
+
+
+```{python}
+# 6. 保存为 h5ad
+adata.write("my_data_for_scGPT.h5ad")
+print("h5ad 生成完毕！")
+```
+
+
+
+### use DropletUtils
+
+这个更合适一些。
+
+```{r}
+
+# 1. 准备数据 (同上)
+DefaultAssay(seurat_obj) <- "RNA"
+seurat_obj <- JoinLayers(seurat_obj)
+
+# 2. 提取稀疏矩阵 (Raw Counts)
+counts_matrix <- GetAssayData(seurat_obj, layer = "counts", assay = "RNA")
+
+# 3. 极速导出 (自动压缩)
+# 这会在当前目录下生成一个叫 "scGPT_input" 的文件夹
+# 里面包含 matrix.mtx.gz, barcodes.tsv.gz, features.tsv.gz
+DropletUtils::write10xCounts(path = "scGPT_input", x = counts_matrix, type = "sparse", version = "3")
+
+# 4. 别忘了单独导出 Metadata (因为 write10xCounts 不带 metadata)
+meta <- seurat_obj@meta.data
+meta$barcode <- rownames(meta)
+write.csv(meta, file = "scGPT_input/metadata.csv", row.names = FALSE)
+
+message("导出完成！文件已自动压缩。")
+```
+
+
+
+```{python}
+import scanpy as sc
+import pandas as pd
+import os
+```
+
+```{python}
+
+# 1. 读取 10x 格式 (Scanpy 会自动识别 .gz 并快速读取)
+# cache=True 会生成一个 .h5ad 缓存，下次读取秒开
+adata = sc.read_10x_mtx("scGPT_input", var_names='gene_symbols', cache=True)
+
+# 2. 加载元数据
+meta = pd.read_csv("scGPT_input/metadata.csv")
+# 确保 index 是 barcode，以便对齐
+meta.index = meta['barcode']
+
+# 3. 将元数据对齐到 adata
+adata.obs = meta.loc[adata.obs_names]
+
+# 4. 检查一下 (应该是整数)
+print(adata.X[:5, :5].toarray())
+
+```
+
+
+这样生成的h5ad文件，adata.var['gene_ids']
+```{python}
+# 6. 保存为 h5ad
+adata.write("my_data_for_scGPT.h5ad")
+print("h5ad 生成完毕！")
+```
+
+
+

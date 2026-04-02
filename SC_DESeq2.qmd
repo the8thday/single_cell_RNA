@@ -1,0 +1,944 @@
+---
+title: "Pseudobulk DESeq2 差异分析"
+format: html
+---
+
+## 对于SC数据进行DESeq2的差异分析
+
+### 1. 加载包
+
+```{r}
+library(Seurat)
+library(DESeq2)
+library(tidyverse)
+library(EnhancedVolcano)
+```
+
+### 2. Pseudobulk 聚合
+
+```{r}
+# AggregateExpression 按 orig.ident + group + cell_type 聚合原始 counts
+pseudo_seurat <- AggregateExpression(seurat_obj,
+                                     group.by = c("orig.ident", "group", "cell_type"),
+                                     assays = "RNA",
+                                     return.seurat = FALSE)
+```
+
+### 3. 提取 Counts 矩阵并构建 Metadata
+
+```{r}
+# 提取 Counts 矩阵 (raw counts)
+cts <- pseudo_seurat$RNA
+
+# 列名格式为 "orig.ident_group_cell_type"，从中解析 metadata
+col_names <- colnames(cts)
+meta_df <- data.frame(
+  orig.ident = sapply(strsplit(col_names, "_"), `[`, 1),
+  group      = sapply(strsplit(col_names, "_"), `[`, 2),
+  cell_type  = sapply(strsplit(col_names, "_"), function(x) paste(x[3:length(x)], collapse = "_")),
+  row.names  = col_names
+)
+
+head(meta_df)
+```
+
+> **注意**：上面对列名的拆分假设 `orig.ident` 和 `group` 中不含下划线。如果含下划线，请根据实际数据调整拆分逻辑。
+
+### 3.1 Pseudobulk 样本细胞数量 QC
+
+```{r}
+# 统计每个 pseudobulk 样本（orig.ident × cell_type）中聚合了多少细胞
+# 细胞数太少的 pseudobulk 样本 counts 不可靠，应排除
+cell_counts <- seurat_obj@meta.data %>%
+  group_by(orig.ident, group, cell_type) %>%
+  summarise(n_cells = n(), .groups = "drop")
+
+cell_counts %>% arrange(n_cells) %>% head(20)
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 6
+#| label: fig-cell-counts-qc
+# 可视化每种细胞类型在每个样本中的细胞数
+# 每个点代表一个 pseudobulk 样本（orig.ident × cell_type）
+ggplot(cell_counts, aes(x = cell_type, y = n_cells, color = group)) +
+  geom_jitter(size = 3, alpha = 0.8, width = 0.2, height = 0) +
+  stat_summary(aes(group = group), fun = median, geom = "crossbar",
+               width = 0.4, linewidth = 0.4, position = position_dodge(0.5)) +
+  geom_hline(yintercept = 25, linetype = "dashed", color = "red") +
+  scale_color_manual(values = c("AF2_Model" = "#3498DB", "AF2_QR056251" = "#E74C3C")) +
+  coord_flip() +
+  labs(x = NULL, y = "Number of cells", color = "Group",
+       title = "Cell counts per pseudobulk sample",
+       subtitle = "Each dot = one sample; red dashed line = minimum recommended (25 cells)") +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+```{r}
+#| fig-width: 12
+#| fig-height: 7
+#| label: fig-cell-counts-barplot
+# 分面 barplot：每个样本一根柱子，按细胞类型分面
+ggplot(cell_counts, aes(x = orig.ident, y = n_cells, fill = group)) +
+  geom_col(width = 0.7) +
+  geom_hline(yintercept = 25, linetype = "dashed", color = "red", linewidth = 0.4) +
+  facet_wrap(~ cell_type, scales = "free_y") +
+  scale_fill_manual(values = c("AF2_Model" = "#3498DB", "AF2_QR056251" = "#E74C3C")) +
+  labs(x = NULL, y = "Number of cells", fill = "Group",
+       title = "Cell counts per sample by cell type",
+       subtitle = "Red dashed line = minimum recommended (25 cells)") +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text = element_text(size = 9, face = "bold"))
+```
+
+> **n=3 小样本注意事项**：当每组仅 3 个生物学重复时，建议排除细胞数 < 25 的
+> pseudobulk 样本。细胞数太少意味着聚合后的 counts 本身就不准确，会引入额外噪声。
+
+```{r}
+# 标记细胞数不足的样本（阈值可调整）
+min_cells <- 25
+low_cell_samples <- cell_counts %>%
+  filter(n_cells < min_cells) %>%
+  mutate(sample_id = paste(orig.ident, group, cell_type, sep = "_"))
+
+if (nrow(low_cell_samples) > 0) {
+  cat("以下 pseudobulk 样本细胞数不足，建议排除：\n")
+  print(low_cell_samples)
+} else {
+  cat("所有 pseudobulk 样本细胞数均 >=", min_cells, "\n")
+}
+```
+
+### 4. 选择目标细胞类型
+
+```{r}
+# Pseudobulk 必须是针对"某一种细胞"在"不同条件"下的对比
+target_cell_type <- "CD4_T_cell"
+```
+
+```{r}
+# 筛选该细胞类型的列
+keep_cols <- meta_df$cell_type == target_cell_type
+curr_cts <- cts[, keep_cols]
+curr_meta <- meta_df[keep_cols, ]
+
+# 排除细胞数不足的样本
+if (nrow(low_cell_samples) > 0) {
+  exclude_ids <- low_cell_samples %>%
+    filter(cell_type == target_cell_type) %>%
+    pull(sample_id)
+  if (length(exclude_ids) > 0) {
+    cat("排除低细胞数样本:", exclude_ids, "\n")
+    curr_cts <- curr_cts[, !colnames(curr_cts) %in% exclude_ids]
+    curr_meta <- curr_meta[!rownames(curr_meta) %in% exclude_ids, ]
+  }
+}
+
+cat("样本数:", ncol(curr_cts), "\n")
+cat("基因数:", nrow(curr_cts), "\n")
+```
+
+### 5. 构建 DESeq2 对象
+
+```{r}
+# 确保 group 是因子，并设定对照组（前者为对照，后者为实验）
+curr_meta$group <- factor(curr_meta$group, levels = c("AF2_Model", "AF2_QR056251"))
+
+dds <- DESeqDataSetFromMatrix(
+  countData = curr_cts,
+  colData = curr_meta,
+  design = ~group
+)
+
+# 过滤低表达基因
+# n=3 per group 时，要求所有样本 (>=3) 都有 counts>=10 过于严格
+# 改为：至少在半数样本中有 counts >= 10（即至少 3 个样本中有表达）
+min_samples <- floor(ncol(curr_cts) / 2)
+keep <- rowSums(counts(dds) >= 10) >= min_samples
+dds <- dds[keep, ]
+
+cat("过滤阈值: 至少", min_samples, "个样本中 counts >= 10\n")
+cat("过滤后基因数:", nrow(dds), "\n")
+```
+
+### 6. 运行 DESeq2
+
+```{r}
+dds <- DESeq(dds)
+resultsNames(dds)
+```
+
+### 6.1 样本级质控（QC）
+
+```{r}
+# Variance Stabilizing Transformation（用于 QC 可视化，不影响差异分析）
+vsd <- vst(dds, blind = TRUE)
+```
+
+#### PCA Plot
+
+```{r}
+#| fig-width: 8
+#| fig-height: 6
+#| label: fig-pca-plot
+pca_data <- plotPCA(vsd, intgroup = "group", returnData = TRUE)
+percent_var <- round(100 * attr(pca_data, "percentVar"))
+
+ggplot(pca_data, aes(x = PC1, y = PC2, color = group)) +
+  geom_point(size = 4, alpha = 0.8) +
+  geom_text(aes(label = name), vjust = -1, size = 3) +
+  xlab(paste0("PC1: ", percent_var[1], "% variance")) +
+  ylab(paste0("PC2: ", percent_var[2], "% variance")) +
+  scale_color_manual(values = c("AF2_Model" = "#3498DB", "AF2_QR056251" = "#E74C3C")) +
+  ggtitle(paste0("PCA - ", target_cell_type)) +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        legend.position = "bottom")
+```
+
+#### MDS Plot
+
+```{r}
+#| fig-width: 8
+#| fig-height: 6
+#| label: fig-mds-plot
+# MDS 基于样本间的欧氏距离，与 PCA 互补
+# PCA 假设线性投影，MDS 更直接地反映样本间的整体距离关系
+sample_dists <- dist(t(assay(vsd)))
+mds_data <- as.data.frame(cmdscale(sample_dists, k = 2))
+colnames(mds_data) <- c("MDS1", "MDS2")
+mds_data$group <- curr_meta$group
+mds_data$name <- rownames(mds_data)
+
+ggplot(mds_data, aes(x = MDS1, y = MDS2, color = group)) +
+  geom_point(size = 4, alpha = 0.8) +
+  geom_text(aes(label = name), vjust = -1, size = 3) +
+  scale_color_manual(values = c("AF2_Model" = "#3498DB", "AF2_QR056251" = "#E74C3C")) +
+  ggtitle(paste0("MDS - ", target_cell_type)) +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        legend.position = "bottom")
+```
+
+#### 样本间相关性热图
+
+```{r}
+#| fig-width: 7
+#| fig-height: 6
+#| label: fig-sample-correlation
+library(pheatmap)
+library(RColorBrewer)
+
+# 样本间距离矩阵
+sample_dists <- dist(t(assay(vsd)))
+sample_dist_mat <- as.matrix(sample_dists)
+
+# 注释信息
+ann_col <- data.frame(Group = curr_meta$group, row.names = rownames(curr_meta))
+
+pheatmap(sample_dist_mat,
+  clustering_distance_rows = sample_dists,
+  clustering_distance_cols = sample_dists,
+  annotation_col = ann_col,
+  color = colorRampPalette(rev(brewer.pal(9, "Blues")))(255),
+  fontsize_row = 9,
+  fontsize_col = 9,
+  main = paste0("Sample Distance - ", target_cell_type)
+)
+```
+
+#### Dispersion Plot
+
+```{r}
+#| fig-width: 7
+#| fig-height: 5
+#| label: fig-dispersion
+# 查看基因离散度拟合情况，评估模型是否合理
+plotDispEsts(dds, main = paste0("Dispersion Estimates - ", target_cell_type))
+```
+
+### 7. 提取差异分析结果
+
+```{r}
+# contrast: 实验组 vs 对照组（未收缩的 MLE 结果，用于 p 值筛选）
+res <- results(dds, contrast = c("group", "AF2_QR056251", "AF2_Model"))
+res <- res[order(res$padj), ]
+
+summary(res)
+```
+
+#### 7.0.1 Cook's Distance 检查（小样本关键 QC）
+
+```{r}
+# n=3 时，单个离群样本对结果影响极大
+# DESeq2 会自动将 Cook's distance 过高的基因 padj 设为 NA
+n_cookfiltered <- sum(is.na(res$padj) & !is.na(res$pvalue))
+cat("因 Cook's distance 被标记的基因数:", n_cookfiltered, "\n")
+cat("占比:", round(n_cookfiltered / nrow(res) * 100, 1), "%\n")
+```
+
+```{r}
+#| fig-width: 8
+#| fig-height: 5
+#| label: fig-cooks-distance
+# 可视化每个样本的 Cook's distance 分布
+# 如果某个样本的中位 Cook's distance 明显高于其他样本，说明它是离群样本
+par(mar = c(8, 4, 4, 2))
+boxplot(log10(assays(dds)[["cooks"]]), range = 0, las = 2,
+        main = paste0("Cook's Distance per Sample - ", target_cell_type),
+        ylab = "log10(Cook's distance)")
+```
+
+> **如果 Cook's distance 过滤掉大量基因**（>10%），说明可能存在离群样本。
+> 应结合 PCA 图检查，必要时排除离群样本后重新分析。
+
+### 7.1 Log2 Fold Change Shrinkage
+
+```{r}
+library(apeglm)
+
+# 查看系数名称，确认 coef 参数
+resultsNames(dds)
+```
+
+```{r}
+# apeglm shrinkage（推荐方法）
+# coef 需要匹配 resultsNames(dds) 中对应的系数名
+res_shrunk <- lfcShrink(dds, coef = "group_AF2_QR056251_vs_AF2_Model", type = "apeglm",
+                        res = res)
+res_shrunk <- res_shrunk[order(res_shrunk$padj), ]
+
+summary(res_shrunk)
+```
+
+```{r}
+# ashr shrinkage 作为对比
+# apeglm 在 n=3 时可能过度保守，ashr 使用 mixture prior，收缩略温和
+library(ashr)
+res_ashr <- lfcShrink(dds, coef = "group_AF2_QR056251_vs_AF2_Model", type = "ashr",
+                      res = res)
+```
+
+> **为什么需要 shrinkage？**
+>
+> - Pseudobulk 样本量通常很小（3-6个），低表达或高离散度基因的 log2FC 估计噪声大、容易膨胀
+> - `lfcShrink()` 将不确定的 LFC 向零收缩，保留有强证据支持的大效应值
+> - **apeglm**（Zhu, Ibrahim & Love, 2019）使用重尾 Cauchy 先验，是默认推荐方法
+> - **ashr** 使用 flexible mixture prior，在 n=3 时收缩更温和，可作为补充参考
+> - 收缩后的 LFC 更适合用于下游的基因排序（如 GSEA）和可视化（如火山图）
+> - 注意：shrinkage 只影响 log2FoldChange，**不影响 p 值和 padj**
+
+```{r}
+#| fig-width: 12
+#| fig-height: 4
+#| label: fig-shrinkage-comparison
+# 对比三种 LFC 估计
+par(mfrow = c(1, 3))
+plotMA(res, ylim = c(-5, 5), main = "Unshrunken (MLE)")
+plotMA(res_shrunk, ylim = c(-5, 5), main = "apeglm (recommended)")
+plotMA(res_ashr, ylim = c(-5, 5), main = "ashr (less conservative)")
+par(mfrow = c(1, 1))
+```
+
+```{r}
+# 对比 apeglm vs ashr 的 DEG 数量
+n_apeglm <- sum(abs(res_shrunk$log2FoldChange) > 1 & res_shrunk$padj < 0.05, na.rm = TRUE)
+n_ashr <- sum(abs(res_ashr$log2FoldChange) > 1 & res_ashr$padj < 0.05, na.rm = TRUE)
+cat("apeglm DEGs (|LFC|>1, padj<0.05):", n_apeglm, "\n")
+cat("ashr   DEGs (|LFC|>1, padj<0.05):", n_ashr, "\n")
+cat("\n如果 apeglm 结果过少，可考虑使用 ashr 的结果\n")
+```
+
+```{r}
+# 使用收缩后的结果构建 data.frame
+# padj 来自原始结果，log2FoldChange 使用收缩后的值
+res_df <- as.data.frame(res_shrunk) %>%
+  rownames_to_column("gene") %>%
+  filter(!is.na(padj))
+
+head(res_df, 20)
+```
+
+### 8. 筛选显著差异基因
+
+```{r}
+# 阈值：|shrunken log2FC| > 1, padj < 0.05
+deg <- res_df %>%
+  filter(abs(log2FoldChange) > 1, padj < 0.05) %>%
+  mutate(direction = ifelse(log2FoldChange > 0, "Up", "Down"))
+
+cat("上调基因:", sum(deg$direction == "Up"), "\n")
+cat("下调基因:", sum(deg$direction == "Down"), "\n")
+```
+
+### 9. 可视化
+
+#### 火山图
+
+```{r}
+#| fig-width: 8
+#| fig-height: 6
+EnhancedVolcano(res_shrunk,
+  lab = rownames(res_shrunk),
+  x = "log2FoldChange",
+  y = "padj",
+  pCutoff = 0.05,
+  FCcutoff = 1,
+  title = paste0("DESeq2: ", target_cell_type),
+  subtitle = "AF2_QR056251 vs AF2_Model"
+)
+```
+
+#### MA Plot
+
+```{r}
+#| fig-width: 8
+#| fig-height: 5
+plotMA(res_shrunk, ylim = c(-5, 5), main = paste0(target_cell_type, ": MA Plot (shrunken)"))
+```
+
+#### Top 基因热图
+
+```{r}
+#| fig-width: 8
+#| fig-height: 6
+
+# 取 top 30 显著基因
+top_genes <- head(res_df$gene, 30)
+
+# 重新计算 vsd（blind=FALSE，适合展示已知差异基因）
+vsd_supervised <- vst(dds, blind = FALSE)
+mat <- assay(vsd_supervised)[top_genes, ]
+mat <- t(scale(t(mat)))  # Z-score 标准化
+
+pheatmap(mat,
+  annotation_col = curr_meta["group"],
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  show_colnames = TRUE,
+  fontsize_row = 8,
+  main = paste0("Top 30 DEGs - ", target_cell_type)
+)
+```
+
+### 10. 保存结果
+
+```{r}
+write.csv(res_df, file = paste0("Results/DESeq2_", target_cell_type, "_all_results.csv"),
+          row.names = FALSE)
+write.csv(deg, file = paste0("Results/DESeq2_", target_cell_type, "_significant_DEGs.csv"),
+          row.names = FALSE)
+```
+
+### 11. （可选）批量分析所有细胞类型
+
+```{r}
+#| eval: false
+
+# 对每种细胞类型分别运行 DESeq2
+cell_types <- unique(meta_df$cell_type)
+
+all_degs <- lapply(cell_types, function(ct) {
+  keep_cols <- meta_df$cell_type == ct
+  curr_cts <- cts[, keep_cols]
+  curr_meta <- meta_df[keep_cols, ]
+
+  # 排除细胞数不足的样本
+  ct_cell_counts <- cell_counts %>% filter(cell_type == ct)
+  low_samples <- ct_cell_counts %>% filter(n_cells < min_cells) %>%
+    mutate(sample_id = paste(orig.ident, group, cell_type, sep = "_")) %>% pull(sample_id)
+  if (length(low_samples) > 0) {
+    curr_cts <- curr_cts[, !colnames(curr_cts) %in% low_samples]
+    curr_meta <- curr_meta[!rownames(curr_meta) %in% low_samples, ]
+  }
+
+  # 样本数太少则跳过（每组至少需要 2 个样本）
+  if (ncol(curr_cts) < 4) {
+    message("跳过 ", ct, "：样本数不足 (", ncol(curr_cts), ")")
+    return(NULL)
+  }
+
+  curr_meta$group <- factor(curr_meta$group, levels = c("AF2_Model", "AF2_QR056251"))
+
+  dds <- DESeqDataSetFromMatrix(countData = curr_cts, colData = curr_meta, design = ~group)
+  min_s <- floor(ncol(curr_cts) / 2)
+  keep <- rowSums(counts(dds) >= 10) >= min_s
+  dds <- dds[keep, ]
+
+  if (nrow(dds) < 10) {
+    message("跳过 ", ct, "：过滤后基因数不足")
+    return(NULL)
+  }
+
+  dds <- DESeq(dds)
+
+  # lfcShrink: 使用 apeglm 收缩 LFC
+  res_shrunk <- lfcShrink(dds, coef = "group_AF2_QR056251_vs_AF2_Model", type = "apeglm",
+                          quiet = TRUE)
+
+  as.data.frame(res_shrunk) %>%
+    rownames_to_column("gene") %>%
+    filter(!is.na(padj)) %>%
+    mutate(cell_type = ct)
+})
+
+all_degs_df <- bind_rows(all_degs)
+write.csv(all_degs_df, "Results/DESeq2_all_cell_types.csv", row.names = FALSE)
+```
+
+
+### 12. 富集分析
+
+```{r}
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(enrichplot)
+library(ggplot2)
+
+# 自定义主题，让图片更专业
+theme_enrich <- theme_bw(base_size = 12) +
+  theme(
+    axis.text.y = element_text(size = 10),
+    axis.text.x = element_text(size = 10),
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 14),
+    legend.position = "right"
+  )
+```
+
+#### 12.1 基因 ID 转换
+
+```{r}
+# DESeq2 结果中的基因名为 Symbol，需转换为 ENTREZID
+deg_up <- deg %>% filter(direction == "Up") %>% pull(gene)
+deg_down <- deg %>% filter(direction == "Down") %>% pull(gene)
+deg_all <- deg$gene
+
+# 转换 ENTREZID
+gene_map <- bitr(deg_all, fromType = "SYMBOL", toType = "ENTREZID",
+                 OrgDb = org.Mm.eg.db)
+head(gene_map)
+```
+
+#### 12.2 ORA — GO 富集分析
+
+```{r}
+ego_bp <- enrichGO(
+  gene = gene_map$ENTREZID,
+  OrgDb = org.Mm.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05,
+  readable = TRUE
+)
+
+ego_mf <- enrichGO(
+  gene = gene_map$ENTREZID,
+  OrgDb = org.Mm.eg.db,
+  ont = "MF",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05,
+  readable = TRUE
+)
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+#| label: fig-go-bp-dotplot
+# GO BP Dotplot
+dotplot(ego_bp, showCategory = 15, label_format = 50,
+        title = paste0("GO Biological Process - ", target_cell_type),
+        font.size = 10) +
+  scale_color_gradient(low = "red", high = "blue") +
+  theme_enrich
+```
+
+```{r}
+#| fig-width: 12
+#| fig-height: 8
+#| label: fig-go-bp-cnetplot
+# 基因-通路关联网络图
+cnetplot(ego_bp, showCategory = 8, node_label = "all",
+         cex.params = list(category_label = 0.8, gene_label = 0.6),
+         color.params = list(foldChange = NULL)) +
+  ggtitle(paste0("GO BP Gene-Concept Network - ", target_cell_type)) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 7
+#| label: fig-go-bp-treeplot
+# 树状图（聚类分层展示）
+if (nrow(ego_bp) >= 2) {
+  p_tree <- treeplot(pairwise_termsim(ego_bp), showCategory = 20,
+                     label_format = 40)
+  p_tree + ggtitle(paste0("GO BP Treeplot - ", target_cell_type))
+}
+```
+
+```{r}
+#| fig-width: 8
+#| fig-height: 7
+#| label: fig-go-mf-dotplot
+dotplot(ego_mf, showCategory = 15, label_format = 50,
+        title = paste0("GO Molecular Function - ", target_cell_type),
+        font.size = 10) +
+  scale_color_gradient(low = "red", high = "blue") +
+  theme_enrich
+```
+
+#### 12.3 ORA — KEGG 富集分析
+
+```{r}
+ekegg <- enrichKEGG(
+  gene = gene_map$ENTREZID,
+  organism = "mmu",
+  keyType = "kegg",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.1
+)
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 7
+#| label: fig-kegg-dotplot
+dotplot(ekegg, showCategory = 15, label_format = 50,
+        title = paste0("KEGG Pathways - ", target_cell_type),
+        font.size = 10) +
+  scale_color_gradient(low = "red", high = "blue") +
+  theme_enrich
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 7
+#| label: fig-kegg-barplot
+# 上下调基因分开的 barplot
+# 分别做上调和下调的 KEGG
+up_map <- gene_map %>% filter(SYMBOL %in% deg_up)
+down_map <- gene_map %>% filter(SYMBOL %in% deg_down)
+
+ekegg_up <- enrichKEGG(gene = up_map$ENTREZID, organism = "mmu", pvalueCutoff = 0.1)
+ekegg_down <- enrichKEGG(gene = down_map$ENTREZID, organism = "mmu", pvalueCutoff = 0.1)
+
+# 合并上下调结果绘制 barplot
+plot_kegg_bar <- function(ekegg_up, ekegg_down, top_n = 10) {
+  up_df <- if (!is.null(ekegg_up) && nrow(ekegg_up) > 0) {
+    as.data.frame(ekegg_up) %>% head(top_n) %>% mutate(direction = "Up", Count = Count)
+  } else { data.frame() }
+
+  down_df <- if (!is.null(ekegg_down) && nrow(ekegg_down) > 0) {
+    as.data.frame(ekegg_down) %>% head(top_n) %>% mutate(direction = "Down", Count = -Count)
+  } else { data.frame() }
+
+  plot_df <- bind_rows(up_df, down_df)
+  if (nrow(plot_df) == 0) return(NULL)
+
+  ggplot(plot_df, aes(x = reorder(Description, Count), y = Count, fill = direction)) +
+    geom_col(width = 0.7) +
+    coord_flip() +
+    scale_fill_manual(values = c("Up" = "#E74C3C", "Down" = "#3498DB")) +
+    labs(x = NULL, y = "Gene Count", fill = "Direction",
+         title = paste0("KEGG: Up vs Down - ", target_cell_type)) +
+    geom_hline(yintercept = 0, linewidth = 0.5) +
+    theme_bw(base_size = 12) +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5))
+}
+
+plot_kegg_bar(ekegg_up, ekegg_down)
+```
+
+#### 12.4 ORA — Reactome 通路富集分析
+
+```{r}
+library(ReactomePA)
+```
+
+```{r}
+ereactome <- enrichPathway(
+  gene = gene_map$ENTREZID,
+  organism = "mouse",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.1,
+  readable = TRUE
+)
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 7
+#| label: fig-reactome-dotplot
+dotplot(ereactome, showCategory = 15, label_format = 50,
+        title = paste0("Reactome Pathways - ", target_cell_type),
+        font.size = 10) +
+  scale_color_gradient(low = "red", high = "blue") +
+  theme_enrich
+```
+
+```{r}
+#| fig-width: 12
+#| fig-height: 8
+#| label: fig-reactome-cnetplot
+cnetplot(ereactome, showCategory = 8, node_label = "all",
+         cex.params = list(category_label = 0.8, gene_label = 0.6)) +
+  ggtitle(paste0("Reactome Gene-Concept Network - ", target_cell_type)) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+#| label: fig-reactome-emapplot
+# 通路间相似性网络图
+if (nrow(ereactome) >= 2) {
+  ereactome_sim <- pairwise_termsim(ereactome)
+  emapplot(ereactome_sim, showCategory = 25, cex.params = list(category_label = 0.7)) +
+    ggtitle(paste0("Reactome Enrichment Map - ", target_cell_type)) +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5))
+}
+```
+
+#### 12.5 GSEA — 基于全部基因的排序分析
+
+```{r}
+# 构建 GSEA 排序基因列表（所有基因，不做阈值筛选）
+#
+# GSEA 排序指标的选择（小样本 n=3 场景）:
+#   1. shrunken LFC (apeglm): 一般情况下的首选（DESeq2 作者推荐），
+#      但 apeglm 在 n=3 时可能过度保守，ranking 过平，GSEA 可能无结果
+#   2. unshrunken LFC (MLE): 低表达基因 LFC 膨胀，可能引入假阳性
+#   3. Wald statistic (stat): LFC / SE，天然下调不确定基因的权重
+#
+# 这里同时构建两个 gene list，后续可根据实际结果选择使用哪个：
+#   - gene_list_shrunk: shrunken LFC（标准推荐）
+#   - gene_list_stat:   Wald statistic（n=3 小样本的稳健替代）
+```
+
+##### 方案 A：Shrunken LFC（标准推荐）
+
+```{r}
+all_gene_map <- bitr(res_df$gene, fromType = "SYMBOL", toType = "ENTREZID",
+                     OrgDb = org.Mm.eg.db)
+
+gsea_input_shrunk <- res_df %>%
+  inner_join(all_gene_map, by = c("gene" = "SYMBOL")) %>%
+  arrange(desc(log2FoldChange)) %>%
+  distinct(ENTREZID, .keep_all = TRUE)
+
+gene_list_shrunk <- gsea_input_shrunk$log2FoldChange
+names(gene_list_shrunk) <- gsea_input_shrunk$ENTREZID
+```
+
+##### 方案 B：Wald Statistic（小样本替代方案）
+
+```{r}
+# Wald stat = LFC / SE，天然地对不确定基因降权
+# Michael Love: "The reason many downstream software recommend Wald statistics
+# is for shrinkage of noisy LFC estimates."
+res_for_gsea <- as.data.frame(res) %>%
+  rownames_to_column("gene") %>%
+  filter(!is.na(stat))
+
+gsea_input_stat <- res_for_gsea %>%
+  inner_join(all_gene_map, by = c("gene" = "SYMBOL")) %>%
+  arrange(desc(stat)) %>%
+  distinct(ENTREZID, .keep_all = TRUE)
+
+gene_list_stat <- gsea_input_stat$stat
+names(gene_list_stat) <- gsea_input_stat$ENTREZID
+```
+
+```{r}
+# ★ 选择使用哪个 gene list（根据实际结果切换）
+# 如果 shrunken LFC 能富集到结果，优先使用它（标准推荐）
+# 如果 apeglm 过度收缩导致无结果，切换为 Wald stat
+gene_list <- gene_list_stat  # <- 修改这里切换: gene_list_shrunk 或 gene_list_stat
+
+cat("当前使用的排序指标:",
+    ifelse(identical(gene_list, gene_list_stat), "Wald statistic", "Shrunken LFC"), "\n")
+cat("基因数:", length(gene_list), "\n")
+cat("排序范围:", round(range(gene_list), 2), "\n")
+```
+
+##### GSEA — GO Biological Process
+
+```{r}
+gsea_go <- gseGO(
+  geneList = gene_list,
+  OrgDb = org.Mm.eg.db,
+  ont = "BP",
+  minGSSize = 15,
+  maxGSSize = 500,
+  pvalueCutoff = 0.05,
+  seed = TRUE,
+  verbose = FALSE
+)
+gsea_go <- setReadable(gsea_go, OrgDb = org.Mm.eg.db, keyType = "ENTREZID")
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+#| label: fig-gsea-go-dotplot
+dotplot(gsea_go, showCategory = 15, split = ".sign", label_format = 50,
+        title = paste0("GSEA GO BP - ", target_cell_type)) +
+  facet_grid(. ~ .sign) +
+  scale_color_gradient(low = "red", high = "blue") +
+  theme_enrich
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 7
+#| label: fig-gsea-go-ridgeplot
+ridgeplot(gsea_go, showCategory = 20, label_format = 40) +
+  ggtitle(paste0("GSEA GO BP Ridge - ", target_cell_type)) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+```{r}
+#| fig-width: 8
+#| fig-height: 5
+#| label: fig-gsea-go-gseaplot
+# 展示 top 3 通路的 Running Enrichment Score
+if (nrow(gsea_go) >= 3) {
+  gseaplot2(gsea_go, geneSetID = 1:3, pvalue_table = TRUE,
+            title = paste0("Top 3 GSEA GO BP - ", target_cell_type))
+}
+```
+
+##### GSEA — KEGG Pathway
+
+```{r}
+gsea_kegg <- gseKEGG(
+  geneList = gene_list,
+  organism = "mmu",
+  minGSSize = 15,
+  maxGSSize = 500,
+  pvalueCutoff = 0.05,
+  seed = TRUE,
+  verbose = FALSE
+)
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+#| label: fig-gsea-kegg-dotplot
+dotplot(gsea_kegg, showCategory = 15, split = ".sign", label_format = 50,
+        title = paste0("GSEA KEGG - ", target_cell_type)) +
+  facet_grid(. ~ .sign) +
+  scale_color_gradient(low = "red", high = "blue") +
+  theme_enrich
+```
+
+```{r}
+#| fig-width: 8
+#| fig-height: 5
+#| label: fig-gsea-kegg-gseaplot
+if (nrow(gsea_kegg) >= 3) {
+  gseaplot2(gsea_kegg, geneSetID = 1:3, pvalue_table = TRUE,
+            title = paste0("Top 3 GSEA KEGG - ", target_cell_type))
+}
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 7
+#| label: fig-gsea-kegg-ridgeplot
+ridgeplot(gsea_kegg, showCategory = 20, label_format = 40) +
+  ggtitle(paste0("GSEA KEGG Ridge - ", target_cell_type)) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+##### GSEA — Reactome Pathway
+
+```{r}
+gsea_reactome <- gsePathway(
+  geneList = gene_list,
+  organism = "mouse",
+  minGSSize = 15,
+  maxGSSize = 500,
+  pvalueCutoff = 0.05,
+  seed = TRUE,
+  verbose = FALSE
+)
+gsea_reactome <- setReadable(gsea_reactome, OrgDb = org.Mm.eg.db, keyType = "ENTREZID")
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+#| label: fig-gsea-reactome-dotplot
+dotplot(gsea_reactome, showCategory = 15, split = ".sign", label_format = 50,
+        title = paste0("GSEA Reactome - ", target_cell_type)) +
+  facet_grid(. ~ .sign) +
+  scale_color_gradient(low = "red", high = "blue") +
+  theme_enrich
+```
+
+```{r}
+#| fig-width: 8
+#| fig-height: 5
+#| label: fig-gsea-reactome-gseaplot
+if (nrow(gsea_reactome) >= 3) {
+  gseaplot2(gsea_reactome, geneSetID = 1:3, pvalue_table = TRUE,
+            title = paste0("Top 3 GSEA Reactome - ", target_cell_type))
+}
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 7
+#| label: fig-gsea-reactome-ridgeplot
+ridgeplot(gsea_reactome, showCategory = 20, label_format = 40) +
+  ggtitle(paste0("GSEA Reactome Ridge - ", target_cell_type)) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+#### 12.6 保存富集分析结果
+
+```{r}
+# ORA 结果
+if (nrow(ego_bp) > 0)
+  write.csv(as.data.frame(ego_bp),
+            paste0("Results/ORA_GO_BP_", target_cell_type, ".csv"), row.names = FALSE)
+if (nrow(ego_mf) > 0)
+  write.csv(as.data.frame(ego_mf),
+            paste0("Results/ORA_GO_MF_", target_cell_type, ".csv"), row.names = FALSE)
+if (nrow(ekegg) > 0)
+  write.csv(as.data.frame(ekegg),
+            paste0("Results/ORA_KEGG_", target_cell_type, ".csv"), row.names = FALSE)
+
+# GSEA 结果
+if (nrow(gsea_go) > 0)
+  write.csv(as.data.frame(gsea_go),
+            paste0("Results/GSEA_GO_BP_", target_cell_type, ".csv"), row.names = FALSE)
+if (nrow(gsea_kegg) > 0)
+  write.csv(as.data.frame(gsea_kegg),
+            paste0("Results/GSEA_KEGG_", target_cell_type, ".csv"), row.names = FALSE)
+
+# Reactome 结果
+if (nrow(ereactome) > 0)
+  write.csv(as.data.frame(ereactome),
+            paste0("Results/ORA_Reactome_", target_cell_type, ".csv"), row.names = FALSE)
+if (nrow(gsea_reactome) > 0)
+  write.csv(as.data.frame(gsea_reactome),
+            paste0("Results/GSEA_Reactome_", target_cell_type, ".csv"), row.names = FALSE)
+```
+
+### 13. Session Info
+
+```{r}
+sessionInfo()
+```

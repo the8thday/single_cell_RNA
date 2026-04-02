@@ -1,0 +1,100 @@
+---
+title: "Untitled"
+format: html
+---
+
+
+# anndataR
+
+从此Seurat、anndata、SingleCellExperiment相互间的转换再也无烦恼。
+
+
+```{r}
+library(anndataR)
+library(Seurat)
+```
+
+
+# Seurat 转 anndata
+
+
+one line code:
+```{r}
+adata <- as_AnnData(seurat_obj)
+
+adata$write_h5ad("my_seurat_converted.h5ad")
+```
+
+
+customize the conversion process:
+```{r}
+# ?as_AnnData
+
+adata <- as_AnnData(
+    seurat_obj,
+    assay_name = "RNA",
+    x_mapping = "counts",
+    layers_mapping = c("dense_counts"),
+    obs_mapping = c(RNA_count = "nCount_RNA", metadata1 = "metadata1"),
+    var_mapping = FALSE,
+    obsm_mapping = list(X_pca = "pca", X_umap = "umap"),
+    obsp_mapping = TRUE,
+    uns_mapping = c("misc1", "misc2")
+)
+adata
+```
+
+
+```{r}
+adata$write_h5ad(adata$write_h5ad("./my_seurat_converted.h5ad"))
+```
+
+
+# Reading H5AD files to a Seurat Object
+
+one line code:
+```{r}
+h5ad_file <- system.file("extdata", "example.h5ad", package = "anndataR")
+
+seurat_obj <- read_h5ad(h5ad_file, as = "Seurat")
+seurat_obj
+```
+
+
+customize the conversion process:
+```{r}
+adata <- read_h5ad(h5ad_path)
+
+seurat_obj <- adata$as_Seurat(
+    layers_mapping = c("counts", "dense_counts"),
+    object_metadata_mapping = c(metadata1 = "Int", metadata2 = "Float"),
+    assay_metadata_mapping = FALSE,
+    reduction_mapping = list(
+        pca = c(key = "PC_", embeddings = "X_pca", loadings = "PCs"),
+        umap = c(key = "UMAP_", embeddings = "X_umap")
+    ),
+    graph_mapping = TRUE,
+    misc_mapping = c(misc1 = "Bool", misc2 = "IntScalar")
+)
+
+seurat_obj
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,599 @@
+---
+title: "hdWGCNA Single-Cell Co-expression Network Analysis"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+---
+
+
+## Introduction
+
+hdWGCNA (high-dimensional Weighted Gene Co-expression Network Analysis) 将经典 WGCNA 框架扩展到单细胞数据。核心思路是通过构建 metacell（聚合相似细胞）减少稀疏性，再对 metacell 表达矩阵构建共表达网络，识别基因模块及其 hub 基因。
+
+**关键概念：**
+
+- **Metacell** — 将转录组相似的细胞聚合为一个"伪细胞"，平均化表达值以稳定基因间相关性
+- **Soft power** — 控制网络拓扑，选择使网络近似无标度（scale-free）的最低阈值
+- **Module eigengene (ME)** — 每个模块的第一主成分，代表模块整体表达趋势
+- **kME (module membership)** — 每个基因与模块 eigengene 的相关性，用于排序 hub 基因
+
+**注意：** hdWGCNA 作者不推荐使用 SCTransform 归一化的数据，建议使用标准 `NormalizeData` 流程的 RNA assay。
+
+
+## Setup
+
+```{r}
+#| label: load-packages
+#| include: false
+
+library(Seurat)
+library(hdWGCNA)
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(patchwork)
+library(qs2)
+
+# 并行计算
+library(future)
+plan("multisession", workers = 4)
+options(future.globals.maxSize = 40 * 1024^3)
+
+set.seed(42)
+```
+
+
+## Load Data
+
+```{r}
+#| label: load-data
+#| eval: false
+
+seurat_obj <- qs2::qs_read("datasets/harmonized_seurat.qs2")
+
+seurat_obj
+colnames(seurat_obj@meta.data)
+
+table(seurat_obj$cell_type)
+table(seurat_obj$group)
+table(seurat_obj$sample)
+table(seurat_obj$level1)
+```
+
+
+## Subset Cells (Optional)
+
+hdWGCNA 需要对特定细胞谱系构建网络。如果关注某个大类（如免疫细胞），可以先提取子集以减少计算量和提高信噪比。
+
+```{r}
+#| label: subset-cells
+#| eval: false
+
+# === 方案1：使用全部数据（对所有细胞类型分别建网络） ===
+seurat_sub <- seurat_obj
+
+# === 方案2：提取特定谱系 ===
+# seurat_sub <- subset(seurat_obj, level1 == "Immune")
+
+# === 方案3：提取特定细胞类型 ===
+# target_types <- c("Alveolar Macrophages", "Interstitial Macrophages", "MregDC")
+# seurat_sub <- subset(seurat_obj, cell_type %in% target_types)
+
+table(seurat_sub$cell_type)
+```
+
+
+## Prepare RNA Assay
+
+hdWGCNA 需要标准归一化的 RNA assay（不推荐 SCT）。确保 RNA assay 已归一化。
+
+```{r}
+#| label: prepare-rna
+#| eval: false
+
+DefaultAssay(seurat_sub) <- "RNA"
+
+# 如果RNA assay尚未归一化，取消下面的注释
+# seurat_sub <- NormalizeData(seurat_sub, verbose = FALSE)
+# seurat_sub <- FindVariableFeatures(seurat_sub, nfeatures = 3000)
+# seurat_sub <- ScaleData(seurat_sub, verbose = FALSE)
+# seurat_sub <- RunPCA(seurat_sub, npcs = 50, verbose = FALSE)
+
+DimPlot(seurat_sub, group.by = "cell_type", label = TRUE, repel = TRUE) +
+  NoLegend()
+```
+
+
+## Initialize hdWGCNA
+
+```{r}
+#| label: setup-hdwgcna
+#| eval: false
+
+# 选择表达在至少 5% 细胞中的基因
+seurat_sub <- SetupForWGCNA(
+  seurat_obj = seurat_sub,
+  gene_select = "fraction",
+  fraction = 0.05,
+  wgcna_name = "hdwgcna_main",
+  seurat_assay = "RNA"
+)
+```
+
+
+## Construct Metacells
+
+Metacell 将转录组相似的单细胞聚合，减少 dropout 和噪声，稳定基因间相关性。按 `cell_type` 和 `sample` 分组构建，避免跨样本/跨类型混合。
+
+```{r}
+#| label: build-metacells
+#| eval: false
+
+seurat_sub <- MetacellsByGroups(
+  seurat_obj = seurat_sub,
+  group.by = c("cell_type", "sample"),  # 按细胞类型和样本分层
+  reduction = "harmony",                 # 使用harmony校正后的PCA
+  k = 25,                                # KNN邻居数，根据数据量调整（20-75）
+  max_shared = 10,
+  ident.group = "cell_type"
+)
+
+seurat_sub <- NormalizeMetacells(seurat_sub)
+```
+
+
+```{r}
+#| label: metacell-qc
+#| eval: false
+
+# （可选）对metacell降维并可视化，检查质量
+seurat_sub <- ScaleMetacells(seurat_sub, features = VariableFeatures(seurat_sub))
+seurat_sub <- RunPCAMetacells(seurat_sub, features = VariableFeatures(seurat_sub))
+seurat_sub <- RunHarmonyMetacells(seurat_sub, group.by.vars = "sample")
+seurat_sub <- RunUMAPMetacells(seurat_sub, reduction = "harmony", dims = 1:20)
+
+DimPlotMetacells(seurat_sub, group.by = "cell_type") +
+  ggtitle("Metacell UMAP")
+```
+
+
+## Select Expression Matrix
+
+为目标细胞类型选择表达矩阵。hdWGCNA 对每种细胞类型分别建网络。
+
+```{r}
+#| label: set-dat-expr
+#| eval: false
+
+# 替换为实际的目标细胞类型
+target_groups <- c("Alveolar Macrophages")
+
+seurat_sub <- SetDatExpr(
+  seurat_obj = seurat_sub,
+  group_name = target_groups,
+  group.by = "cell_type",
+  assay = "RNA",
+  layer = "data",
+  use_metacells = TRUE
+)
+```
+
+
+## Soft Power Selection
+
+选择使网络近似无标度拓扑的最低 soft power（Scale Free Topology Model Fit ≥ 0.8）。
+
+```{r}
+#| label: test-soft-powers
+#| eval: false
+
+seurat_sub <- TestSoftPowers(
+  seurat_sub,
+  networkType = "signed",
+  power_vector = 1:30
+)
+
+plot_list <- PlotSoftPowers(seurat_sub)
+wrap_plots(plot_list, ncol = 2)
+```
+
+
+```{r}
+#| label: choose-soft-power
+#| eval: false
+
+# 根据上图选择最低的满足 R^2 >= 0.8 的 power
+soft_power <- 9  # 替换为实际值
+```
+
+
+## Construct Network
+
+```{r}
+#| label: construct-network
+#| eval: false
+
+seurat_sub <- ConstructNetwork(
+  seurat_sub,
+  soft_power = soft_power,
+  tom_name = paste0("tom_", gsub(" ", "_", target_groups[1]))
+)
+```
+
+
+```{r}
+#| label: plot-dendrogram
+#| eval: false
+
+# 模块树状图
+PlotDendrogram(seurat_sub,
+               main = paste("hdWGCNA Dendrogram:", target_groups[1]))
+```
+
+
+## Module Eigengenes & Connectivity
+
+```{r}
+#| label: module-eigengenes
+#| eval: false
+
+# 计算模块eigengenes，通过harmony校正批次效应
+seurat_sub <- ModuleEigengenes(
+  seurat_sub,
+  group.by.vars = "sample"  # 批次变量
+)
+
+hMEs <- GetMEs(seurat_sub)                     # 校正后的MEs
+MEs  <- GetMEs(seurat_sub, harmonized = FALSE) # 原始MEs
+```
+
+
+```{r}
+#| label: module-connectivity
+#| eval: false
+
+# 计算kME（基因与模块eigengene的相关性）
+seurat_sub <- ModuleConnectivity(
+  seurat_sub,
+  group.by = "cell_type",
+  group_name = target_groups
+)
+
+# 重命名模块
+seurat_sub <- ResetModuleNames(seurat_sub, new_name = "M")
+```
+
+
+```{r}
+#| label: plot-kme
+#| eval: false
+
+# kME分布图：展示每个模块top基因的连接度
+PlotKMEs(seurat_sub, ncol = 4)
+```
+
+
+## Hub Genes
+
+```{r}
+#| label: hub-genes
+#| eval: false
+
+# 提取模块分配和hub基因
+modules_tbl <- GetModules(seurat_sub) %>%
+  filter(module != "grey")
+
+hub_tbl <- GetHubGenes(seurat_sub, n_hubs = 20)
+
+# 每个模块的基因数量
+table(modules_tbl$module)
+
+# top hub genes
+head(hub_tbl, 30)
+
+# 保存hub基因表
+dir.create("Results", showWarnings = FALSE)
+write.csv(hub_tbl, "Results/hdwgcna_hub_genes.csv", row.names = FALSE)
+```
+
+
+## Module Visualization
+
+### Feature Plot
+
+```{r}
+#| label: module-featureplot
+#| eval: false
+
+# 在UMAP上展示各模块的eigengene值
+feature_plots <- ModuleFeaturePlot(
+  seurat_sub,
+  features = "hMEs",
+  order = TRUE
+)
+
+wrap_plots(feature_plots, ncol = 4)
+```
+
+
+### Module Score (UCell)
+
+```{r}
+#| label: module-scores
+#| eval: false
+
+# 使用UCell计算模块表达分数（每个细胞）
+seurat_sub <- ModuleExprScore(
+  seurat_sub,
+  n_genes = 25,
+  method = "UCell"
+)
+```
+
+
+### Network Plot
+
+```{r}
+#| label: module-network-plot
+#| eval: false
+
+# 每个模块的网络可视化（内圈：top 10 hub genes, 外圈：15个辅助基因）
+# 输出PDF到 ModuleNetworks/ 目录
+ModuleNetworkPlot(seurat_sub)
+```
+
+
+```{r}
+#| label: hub-network-plot
+#| eval: false
+
+# 多模块hub基因的联合网络图
+HubGeneNetworkPlot(seurat_sub,
+                    n_hubs = 10,
+                    n_other = 5,
+                    edge_prop = 0.75)
+```
+
+
+### Module UMAP
+
+```{r}
+#| label: module-umap
+#| eval: false
+
+# 将TOM矩阵降维到UMAP空间，展示基因模块的低维嵌入
+seurat_sub <- RunModuleUMAP(
+  seurat_sub,
+  n_hubs = 10,
+  n_neighbors = 15,
+  min_dist = 0.1
+)
+
+ModuleUMAPPlot(
+  seurat_sub,
+  edge_prop = 0.1,
+  sample_edges = TRUE,
+  edge.alpha = 0.25,
+  keep_grey_edges = FALSE,
+  label_hubs = 2
+)
+```
+
+
+## Module-Trait Correlation
+
+将模块 eigengene 与元数据中的表型/实验变量关联，识别与特定条件相关的模块。
+
+```{r}
+#| label: module-trait-correlation
+#| eval: false
+
+# 选择关联的变量（需要是数值型或二分类因子）
+# group 需要转为数值：如 Normal=0, Treatment=1
+seurat_sub$group_numeric <- as.numeric(factor(seurat_sub$group)) - 1
+
+traits <- c("nCount_RNA", "nFeature_RNA", "percent_mito", "group_numeric")
+
+seurat_sub <- ModuleTraitCorrelation(
+  seurat_sub,
+  traits = traits,
+  group.by = "cell_type",
+  group.by.vars = target_groups
+)
+
+# 可视化相关性热图
+plt <- PlotModuleTraitCorrelation(
+  seurat_sub,
+  label = "fdr",
+  label_symbol = "stars",
+  text_size = 3,
+  text_digits = 2,
+  combine = TRUE
+)
+
+plt
+```
+
+
+## Enrichment Analysis
+
+使用 Enrichr 对每个模块的基因进行功能富集分析。
+
+```{r}
+#| label: enrichment
+#| eval: false
+
+# 对模块基因做Enrichr富集
+# 常用数据库：GO_Biological_Process_2023, GO_Cellular_Component_2023,
+# GO_Molecular_Function_2023, KEGG_2021_Human, MSigDB_Hallmark_2020
+dbs <- c("GO_Biological_Process_2023",
+         "GO_Cellular_Component_2023",
+         "KEGG_2021_Human")
+
+seurat_sub <- RunEnrichr(
+  seurat_sub,
+  dbs = dbs,
+  max_genes = 100  # 每个模块取top 100个基因（按kME排序）
+)
+
+# 提取富集结果表
+enrich_tbl <- GetEnrichrTable(seurat_sub)
+head(enrich_tbl)
+```
+
+
+```{r}
+#| label: enrichment-plot
+#| eval: false
+
+# 点图：跨模块展示富集结果
+EnrichrDotPlot(
+  seurat_sub,
+  mods = "all",
+  database = "GO_Biological_Process_2023",
+  n_terms = 3
+)
+```
+
+
+```{r}
+#| label: enrichment-barplot
+#| eval: false
+
+# 条形图：每个模块的top富集通路（输出PDF）
+EnrichrBarPlot(
+  seurat_sub,
+  outdir = "Results/hdwgcna_enrichr",
+  n_terms = 10,
+  plot_size = c(5, 7)
+)
+```
+
+
+## Module Preservation Across Conditions
+
+评估在一个条件中识别的模块在另一个条件中是否保守（preserved）。
+
+```{r}
+#| label: module-preservation
+#| eval: false
+
+# 需要分别构建两个条件的hdWGCNA对象
+# 假设已有 seurat_ref（如 Normal）和 seurat_query（如 Treatment）
+
+# seurat_ref  <- subset(seurat_sub, group == "Normal")
+# seurat_query <- subset(seurat_sub, group == "Treatment")
+
+# 对 seurat_query 也需要完成 SetupForWGCNA + MetacellsByGroups + NormalizeMetacells
+
+# 运行保守性检验（计算量大，建议 n_permutations >= 100）
+# seurat_sub <- ModulePreservation(
+#   seurat_sub,
+#   seurat_ref = seurat_ref,
+#   seurat_query = seurat_query,
+#   group_name = target_groups,
+#   group.by = "cell_type",
+#   n_permutations = 200
+# )
+
+# 可视化
+# PlotModulePreservation(
+#   seurat_sub,
+#   statistics = "summary",
+#   name = "preservation",
+#   plot_size = c(5, 5)
+# )
+```
+
+
+## Multiple Cell Types Analysis
+
+对多种细胞类型分别构建网络，一个 Seurat 对象可以存储多个 hdWGCNA experiment。
+
+```{r}
+#| label: multi-celltype
+#| eval: false
+
+# 获取所有细胞类型
+all_cell_types <- unique(seurat_sub$cell_type)
+# 筛选细胞数足够多的类型（建议 >200）
+cell_counts <- table(seurat_sub$cell_type)
+valid_types <- names(cell_counts[cell_counts >= 200])
+
+# 对每种细胞类型循环构建网络
+for (ct in valid_types) {
+  wgcna_name <- paste0("hdwgcna_", gsub(" ", "_", ct))
+
+  seurat_sub <- SetupForWGCNA(
+    seurat_sub,
+    gene_select = "fraction",
+    fraction = 0.05,
+    wgcna_name = wgcna_name,
+    seurat_assay = "RNA"
+  )
+
+  seurat_sub <- MetacellsByGroups(
+    seurat_sub,
+    group.by = c("cell_type", "sample"),
+    reduction = "harmony",
+    k = 25, max_shared = 10,
+    ident.group = "cell_type"
+  )
+  seurat_sub <- NormalizeMetacells(seurat_sub)
+
+  seurat_sub <- SetDatExpr(
+    seurat_sub,
+    group_name = ct,
+    group.by = "cell_type",
+    assay = "RNA",
+    layer = "data",
+    use_metacells = TRUE
+  )
+
+  seurat_sub <- TestSoftPowers(seurat_sub, networkType = "signed")
+
+  # 注意：这里soft_power需要手动检查每种类型的诊断图
+  # 暂时使用默认值，实际分析时需要逐个调整
+  cat("Cell type:", ct, "- check PlotSoftPowers to select power\n")
+}
+```
+
+
+## Pseudotime Integration
+
+如果已有拟时序信息（如 monocle3），可以可视化模块 eigengene 随拟时序的变化趋势。
+
+```{r}
+#| label: pseudotime-modules
+#| eval: false
+
+# 假设 seurat_sub 中已有 pseudotime 列（从 monocle3 转移过来）
+# seurat_sub$pseudotime <- pseudotime_values
+
+# 模块eigengene随拟时序的变化趋势
+# PlotModuleTrajectory(
+#   seurat_sub,
+#   pseudotime_col = "pseudotime",
+#   group.by = "cell_type"
+# )
+```
+
+
+## Save Results
+
+```{r}
+#| label: save-results
+#| eval: false
+
+qs2::qs_save(seurat_sub, "datasets/hdwgcna_seurat.qs2")
+```
+
+
+## Session Info
+
+```{r}
+#| label: session-info
+
+sessionInfo()
+```

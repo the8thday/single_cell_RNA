@@ -1,0 +1,401 @@
+---
+title: "CellPhoneDB v5 Cell-Cell Communication Analysis"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+---
+
+
+## Introduction
+
+CellPhoneDB 通过配体-受体互作推断细胞间通讯。v5 的主要更新（Troule et al., Nature Protocols 2025）：
+
+- **完整 Python API** — 无需 CLI，可直接在 Jupyter/Quarto 中调用
+- **Scoring 模块** — 0-100 分评估互作的表达特异性
+- **CellSign 模块** — 211 条受体-TF 关系，标记具有活跃下游转录因子的互作
+- **三种分析方法** — 简单分析、统计检验（置换检验）、DEG 分析
+- **数据库扩展** — ~3,000 条人工验证的互作，含非蛋白配体和通路分类
+
+本文件基于 harmonized_seurat 对象，将 Seurat 数据导出为 h5ad 格式后使用 CellPhoneDB v5 分析。所有分析 chunk 设为 `eval: false`，适合逐步交互运行。
+
+::: {.callout-important}
+CellPhoneDB 仅支持**人类基因**。小鼠数据需先转换为人类同源基因。
+:::
+
+
+## Setup
+
+### Install CellPhoneDB
+
+```{bash}
+#| label: install-cpdb
+#| eval: false
+
+pip install cellphonedb
+# 主要依赖：anndata, scanpy, ktplotspy
+```
+
+
+### R Packages
+
+```{r}
+#| label: load-r-packages
+#| include: false
+
+library(Seurat)
+library(dplyr)
+library(qs2)
+```
+
+
+### Python Setup
+
+```{python}
+#| label: load-python-packages
+#| eval: false
+
+import os
+import pandas as pd
+import scanpy as sc
+import anndata as ad
+from cellphonedb.utils import db_utils, search_utils
+from cellphonedb.src.core.methods import cpdb_statistical_analysis_method
+from cellphonedb.src.core.methods import cpdb_degs_analysis_method
+import ktplotspy as kpy
+import matplotlib.pyplot as plt
+```
+
+
+## Prepare Input Data
+
+### Export Seurat to h5ad
+
+CellPhoneDB 需要 h5ad 格式的标准化表达矩阵和细胞类型 metadata。
+
+```{r}
+#| label: export-data
+#| eval: false
+
+seurat_obj <- qs2::qs_read("datasets/harmonized_seurat.qs2")
+
+# === 方案1：提取单个样本 ===
+seurat_sub <- subset(seurat_obj, orig.ident == "E3_young")
+
+# === 方案2：提取特定条件 ===
+# seurat_sub <- subset(seurat_obj, group == "Normal")
+
+# 移除细胞数过少的类型
+cell_counts <- table(seurat_sub$cell_type)
+keep_types <- names(cell_counts[cell_counts >= 10])
+seurat_sub <- subset(seurat_sub, cell_type %in% keep_types)
+
+table(seurat_sub$cell_type)
+
+# --- 导出 metadata ---
+meta <- data.frame(
+  barcode_sample = colnames(seurat_sub),
+  cell_type = as.character(seurat_sub$cell_type)
+)
+write.table(meta, "datasets/cpdb_meta.tsv",
+            sep = "\t", row.names = FALSE, quote = FALSE)
+
+# --- 导出 h5ad（需要 anndataR 或 SeuratDisk）---
+# 方法1：使用 anndataR（推荐）
+library(anndataR)
+adata <- from_Seurat(seurat_sub, assay = "RNA")
+write_h5ad(adata, "datasets/cpdb_counts.h5ad")
+
+# 方法2：使用 SeuratDisk
+# library(SeuratDisk)
+# SaveH5Seurat(seurat_sub, filename = "datasets/cpdb_counts.h5seurat")
+# Convert("datasets/cpdb_counts.h5seurat", dest = "h5ad")
+```
+
+
+### Download CellPhoneDB Database
+
+```{python}
+#| label: download-db
+#| eval: false
+
+cpdb_db_dir = "datasets/cpdb_db"
+os.makedirs(cpdb_db_dir, exist_ok=True)
+
+db_utils.download_database(cpdb_db_dir, cpdb_version="v5.0.0")
+# 下载后目录中会有 cellphonedb.zip
+```
+
+
+## Method 1: Statistical Analysis (Recommended)
+
+基于置换检验的统计分析，评估配体-受体互作的显著性。
+
+```{python}
+#| label: run-statistical
+#| eval: false
+
+cpdb_file = "datasets/cpdb_db/cellphonedb.zip"
+
+cpdb_results = cpdb_statistical_analysis_method.call(
+    cpdb_file_path=cpdb_file,
+    meta_file_path="datasets/cpdb_meta.tsv",
+    counts_file_path="datasets/cpdb_counts.h5ad",
+    counts_data="hgnc_symbol",        # 基因ID类型: hgnc_symbol / ensembl
+    score_interactions=True,           # 启用 scoring 模块
+    iterations=1000,                   # 置换次数
+    threshold=0.1,                     # 最低表达比例阈值
+    threads=5,
+    pvalue=0.05,
+    debug_seed=42,
+    result_precision=3,
+    separator="|",
+    output_path="Results/cpdb_statistical/"
+)
+```
+
+### Output 说明
+
+```{python}
+#| label: check-results
+#| eval: false
+
+# 返回字典，包含以下 DataFrame:
+print(cpdb_results.keys())
+# - pvalues: 每对细胞类型间每个互作的 p 值
+# - means: 互作平均表达
+# - significant_means: 仅保留显著互作的均值（其余 NaN）
+# - deconvoluted: 复合物各亚基的表达
+# - interaction_scores: 0-100 特异性评分
+
+cpdb_results["significant_means"].head()
+```
+
+
+## Method 2: DEG-based Analysis (Alternative)
+
+基于差异表达基因的分析，适合有明确 DEG 列表的场景。
+
+### Compute DEGs in R
+
+```{r}
+#| label: compute-degs
+#| eval: false
+
+# 每个细胞类型 vs 其余细胞的差异基因
+Idents(seurat_sub) <- "cell_type"
+degs_all <- FindAllMarkers(seurat_sub,
+                           only.pos = TRUE,
+                           min.pct = 0.1,
+                           logfc.threshold = 0.25,
+                           test.use = "wilcox")
+
+# 格式化为 CellPhoneDB 要求：cell_type, gene
+degs_cpdb <- degs_all |>
+  filter(p_val_adj < 0.05) |>
+  select(cluster, gene) |>
+  rename(cell_type = cluster)
+
+write.table(degs_cpdb, "datasets/cpdb_degs.tsv",
+            sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+
+### Run DEG Analysis
+
+```{python}
+#| label: run-degs
+#| eval: false
+
+cpdb_results_deg = cpdb_degs_analysis_method.call(
+    cpdb_file_path=cpdb_file,
+    meta_file_path="datasets/cpdb_meta.tsv",
+    counts_file_path="datasets/cpdb_counts.h5ad",
+    degs_file_path="datasets/cpdb_degs.tsv",
+    counts_data="hgnc_symbol",
+    score_interactions=True,
+    threshold=0.1,
+    threads=5,
+    output_path="Results/cpdb_degs/"
+)
+
+# DEG 方法返回 relevant_interactions（0/1）而非 p 值
+cpdb_results_deg["relevant_interactions"].head()
+```
+
+
+## Visualization
+
+### Interaction Count Heatmap
+
+```{python}
+#| label: plot-heatmap
+#| eval: false
+
+fig, ax = plt.subplots(figsize=(6, 6))
+kpy.plot_cpdb_heatmap(
+    pvals=cpdb_results["pvalues"],
+    degs_analysis=False,
+    figsize=(6, 6),
+    title="Number of significant interactions"
+)
+plt.tight_layout()
+plt.savefig("Results/cpdb_heatmap.pdf", dpi=300, bbox_inches="tight")
+plt.show()
+```
+
+
+### Dot Plot
+
+```{python}
+#| label: plot-dotplot
+#| eval: false
+
+adata = sc.read_h5ad("datasets/cpdb_counts.h5ad")
+
+# 指定感兴趣的细胞类型对（用 | 分隔）
+kpy.plot_cpdb(
+    adata=adata,
+    cell_type1="Fibroblast",              # 替换为实际细胞类型
+    cell_type2="Macrophage|T_cell",       # 可用 | 指定多个
+    means=cpdb_results["means"],
+    pvals=cpdb_results["pvalues"],
+    celltype_key="cell_type",
+    figsize=(12, 4),
+    degs_analysis=False,
+    standard_scale=True,
+    interaction_scores=cpdb_results["interaction_scores"],
+    scale_alpha_by_interaction_scores=True
+)
+plt.savefig("Results/cpdb_dotplot.pdf", dpi=300, bbox_inches="tight")
+plt.show()
+```
+
+
+### Dot Plot — Specific Genes
+
+```{python}
+#| label: plot-dotplot-genes
+#| eval: false
+
+kpy.plot_cpdb(
+    adata=adata,
+    cell_type1="Fibroblast",
+    cell_type2=".",                        # "." 匹配所有细胞类型
+    means=cpdb_results["means"],
+    pvals=cpdb_results["pvalues"],
+    celltype_key="cell_type",
+    genes=["TGFB1", "COL1A1", "FN1"],    # 替换为感兴趣的基因
+    figsize=(10, 3),
+    degs_analysis=False,
+    standard_scale=True
+)
+plt.savefig("Results/cpdb_dotplot_genes.pdf", dpi=300, bbox_inches="tight")
+plt.show()
+```
+
+
+## Query Results
+
+CellPhoneDB v5 提供编程式查询接口，按细胞类型、基因或通路筛选结果。
+
+```{python}
+#| label: query-results
+#| eval: false
+
+search_results = search_utils.search_analysis_results(
+    query_cell_types_1=["Fibroblast"],       # 替换为实际细胞类型
+    query_cell_types_2=["Macrophage"],
+    # query_genes=["TGFB1"],                 # 可选：按基因筛选
+    # query_interactions=["TGFB1_TGFBR1"],   # 可选：按互作名筛选
+    significant_means=cpdb_results["significant_means"],
+    deconvoluted=cpdb_results["deconvoluted"],
+    interaction_scores=cpdb_results["interaction_scores"],
+    query_minimum_score=50,                   # 最低特异性评分
+    separator="|",
+    long_format=True
+)
+
+search_results.head(20)
+```
+
+
+## Multi-Sample Comparison
+
+对多个条件分别运行 CellPhoneDB，然后比较结果。
+
+```{python}
+#| label: multi-sample
+#| eval: false
+
+conditions = ["Normal", "Treatment"]  # 替换为实际条件名
+
+results_dict = {}
+for cond in conditions:
+    meta_path = f"datasets/cpdb_meta_{cond}.tsv"
+    counts_path = f"datasets/cpdb_counts_{cond}.h5ad"
+    out_path = f"Results/cpdb_{cond}/"
+    os.makedirs(out_path, exist_ok=True)
+
+    results_dict[cond] = cpdb_statistical_analysis_method.call(
+        cpdb_file_path=cpdb_file,
+        meta_file_path=meta_path,
+        counts_file_path=counts_path,
+        counts_data="hgnc_symbol",
+        score_interactions=True,
+        iterations=1000,
+        threshold=0.1,
+        threads=5,
+        pvalue=0.05,
+        debug_seed=42,
+        output_path=out_path
+    )
+    print(f"{cond} done.")
+```
+
+```{python}
+#| label: compare-conditions
+#| eval: false
+
+# 比较两个条件下的显著互作数量
+for cond, res in results_dict.items():
+    sig = res["significant_means"].notna().sum().sum()
+    print(f"{cond}: {sig} significant interactions")
+
+# 提取条件特异性互作
+sig_normal = set(
+    results_dict["Normal"]["significant_means"]
+    .dropna(how="all")
+    .index
+)
+sig_treatment = set(
+    results_dict["Treatment"]["significant_means"]
+    .dropna(how="all")
+    .index
+)
+
+only_normal = sig_normal - sig_treatment
+only_treatment = sig_treatment - sig_normal
+shared = sig_normal & sig_treatment
+
+print(f"Normal-specific: {len(only_normal)}")
+print(f"Treatment-specific: {len(only_treatment)}")
+print(f"Shared: {len(shared)}")
+```
+
+
+## Session Info
+
+```{r}
+#| label: session-info
+
+sessionInfo()
+```
+
+```{python}
+#| label: python-version
+#| eval: false
+
+import cellphonedb
+print(f"CellPhoneDB version: {cellphonedb.__version__}")
+```

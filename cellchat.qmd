@@ -1,0 +1,1130 @@
+---
+title: "CellChat v2 Cell-Cell Communication Analysis"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+---
+
+
+## Introduction
+
+CellChat 通过建模配体-受体（L-R）相互作用来推断细胞间通讯网络。CellChat v2 相比 v1 的主要更新：
+
+- **CellChatDB v2** — 扩展至 ~3,300 条验证的分子互作，新增非蛋白信号（代谢、突触信号）
+- **`smoothData()` 替代 `projectData()`** — 基于 PPI 网络的扩散平滑
+- **`subsetDB()` 默认排除非蛋白信号** — 避免引入基于酶/代谢中间体的间接推断
+- **直接接受 Seurat 对象** — `createCellChat(object = seurat_obj, group.by = "cell_type")`
+- **多数据集比较** — `mergeCellChat()` + `liftCellChat()` 处理不同细胞组成
+
+本文件基于 harmonized_seurat 对象进行细胞间通讯分析，所有分析 chunk 设为 `eval: false`，适合在 RStudio 中逐步交互运行。
+
+
+## Setup
+
+```{r}
+#| label: load-packages
+#| include: false
+
+library(Seurat)
+library(CellChat)
+library(patchwork)
+library(ggalluvial)
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(NMF)
+library(ComplexHeatmap)
+library(qs2)
+
+options(future.globals.maxSize = 40 * 1024^3)
+set.seed(42)
+```
+
+
+## Load Data
+
+```{r}
+#| label: load-data
+#| eval: false
+
+seurat_obj <- qs2::qs_read("datasets/harmonized_seurat.qs2")
+
+# 移除 Multiplets（技术伪影，非真实细胞类型）
+seurat_obj <- subset(seurat_obj, cell_type != "Multiplets")
+
+# CellChat 需要 normalized gene expression（非 raw counts，非 integrated embeddings）。
+# 上游流程（BLM_mice.qmd）已对 RNA assay 执行 NormalizeData()（log-normalization），
+# 因此 RNA assay 的 data slot 可直接用于 CellChat。
+# 若上游使用 SCTransform 且未对 RNA assay 做 NormalizeData，需在此处补充：
+# seurat_obj <- NormalizeData(seurat_obj, verbose = FALSE)
+DefaultAssay(seurat_obj) <- "RNA"
+
+seurat_obj
+table(seurat_obj$cell_type)
+table(seurat_obj$group)
+table(seurat_obj$orig.ident)
+```
+
+
+## Part I: Single Sample Analysis (Optional) {#part-i}
+
+::: {.callout-note}
+## 何时使用单样本分析？
+
+**适用场景：**
+
+- 探索性分析：先了解某个样本/条件下的通讯全貌，再决定后续分析方向
+- 只有单个样本或单个条件，无法做多数据集比较
+- 样本间异质性大，需逐个样本检查通讯模式
+- 关注单个样本内部特定细胞类型间的详细互作
+
+**可以跳过的场景（直接进入 [Part II](#part-ii)）：**
+
+- 目标是比较条件间（如 Normal vs Treatment）的通讯差异 — 这是最常见的需求
+- 每个条件下有多个生物学重复，按 `group` 分组分析更有统计意义
+- 时间/计算资源有限，优先做多条件比较
+:::
+
+### Subset Data
+
+对单样本分析，先提取一个样本（或一个条件）的数据。也可以对全部数据做分析，但计算量更大。
+
+```{r}
+#| label: subset-sample
+#| eval: false
+
+# === 方案1：提取单个样本 ===
+seurat_sub <- subset(seurat_obj, orig.ident == "E3_young")  # 替换为实际样本名
+
+# === 方案2：提取特定条件的所有样本 ===
+# seurat_sub <- subset(seurat_obj, group == "Normal")
+
+# === 方案3：使用全部数据（计算量大） ===
+# seurat_sub <- seurat_obj
+
+table(seurat_sub$cell_type)
+
+# 移除细胞数过少的类型（建议 >10 个细胞）
+cell_counts <- table(seurat_sub$cell_type)
+keep_types <- names(cell_counts[cell_counts >= 10])
+seurat_sub <- subset(seurat_sub, cell_type %in% keep_types)
+```
+
+
+### Create CellChat Object
+
+```{r}
+#| label: create-cellchat
+#| eval: false
+
+# CellChat v2 支持直接传入 Seurat 对象
+cellchat <- createCellChat(object = seurat_sub,
+                            group.by = "cell_type",
+                            assay = "RNA")
+
+groupSize <- as.numeric(table(cellchat@idents))
+levels(cellchat@idents)
+```
+
+
+### Set CellChatDB
+
+```{r}
+#| label: set-database
+#| eval: false
+
+# 根据物种选择数据库
+CellChatDB <- CellChatDB.mouse   # 小鼠数据
+# CellChatDB <- CellChatDB.human  # 人类数据
+
+showDatabaseCategory(CellChatDB)
+dplyr::glimpse(CellChatDB$interaction)
+
+# CellChatDB v2 包含 ~30% 的非蛋白信号（代谢/突触），建议排除
+# subsetDB() 默认排除 "Non-protein Signaling"
+CellChatDB.use <- subsetDB(CellChatDB)
+
+# 如果只关注分泌型信号：
+# CellChatDB.use <- subsetDB(CellChatDB, search = "Secreted Signaling", key = "annotation")
+
+cellchat@DB <- CellChatDB.use
+```
+
+
+### Preprocessing
+
+```{r}
+#| label: preprocess
+#| eval: false
+
+# 提取数据库支持的基因子集（必须步骤）
+cellchat <- subsetData(cellchat)
+
+# 识别过表达基因和互作
+cellchat <- identifyOverExpressedGenes(cellchat)
+cellchat <- identifyOverExpressedInteractions(cellchat)
+
+# 基于PPI网络平滑表达数据（可选，适合测序深度较浅的数据）
+# smoothData 替代了已废弃的 projectData
+# 默认不启用；如需使用，Part II 的多条件分析中也应同步启用以保持一致
+# cellchat <- smoothData(cellchat, adj = PPI.mouse)  # PPI.human for human
+```
+
+
+### Infer Communication Network
+
+```{r}
+#| label: infer-network
+#| eval: false
+#| message: false
+#| warning: false
+
+ptm <- Sys.time()
+
+# 推断配体-受体水平的通讯概率
+# type = "triMean" 更严格，减少假阳性；"truncatedMean" 更灵敏
+cellchat <- computeCommunProb(cellchat, type = "triMean")
+
+# 过滤细胞数过少的通讯
+cellchat <- filterCommunication(cellchat, min.cells = 10)
+
+# 在信号通路水平汇总通讯概率
+cellchat <- computeCommunProbPathway(cellchat)
+
+# 聚合细胞间通讯网络
+cellchat <- aggregateNet(cellchat)
+
+cat("Elapsed:", round(difftime(Sys.time(), ptm, units = "mins"), 1), "min\n")
+```
+
+
+```{r}
+#| label: save-cellchat
+#| eval: false
+
+qs2::qs_save(cellchat, "datasets/cellchat_single.qs2")
+# cellchat <- qs2::qs_read("datasets/cellchat_single.qs2")
+```
+
+
+### Network Visualization
+
+#### Interaction Count & Strength
+
+```{r}
+#| label: plot-network-overview
+#| eval: false
+
+groupSize <- as.numeric(table(cellchat@idents))
+
+par(mfrow = c(1, 2), xpd = TRUE)
+netVisual_circle(cellchat@net$count,
+                 vertex.weight = groupSize,
+                 weight.scale = TRUE, label.edge = FALSE,
+                 title.name = "Number of interactions")
+netVisual_circle(cellchat@net$weight,
+                 vertex.weight = groupSize,
+                 weight.scale = TRUE, label.edge = FALSE,
+                 title.name = "Interaction weights/strength")
+```
+
+
+#### Per Cell Type Network
+
+```{r}
+#| label: plot-per-celltype
+#| eval: false
+
+# 每个细胞类型作为 source 的互作网络
+mat <- cellchat@net$weight
+n_types <- nrow(mat)
+par(mfrow = c(ceiling(n_types / 4), 4), xpd = TRUE)
+
+for (i in seq_len(n_types)) {
+  mat2 <- matrix(0, nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+  mat2[i, ] <- mat[i, ]
+  netVisual_circle(mat2,
+                   vertex.weight = groupSize,
+                   weight.scale = TRUE,
+                   edge.weight.max = max(mat),
+                   title.name = rownames(mat)[i])
+}
+```
+
+
+#### Pathway-Level Visualization
+
+```{r}
+#| label: plot-pathway
+#| eval: false
+
+# 查看所有富集到的信号通路
+cellchat@netP$pathways
+
+# 选择感兴趣的通路
+pathways.show <- "TGFb"  # 替换为实际通路名
+
+# 层级图
+netVisual_aggregate(cellchat,
+                    signaling = pathways.show,
+                    layout = "hierarchy")
+
+# 圆形图
+netVisual_aggregate(cellchat,
+                    signaling = pathways.show,
+                    layout = "circle")
+
+# 热图
+netVisual_heatmap(cellchat,
+                  signaling = pathways.show,
+                  color.heatmap = "Reds")
+```
+
+
+#### L-R Pair Contribution
+
+```{r}
+#| label: plot-lr-contribution
+#| eval: false
+
+# 每个配体-受体对对信号通路的贡献度
+netAnalysis_contribution(cellchat, signaling = pathways.show)
+```
+
+
+#### Bubble Plot
+
+```{r}
+#| label: plot-bubble
+#| eval: false
+
+# 指定 source 和 target 细胞群
+# 查看索引：levels(cellchat@idents)
+netVisual_bubble(cellchat,
+                 sources.use = 1,
+                 targets.use = c(2:5),
+                 remove.isolate = FALSE)
+
+# 指定特定通路
+netVisual_bubble(cellchat,
+                 sources.use = 1,
+                 targets.use = c(2:5),
+                 signaling = c("TGFb", "WNT"))
+```
+
+
+#### Chord Diagram
+
+```{r}
+#| label: plot-chord
+#| eval: false
+
+# 基因水平的弦图
+netVisual_chord_gene(cellchat,
+                     sources.use = c(1, 2),
+                     targets.use = c(3, 4),
+                     legend.pos.x = 15)
+
+# 信号通路水平的弦图
+netVisual_chord_cell(cellchat,
+                     signaling = pathways.show,
+                     group = groupSize)
+```
+
+
+#### Gene Expression
+
+```{r}
+#| label: plot-gene-expression
+#| eval: false
+
+# 信号通路相关基因的表达分布
+plotGeneExpression(cellchat, signaling = pathways.show, type = "violin")
+# type: "violin", "dot", "bar"
+```
+
+
+### Systems Analysis
+
+#### Centrality Scores
+
+```{r}
+#| label: centrality
+#| eval: false
+
+# 计算网络中心性（Sender, Receiver, Mediator, Influencer）
+cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "netP")
+
+# 热图展示各细胞类型在特定通路中的角色
+netAnalysis_signalingRole_network(cellchat,
+                                  signaling = pathways.show,
+                                  width = 8, height = 2.5,
+                                  font.size = 10)
+
+# 散点图：所有通路汇总的 sender/receiver 角色
+netAnalysis_signalingRole_scatter(cellchat)
+```
+
+
+#### Communication Patterns (Optional)
+
+基于 NMF 的通讯模式识别，计算较慢，可跳过，不影响其他分析步骤。
+
+```{r}
+#| label: outgoing-patterns
+#| eval: false
+
+# 确定最佳模式数
+selectK(cellchat, pattern = "outgoing")
+
+# 识别 outgoing 通讯模式
+nPatterns <- 3  # 根据 selectK 结果调整
+cellchat <- identifyCommunicationPatterns(cellchat,
+                                          pattern = "outgoing",
+                                          k = nPatterns)
+
+# 可视化
+netAnalysis_river(cellchat, pattern = "outgoing")
+netAnalysis_dot(cellchat, pattern = "outgoing")
+```
+
+
+```{r}
+#| label: incoming-patterns
+#| eval: false
+
+selectK(cellchat, pattern = "incoming")
+
+nPatterns <- 3  # 根据 selectK 结果调整
+cellchat <- identifyCommunicationPatterns(cellchat,
+                                          pattern = "incoming",
+                                          k = nPatterns)
+
+netAnalysis_river(cellchat, pattern = "incoming")
+netAnalysis_dot(cellchat, pattern = "incoming")
+```
+
+
+#### Signaling Network Clustering
+
+```{r}
+#| label: network-clustering
+#| eval: false
+
+# 按功能相似性聚类
+cellchat <- computeNetSimilarity(cellchat, type = "functional")
+cellchat <- netEmbedding(cellchat, type = "functional")
+cellchat <- netClustering(cellchat, type = "functional")
+netVisual_embedding(cellchat, type = "functional", label.size = 3.5)
+
+# 按结构相似性聚类
+cellchat <- computeNetSimilarity(cellchat, type = "structural")
+cellchat <- netEmbedding(cellchat, type = "structural")
+cellchat <- netClustering(cellchat, type = "structural")
+netVisual_embedding(cellchat, type = "structural", label.size = 3.5)
+```
+
+
+## Part II: Multi-Dataset Comparison (Recommended) {#part-ii}
+
+::: {.callout-tip}
+## 何时使用多数据集比较？
+
+**适用场景（最常用）：**
+
+- 比较不同条件（Normal vs Treatment、Young vs Old、WT vs KO）间的通讯差异
+- 每个条件有多个生物学重复，需要整合分析
+- 需要识别条件特异性的上调/下调信号通路
+- 关注疾病进展或治疗前后的通讯网络重塑
+
+**不适用的场景（使用 [Part I](#part-i)）：**
+
+- 只有单个样本/单个条件
+- 纯探索性分析，尚未定义比较组
+:::
+
+::: {.callout-warning}
+## 关于统计严谨性的说明
+
+本分析将同一条件下所有生物学重复的细胞合并为一个 CellChat 对象进行比较，这是 CellChat 官方教程及大多数已发表文献采用的标准做法。但需注意，此方法为**描述性比较（descriptive comparison）**，未纳入生物学重复的样本间变异（between-replicate variability），因此无法严格区分条件间的真实差异与样本间的随机波动。如需 replicate-aware 的统计推断，可对每个样本单独运行 CellChat，再在 replicate 水平进行统计检验。
+:::
+
+比较不同条件（如 Normal vs Treatment）之间的细胞通讯差异。需要分别对每个条件构建 CellChat 对象，再合并比较。
+
+### Build CellChat for Each Condition
+
+```{r}
+#| label: build-multi
+#| eval: false
+
+# 按条件拆分
+conditions <- unique(seurat_obj$group)
+cellchat_list <- list()
+
+for (cond in conditions) {
+  seurat_cond <- subset(seurat_obj, group == cond)
+
+  # 移除细胞数过少的类型
+  cell_counts <- table(seurat_cond$cell_type)
+  keep_types <- names(cell_counts[cell_counts >= 10])
+  seurat_cond <- subset(seurat_cond, cell_type %in% keep_types)
+
+  cc <- createCellChat(object = seurat_cond,
+                       group.by = "cell_type",
+                       assay = "RNA")
+
+  CellChatDB <- CellChatDB.mouse
+  cc@DB <- subsetDB(CellChatDB)
+
+  cc <- subsetData(cc)
+  cc <- identifyOverExpressedGenes(cc)
+  cc <- identifyOverExpressedInteractions(cc)
+  cc <- computeCommunProb(cc, type = "triMean")
+  cc <- filterCommunication(cc, min.cells = 10)
+  cc <- computeCommunProbPathway(cc)
+  cc <- aggregateNet(cc)
+
+  cellchat_list[[cond]] <- cc
+  cat(cond, "done.\n")
+}
+```
+
+
+### Cell Composition Overview
+
+查看各条件下每个细胞亚群的细胞数量，便于判断后续通讯差异是否受细胞数影响。
+
+```{r}
+#| label: cell-composition
+#| eval: false
+
+# 各条件下细胞亚群的数量统计
+cell_comp <- table(seurat_obj$group, seurat_obj$cell_type)
+cell_comp_df <- as.data.frame.matrix(cell_comp)
+cell_comp_df
+
+# 导出为 CSV 方便查阅
+write.csv(cell_comp_df, "Results/cellchat_cell_composition.csv")
+```
+
+
+### Lift Cell Types (Optional)
+
+当不同条件下的细胞类型组成不一致时，使用 `liftCellChat` 对齐。
+
+```{r}
+#| label: lift-celltypes
+#| eval: false
+
+# 获取所有条件中出现的细胞类型的并集
+all_cell_types <- sort(unique(unlist(lapply(cellchat_list, function(x) levels(x@idents)))))
+
+# 对齐每个 CellChat 对象的细胞类型
+cellchat_list <- lapply(cellchat_list, function(cc) {
+  liftCellChat(cc, group.new = all_cell_types)
+})
+```
+
+
+### Compute Network Centrality
+
+在合并之前，需要为每个条件计算网络中心性分数，后续的信号通路变化分析依赖此结果。
+
+```{r}
+#| label: compute-centrality
+#| eval: false
+
+for (nm in names(cellchat_list)) {
+  cellchat_list[[nm]] <- netAnalysis_computeCentrality(cellchat_list[[nm]])
+}
+```
+
+
+### Communication Patterns (Optional)
+
+对每个条件分别识别 outgoing 和 incoming 通讯模式，与 Part I 的 pattern 分析对应。基于 NMF 的矩阵分解，计算较慢，可跳过，不影响后续条件间比较分析。
+
+需要先用 `selectK` 确定每个条件的最佳 pattern 数，再分别设置 `nPatterns`。
+
+#### Step 1: Determine Optimal Pattern Number
+
+```{r}
+#| label: selectK-patterns
+#| eval: false
+
+# 分别查看每个条件的最佳 pattern 数（看拐点位置）
+for (nm in names(cellchat_list)) {
+  cat("=== ", nm, " ===\n")
+  selectK(cellchat_list[[nm]], pattern = "outgoing")
+  selectK(cellchat_list[[nm]], pattern = "incoming")
+}
+```
+
+
+#### Step 2: Identify Patterns per Condition
+
+根据上一步 selectK 的结果，为每个条件分别设置 nPatterns。
+
+```{r}
+#| label: outgoing-patterns-per-condition
+#| eval: false
+
+# 根据 selectK 结果分别设置每个条件的 outgoing pattern 数
+nPatterns_outgoing <- c("Normal" = 3, "Model" = 3, "QR056251" = 3)
+
+for (nm in names(cellchat_list)) {
+  cellchat_list[[nm]] <- identifyCommunicationPatterns(
+    cellchat_list[[nm]],
+    pattern = "outgoing",
+    k = nPatterns_outgoing[[nm]]
+  )
+  netAnalysis_river(cellchat_list[[nm]], pattern = "outgoing")
+  netAnalysis_dot(cellchat_list[[nm]], pattern = "outgoing")
+}
+```
+
+
+```{r}
+#| label: incoming-patterns-per-condition
+#| eval: false
+
+# 根据 selectK 结果分别设置每个条件的 incoming pattern 数
+nPatterns_incoming <- c("Normal" = 3, "Model" = 3, "QR056251" = 3)
+
+for (nm in names(cellchat_list)) {
+  cellchat_list[[nm]] <- identifyCommunicationPatterns(
+    cellchat_list[[nm]],
+    pattern = "incoming",
+    k = nPatterns_incoming[[nm]]
+  )
+  netAnalysis_river(cellchat_list[[nm]], pattern = "incoming")
+  netAnalysis_dot(cellchat_list[[nm]], pattern = "incoming")
+}
+```
+
+
+### Explore Single Condition (Optional)
+
+可以直接从 cellchat_list 中提取单个条件的 CellChat 对象，使用 Part I 的所有可视化函数。
+
+```{r}
+#| label: explore-single-condition
+#| eval: false
+
+# 查看单个条件的通讯网络（无需重新构建）
+cc_model <- cellchat_list[["Model"]]
+
+groupSize <- as.numeric(table(cc_model@idents))
+par(mfrow = c(1, 2), xpd = TRUE)
+netVisual_circle(cc_model@net$count,
+                 vertex.weight = groupSize,
+                 weight.scale = TRUE, label.edge = FALSE,
+                 title.name = "Model - Number of interactions")
+netVisual_circle(cc_model@net$weight,
+                 vertex.weight = groupSize,
+                 weight.scale = TRUE, label.edge = FALSE,
+                 title.name = "Model - Interaction strength")
+```
+
+
+### Pairwise Merge & Compare
+
+对三个条件做两两比较。`mergeCellChat()` 中位置1为基准，位置2为比较对象，差异 = 位置2 - 位置1。
+红色 = 位置2中上调，蓝色 = 位置2中下调。
+
+- **比较1**：Model（位置2）相对于 Normal（位置1）的变化 → 疾病带来的改变
+- **比较2**：QR056251（位置2）相对于 Model（位置1）的变化 → 药物治疗的效果
+
+```{r}
+#| label: pairwise-merge
+#| eval: false
+
+# --- 比较1：Model vs Normal（红色 = Model中上调）---
+cellchat_MvsN <- mergeCellChat(
+  cellchat_list[c("Normal", "Model")],
+  add.names = c("Normal", "Model")
+)
+
+# --- 比较2：QR056251 vs Model（红色 = QR056251中上调）---
+cellchat_DvsM <- mergeCellChat(
+  cellchat_list[c("Model", "QR056251")],
+  add.names = c("Model", "QR056251")
+)
+```
+
+
+### Compare Interaction Number & Strength
+
+```{r}
+#| label: compare-overview-MvsN
+#| eval: false
+
+# === Model vs Normal ===
+gg1 <- compareInteractions(cellchat_MvsN, show.legend = FALSE, group = c(1, 2)) +
+  ggtitle("Model vs Normal - Count")
+gg2 <- compareInteractions(cellchat_MvsN, show.legend = FALSE,
+                            group = c(1, 2), measure = "weight") +
+  ggtitle("Model vs Normal - Strength")
+gg1 + gg2
+```
+
+```{r}
+#| label: compare-overview-DvsM
+#| eval: false
+
+# === QR056251 vs Model ===
+gg1 <- compareInteractions(cellchat_DvsM, show.legend = FALSE, group = c(1, 2)) +
+  ggtitle("QR056251 vs Model - Count")
+gg2 <- compareInteractions(cellchat_DvsM, show.legend = FALSE,
+                            group = c(1, 2), measure = "weight") +
+  ggtitle("QR056251 vs Model - Strength")
+gg1 + gg2
+```
+
+
+### Differential Network
+
+```{r}
+#| label: compare-network-MvsN
+#| eval: false
+
+# === Model vs Normal：差异网络 ===
+par(mfrow = c(1, 2), xpd = TRUE)
+netVisual_diffInteraction(cellchat_MvsN, weight.scale = TRUE,
+                          title.name = "Model vs Normal - Diff Count")
+netVisual_diffInteraction(cellchat_MvsN, weight.scale = TRUE, measure = "weight",
+                          title.name = "Model vs Normal - Diff Strength")
+```
+
+```{r}
+#| label: compare-network-DvsM
+#| eval: false
+
+# === QR056251 vs Model：差异网络 ===
+par(mfrow = c(1, 2), xpd = TRUE)
+netVisual_diffInteraction(cellchat_DvsM, weight.scale = TRUE,
+                          title.name = "QR056251 vs Model - Diff Count")
+netVisual_diffInteraction(cellchat_DvsM, weight.scale = TRUE, measure = "weight",
+                          title.name = "QR056251 vs Model - Diff Strength")
+```
+
+
+### Differential Heatmap
+
+```{r}
+#| label: compare-heatmap-MvsN
+#| eval: false
+
+# === Model vs Normal ===
+gg1 <- netVisual_heatmap(cellchat_MvsN, title.name = "Model vs Normal - Diff Count")
+gg2 <- netVisual_heatmap(cellchat_MvsN, measure = "weight",
+                          title.name = "Model vs Normal - Diff Strength")
+gg1 + gg2
+```
+
+```{r}
+#| label: compare-heatmap-DvsM
+#| eval: false
+
+# === QR056251 vs Model ===
+gg1 <- netVisual_heatmap(cellchat_DvsM, title.name = "QR056251 vs Model - Diff Count")
+gg2 <- netVisual_heatmap(cellchat_DvsM, measure = "weight",
+                          title.name = "QR056251 vs Model - Diff Strength")
+gg1 + gg2
+```
+
+
+### Compare Signaling Pathways
+
+```{r}
+#| label: compare-pathways-MvsN
+#| eval: false
+
+# === Model vs Normal ===
+# 需要指定具体细胞类型，替换为感兴趣的类型
+cell_types <- levels(cellchat_MvsN@idents[[1]])
+
+for (ct in cell_types) {
+  tryCatch({
+    p <- netAnalysis_signalingChanges_scatter(cellchat_MvsN, idents.use = ct) +
+      ggtitle(paste("Model vs Normal -", ct))
+    print(p)
+  }, error = function(e) message("Skipped: ", ct))
+}
+```
+
+```{r}
+#| label: compare-pathways-DvsM
+#| eval: false
+
+# === QR056251 vs Model ===
+cell_types <- levels(cellchat_DvsM@idents[[1]])
+
+for (ct in cell_types) {
+  tryCatch({
+    p <- netAnalysis_signalingChanges_scatter(cellchat_DvsM, idents.use = ct) +
+      ggtitle(paste("QR056251 vs Model -", ct))
+    print(p)
+  }, error = function(e) message("Skipped: ", ct))
+}
+```
+
+
+### Specific Pathway Comparison
+
+```{r}
+#| label: compare-specific-pathway
+#| eval: false
+
+pathways.show <- "TGFb"  # 替换为实际通路
+
+# Model vs Normal
+cc_pair <- cellchat_list[c("Normal", "Model")]
+# 只取该通路的权重最大值，避免被其他高权重通路压缩线宽
+weight.max <- max(sapply(cc_pair, function(x) {
+  net <- x@netP$prob[, , pathways.show]
+  if (is.null(net)) return(0)
+  max(net)
+}))
+
+par(mfrow = c(1, 2), xpd = TRUE)
+for (i in seq_along(cc_pair)) {
+  netVisual_aggregate(cc_pair[[i]],
+                      signaling = pathways.show,
+                      layout = "circle",
+                      edge.weight.max = weight.max,
+                      edge.width.max = 12,
+                      signaling.name = paste(pathways.show, names(cc_pair)[i]))
+}
+```
+
+
+### Information Flow Comparison
+
+```{r}
+#| label: compare-info-flow-MvsN
+#| eval: false
+
+# === Model vs Normal ===
+gg1 <- rankNet(cellchat_MvsN, mode = "comparison",
+               comparison = c(1, 2), stacked = TRUE, do.stat = TRUE) +
+  ggtitle("Model vs Normal - Stacked")
+gg2 <- rankNet(cellchat_MvsN, mode = "comparison",
+               comparison = c(1, 2), stacked = FALSE, do.stat = TRUE) +
+  ggtitle("Model vs Normal - Unstacked")
+gg1 + gg2
+```
+
+```{r}
+#| label: compare-info-flow-DvsM
+#| eval: false
+
+# === QR056251 vs Model ===
+gg1 <- rankNet(cellchat_DvsM, mode = "comparison",
+               comparison = c(1, 2), stacked = TRUE, do.stat = TRUE) +
+  ggtitle("QR056251 vs Model - Stacked")
+gg2 <- rankNet(cellchat_DvsM, mode = "comparison",
+               comparison = c(1, 2), stacked = FALSE, do.stat = TRUE) +
+  ggtitle("QR056251 vs Model - Unstacked")
+gg1 + gg2
+```
+
+
+### Outgoing/Incoming Signal Comparison
+
+```{r}
+#| label: compare-signal-scatter
+#| eval: false
+
+# 并排比较三个条件的 sender/receiver 角色
+plots <- lapply(names(cellchat_list), function(nm) {
+  netAnalysis_signalingRole_scatter(cellchat_list[[nm]], title = nm)
+})
+wrap_plots(plots, ncol = 3)
+```
+
+
+### Identify Up/Down-regulated Signaling
+
+```{r}
+#| label: updown-signaling-MvsN
+#| eval: false
+
+# === Model vs Normal：功能相似性 ===
+cellchat_MvsN <- computeNetSimilarityPairwise(cellchat_MvsN, type = "functional")
+cellchat_MvsN <- netEmbedding(cellchat_MvsN, type = "functional")
+cellchat_MvsN <- netClustering(cellchat_MvsN, type = "functional")
+netVisual_embeddingPairwise(cellchat_MvsN, type = "functional", label.size = 3.5)
+
+# 结构相似性
+cellchat_MvsN <- computeNetSimilarityPairwise(cellchat_MvsN, type = "structural")
+cellchat_MvsN <- netEmbedding(cellchat_MvsN, type = "structural")
+cellchat_MvsN <- netClustering(cellchat_MvsN, type = "structural")
+netVisual_embeddingPairwise(cellchat_MvsN, type = "structural", label.size = 3.5)
+```
+
+```{r}
+#| label: updown-signaling-DvsM
+#| eval: false
+
+# === QR056251 vs Model：功能相似性 ===
+cellchat_DvsM <- computeNetSimilarityPairwise(cellchat_DvsM, type = "functional")
+cellchat_DvsM <- netEmbedding(cellchat_DvsM, type = "functional")
+cellchat_DvsM <- netClustering(cellchat_DvsM, type = "functional")
+netVisual_embeddingPairwise(cellchat_DvsM, type = "functional", label.size = 3.5)
+
+# 结构相似性
+cellchat_DvsM <- computeNetSimilarityPairwise(cellchat_DvsM, type = "structural")
+cellchat_DvsM <- netEmbedding(cellchat_DvsM, type = "structural")
+cellchat_DvsM <- netClustering(cellchat_DvsM, type = "structural")
+netVisual_embeddingPairwise(cellchat_DvsM, type = "structural", label.size = 3.5)
+```
+
+
+### Compare Specific L-R Pairs
+
+```{r}
+#| label: compare-lr-bubble-MvsN
+#| eval: false
+
+# === Model vs Normal ===
+# sources.use / targets.use 用细胞类型索引，参考 levels(cellchat_list[[1]]@idents)
+netVisual_bubble(cellchat_MvsN,
+                 sources.use = 1,
+                 targets.use = c(2:5),
+                 comparison = c(1, 2),
+                 angle.x = 45)
+```
+
+```{r}
+#| label: compare-lr-bubble-DvsM
+#| eval: false
+
+# === QR056251 vs Model ===
+netVisual_bubble(cellchat_DvsM,
+                 sources.use = 1,
+                 targets.use = c(2:5),
+                 comparison = c(1, 2),
+                 angle.x = 45)
+```
+
+
+### Export L-R Pair Results
+
+导出配体-受体对水平的通讯结果表，方便后续筛选特定互作和写文章引用。
+
+```{r}
+#| label: export-lr-results
+#| eval: false
+
+# 导出每个条件下的 L-R pair 通讯结果
+for (nm in names(cellchat_list)) {
+  df_lr <- subsetCommunication(cellchat_list[[nm]])
+  write.csv(df_lr,
+            paste0("Results/cellchat_LR_", nm, ".csv"),
+            row.names = FALSE)
+  cat(nm, ":", nrow(df_lr), "L-R pairs exported.\n")
+}
+
+# 也可以指定特定通路或细胞类型导出
+# subsetCommunication(cellchat_list[["Model"]], signaling = "TGFb")
+# subsetCommunication(cellchat_list[["Model"]], sources.use = "Macrophages")
+```
+
+
+## Part III: Replicate-Aware Analysis {#part-iii}
+
+::: {.callout-tip}
+## 何时使用 Replicate-Aware 分析？
+
+**适用场景：**
+
+- 每个条件有 ≥3 个生物学重复
+- 需要在 replicate 水平做统计推断，而非仅描述性比较
+- 审稿人要求考虑样本间变异
+
+**思路：** 对每个样本（`orig.ident`）单独运行 CellChat（类似 Part I），提取每个样本中各信号通路的通讯概率，再按条件分组进行统计检验。
+:::
+
+
+### Build CellChat per Sample
+
+```{r}
+#| label: build-per-sample
+#| eval: false
+
+samples <- unique(seurat_obj$orig.ident)
+cellchat_per_sample <- list()
+
+for (smp in samples) {
+  seurat_smp <- subset(seurat_obj, orig.ident == smp)
+
+  # 移除细胞数过少的类型
+  cell_counts <- table(seurat_smp$cell_type)
+  keep_types <- names(cell_counts[cell_counts >= 10])
+
+  if (length(keep_types) < 2) {
+    message("Skipped ", smp, ": fewer than 2 cell types with >=10 cells")
+    next
+  }
+
+  seurat_smp <- subset(seurat_smp, cell_type %in% keep_types)
+
+  cc <- createCellChat(object = seurat_smp,
+                       group.by = "cell_type",
+                       assay = "RNA")
+
+  CellChatDB <- CellChatDB.mouse
+  cc@DB <- subsetDB(CellChatDB)
+
+  cc <- subsetData(cc)
+  cc <- identifyOverExpressedGenes(cc)
+  cc <- identifyOverExpressedInteractions(cc)
+  cc <- computeCommunProb(cc, type = "triMean")
+  cc <- filterCommunication(cc, min.cells = 10)
+  cc <- computeCommunProbPathway(cc)
+  cc <- aggregateNet(cc)
+
+  cellchat_per_sample[[smp]] <- cc
+  cat(smp, "done.\n")
+}
+```
+
+
+### Extract Pathway-Level Communication Probability
+
+从每个样本的 CellChat 对象中提取各信号通路的总通讯概率，整理为一个长表。
+
+```{r}
+#| label: extract-pathway-prob
+#| eval: false
+
+# 构建样本-条件映射表
+sample_meta <- seurat_obj@meta.data |>
+  dplyr::distinct(orig.ident, group)
+
+pathway_prob_list <- list()
+
+for (smp in names(cellchat_per_sample)) {
+  cc <- cellchat_per_sample[[smp]]
+  # netP$prob: array [source, target, pathway]
+  prob_array <- cc@netP$prob
+
+  if (is.null(prob_array)) next
+
+  # 对每个通路，汇总所有 source-target 对的通讯概率
+  pathway_names <- dimnames(prob_array)[[3]]
+  total_prob <- sapply(pathway_names, function(pw) sum(prob_array[, , pw]))
+
+  pathway_prob_list[[smp]] <- data.frame(
+    sample = smp,
+    pathway = pathway_names,
+    prob = total_prob,
+    row.names = NULL
+  )
+}
+
+pathway_prob_df <- dplyr::bind_rows(pathway_prob_list) |>
+  dplyr::left_join(sample_meta, by = c("sample" = "orig.ident"))
+
+head(pathway_prob_df)
+```
+
+
+### Statistical Test (Replicate-Level)
+
+对每个信号通路，比较两个条件间的通讯概率是否存在显著差异。
+
+```{r}
+#| label: replicate-stat-test
+#| eval: false
+
+# 定义比较组（根据实际条件修改）
+group1 <- "Normal"
+group2 <- "Model"
+
+# 筛选两组的数据
+df_compare <- pathway_prob_df |>
+  dplyr::filter(group %in% c(group1, group2))
+
+# 对每个通路进行 Wilcoxon 检验
+stat_results <- df_compare |>
+  dplyr::group_by(pathway) |>
+  dplyr::summarise(
+    mean_g1 = mean(prob[group == group1]),
+    mean_g2 = mean(prob[group == group2]),
+    log2FC = log2((mean_g2 + 1e-10) / (mean_g1 + 1e-10)),
+    n_g1 = sum(group == group1),
+    n_g2 = sum(group == group2),
+    p_value = tryCatch(
+      wilcox.test(prob[group == group1], prob[group == group2])$p.value,
+      error = function(e) NA_real_
+    ),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(p_adj = p.adjust(p_value, method = "BH")) |>
+  dplyr::arrange(p_adj)
+
+head(stat_results, 20)
+```
+
+
+### Visualization: Replicate-Level Pathway Comparison
+
+```{r}
+#| label: plot-replicate-comparison
+#| eval: false
+
+# 选择 top 差异通路可视化
+top_pathways <- stat_results |>
+  dplyr::filter(!is.na(p_adj)) |>
+  dplyr::slice_min(p_adj, n = 20) |>
+  dplyr::pull(pathway)
+
+df_plot <- df_compare |>
+  dplyr::filter(pathway %in% top_pathways) |>
+  dplyr::mutate(pathway = factor(pathway, levels = rev(top_pathways)))
+
+ggplot(df_plot, aes(x = pathway, y = prob, fill = group)) +
+  geom_boxplot(outlier.size = 0.5, width = 0.6) +
+  geom_jitter(aes(color = group), width = 0.15, size = 1, alpha = 0.7) +
+  coord_flip() +
+  labs(x = NULL, y = "Total communication probability",
+       title = paste0("Replicate-level comparison: ", group2, " vs ", group1)) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "top")
+```
+
+
+### Save Replicate-Aware Results
+
+```{r}
+#| label: save-replicate
+#| eval: false
+
+qs2::qs_save(cellchat_per_sample, "datasets/cellchat_per_sample.qs2")
+write.csv(stat_results, "Results/cellchat_replicate_stat.csv", row.names = FALSE)
+```
+
+
+## Save Results
+
+```{r}
+#| label: save-all
+#| eval: false
+
+# 保存所有结果
+qs2::qs_save(cellchat_list, "datasets/cellchat_list.qs2")
+qs2::qs_save(cellchat_MvsN, "datasets/cellchat_MvsN.qs2")
+qs2::qs_save(cellchat_DvsM, "datasets/cellchat_DvsM.qs2")
+```
+
+
+## Session Info
+
+```{r}
+#| label: session-info
+
+sessionInfo()
+```
