@@ -470,6 +470,9 @@ for (cond in conditions) {
   keep_types <- names(cell_counts[cell_counts >= 10])
   seurat_cond <- subset(seurat_cond, cell_type %in% keep_types)
 
+  # CellChat v2 需要 samples 列标识生物学重复，避免 warning
+  seurat_cond$samples <- seurat_cond$orig.ident
+
   cc <- createCellChat(object = seurat_cond,
                        group.by = "cell_type",
                        assay = "RNA")
@@ -930,6 +933,294 @@ for (nm in names(cellchat_list)) {
 # 也可以指定特定通路或细胞类型导出
 # subsetCommunication(cellchat_list[["Model"]], signaling = "TGFb")
 # subsetCommunication(cellchat_list[["Model"]], sources.use = "Macrophages")
+```
+
+
+### Identify Drug-Reversed Communications
+
+系统性地筛选被药物逆转的 L-R pair：Model 相对 Normal 上调（疾病相关），且 QR056251 相对 Model 下调（被药物抑制）。
+
+```{r}
+#| label: drug-reversed-lr
+#| eval: false
+
+# 提取三个条件的 L-R pair 通讯结果
+lr_list <- lapply(cellchat_list, subsetCommunication)
+
+# 构建统一的 key: source-target-ligand-receptor-pathway
+make_key <- function(df) {
+  paste(df$source, df$target, df$ligand, df$receptor, df$pathway_name, sep = "|")
+}
+
+for (nm in names(lr_list)) {
+  lr_list[[nm]]$key <- make_key(lr_list[[nm]])
+}
+
+# 合并三个条件的通讯概率
+lr_merged <- lr_list[["Normal"]] |>
+  dplyr::select(key, source, target, ligand, receptor, pathway_name,
+                prob_Normal = prob) |>
+  dplyr::full_join(
+    lr_list[["Model"]] |> dplyr::select(key, prob_Model = prob),
+    by = "key"
+  ) |>
+  dplyr::full_join(
+    lr_list[["QR056251"]] |> dplyr::select(key, prob_QR056251 = prob),
+    by = "key"
+  )
+
+# 补充 full_join 后缺失的注释信息（来自 Model 或 QR056251）
+for (col in c("source", "target", "ligand", "receptor", "pathway_name")) {
+  lr_merged[[col]] <- dplyr::coalesce(
+    lr_merged[[col]],
+    lr_list[["Model"]][[col]][match(lr_merged$key, lr_list[["Model"]]$key)],
+    lr_list[["QR056251"]][[col]][match(lr_merged$key, lr_list[["QR056251"]]$key)]
+  )
+}
+
+# 缺失值填 0（该条件下无此通讯）
+lr_merged <- lr_merged |>
+  dplyr::mutate(
+    prob_Normal = tidyr::replace_na(prob_Normal, 0),
+    prob_Model = tidyr::replace_na(prob_Model, 0),
+    prob_QR056251 = tidyr::replace_na(prob_QR056251, 0)
+  )
+
+# 筛选：Model 上调（疾病相关）且 QR056251 下调（药物逆转）
+drug_reversed <- lr_merged |>
+  dplyr::filter(
+    prob_Model > prob_Normal,     # 疾病中上调
+    prob_QR056251 < prob_Model    # 药物处理后下调
+  ) |>
+  dplyr::mutate(
+    fc_disease = prob_Model / (prob_Normal + 1e-10),
+    fc_drug = prob_QR056251 / (prob_Model + 1e-10)
+  ) |>
+  dplyr::arrange(fc_drug, desc(fc_disease)) |>
+  dplyr::select(source, target, ligand, receptor, pathway_name,
+                prob_Normal, prob_Model, prob_QR056251, fc_disease, fc_drug)
+
+cat("Drug-reversed L-R pairs:", nrow(drug_reversed), "\n")
+head(drug_reversed, 20)
+
+write.csv(drug_reversed, "Results/cellchat_drug_reversed_LR.csv", row.names = FALSE)
+```
+
+
+#### Visualize Top Drug-Reversed Pathways
+
+汇总到通路水平，查看哪些通路被药物逆转的 L-R pair 最多。
+
+```{r}
+#| label: drug-reversed-summary
+#| eval: false
+
+# 按通路汇总
+pathway_summary <- drug_reversed |>
+  dplyr::group_by(pathway_name) |>
+  dplyr::summarise(
+    n_LR_pairs = dplyr::n(),
+    mean_prob_Normal = mean(prob_Normal),
+    mean_prob_Model = mean(prob_Model),
+    mean_prob_QR056251 = mean(prob_QR056251),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(desc(n_LR_pairs))
+
+# 按 sender-receiver 汇总
+cell_summary <- drug_reversed |>
+  dplyr::group_by(source, target) |>
+  dplyr::summarise(
+    n_LR_pairs = dplyr::n(),
+    pathways = paste(unique(pathway_name), collapse = ", "),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(desc(n_LR_pairs))
+
+head(pathway_summary, 15)
+head(cell_summary, 15)
+
+write.csv(pathway_summary, "Results/cellchat_drug_reversed_pathway_summary.csv", row.names = FALSE)
+write.csv(cell_summary, "Results/cellchat_drug_reversed_cell_summary.csv", row.names = FALSE)
+```
+
+
+```{r}
+#| label: plot-drug-reversed
+#| eval: false
+
+# Top 15 被药物逆转的通路
+top_pw <- pathway_summary |> dplyr::slice_head(n = 15)
+
+# 转为长格式绘图
+top_pw_long <- top_pw |>
+  tidyr::pivot_longer(
+    cols = starts_with("mean_prob_"),
+    names_to = "condition",
+    values_to = "mean_prob",
+    names_prefix = "mean_prob_"
+  ) |>
+  dplyr::mutate(condition = factor(condition, levels = c("Normal", "Model", "QR056251")))
+
+# 按 Model 的概率值排序（疾病中最活跃的通路排在上面）
+pw_order <- top_pw |> dplyr::arrange(mean_prob_Model) |> dplyr::pull(pathway_name)
+top_pw_long <- top_pw_long |>
+  dplyr::mutate(pathway_name = factor(pathway_name, levels = pw_order))
+
+ggplot(top_pw_long, aes(x = pathway_name, y = mean_prob, fill = condition)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  scale_fill_manual(values = c("Normal" = "#4393C3", "Model" = "#D6604D", "QR056251" = "#5AAE61")) +
+  coord_flip() +
+  labs(x = NULL, y = "Mean communication probability",
+       title = "Top drug-reversed signaling pathways") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "top")
+```
+
+
+#### Drug-Specific Communications
+
+药物可能不只是逆转疾病通讯，还可能激活新的保护性通讯（Normal 和 Model 都没有，QR056251 特有）。
+
+```{r}
+#| label: drug-specific-lr
+#| eval: false
+
+drug_specific <- lr_merged |>
+  dplyr::filter(prob_Normal == 0, prob_Model == 0, prob_QR056251 > 0) |>
+  dplyr::arrange(desc(prob_QR056251)) |>
+  dplyr::select(source, target, ligand, receptor, pathway_name,
+                prob_Normal, prob_Model, prob_QR056251)
+
+cat("Drug-specific L-R pairs:", nrow(drug_specific), "\n")
+head(drug_specific, 20)
+
+write.csv(drug_specific, "Results/cellchat_drug_specific_LR.csv", row.names = FALSE)
+```
+
+
+#### Disease-Only Communications
+
+Normal 和 QR056251 都没有，只在 Model 中出现——被药物完全消除的致病通讯。
+
+```{r}
+#| label: disease-only-lr
+#| eval: false
+
+disease_only <- lr_merged |>
+  dplyr::filter(prob_Normal == 0, prob_Model > 0, prob_QR056251 == 0) |>
+  dplyr::arrange(desc(prob_Model)) |>
+  dplyr::select(source, target, ligand, receptor, pathway_name,
+                prob_Normal, prob_Model, prob_QR056251)
+
+cat("Disease-only L-R pairs:", nrow(disease_only), "\n")
+head(disease_only, 20)
+
+write.csv(disease_only, "Results/cellchat_disease_only_LR.csv", row.names = FALSE)
+```
+
+
+#### Cell-Centric Communication Changes
+
+聚焦某个关键细胞类型，查看它作为 sender 时所有通路在三个条件间的变化。
+
+```{r}
+#| label: cell-centric-lr
+#| eval: false
+
+# 修改 cell_of_interest 为感兴趣的细胞类型
+cell_of_interest <- "Pro-fibrotic Macrophages"
+
+# 该细胞作为 sender 的通讯变化
+sender_changes <- lr_merged |>
+  dplyr::filter(source == cell_of_interest) |>
+  dplyr::mutate(
+    disease_change = prob_Model - prob_Normal,
+    drug_change = prob_QR056251 - prob_Model
+  ) |>
+  dplyr::arrange(drug_change) |>
+  dplyr::select(source, target, ligand, receptor, pathway_name,
+                prob_Normal, prob_Model, prob_QR056251, disease_change, drug_change)
+
+cat(cell_of_interest, "as sender - top drug-suppressed:\n")
+head(sender_changes, 15)
+
+# 该细胞作为 receiver 的通讯变化
+receiver_changes <- lr_merged |>
+  dplyr::filter(target == cell_of_interest) |>
+  dplyr::mutate(
+    disease_change = prob_Model - prob_Normal,
+    drug_change = prob_QR056251 - prob_Model
+  ) |>
+  dplyr::arrange(drug_change) |>
+  dplyr::select(source, target, ligand, receptor, pathway_name,
+                prob_Normal, prob_Model, prob_QR056251, disease_change, drug_change)
+
+cat(cell_of_interest, "as receiver - top drug-suppressed:\n")
+head(receiver_changes, 15)
+
+write.csv(sender_changes,
+          paste0("Results/cellchat_", gsub(" ", "_", cell_of_interest), "_sender.csv"),
+          row.names = FALSE)
+write.csv(receiver_changes,
+          paste0("Results/cellchat_", gsub(" ", "_", cell_of_interest), "_receiver.csv"),
+          row.names = FALSE)
+```
+
+
+#### Communication Network Remodeling
+
+从 sender-receiver 对的角度，查看药物对整体通讯网络的重塑效果。
+
+```{r}
+#| label: network-remodeling
+#| eval: false
+
+cell_pair_flow <- lr_merged |>
+  dplyr::group_by(source, target) |>
+  dplyr::summarise(
+    n_LR = dplyr::n(),
+    total_Normal = sum(prob_Normal),
+    total_Model = sum(prob_Model),
+    total_QR056251 = sum(prob_QR056251),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    disease_change = total_Model - total_Normal,
+    drug_change = total_QR056251 - total_Model
+  )
+
+# 药物抑制最强的细胞对（drug_change 最负）
+cat("Top drug-suppressed cell pairs:\n")
+cell_pair_flow |> dplyr::arrange(drug_change) |> head(15)
+
+# 药物增强最强的细胞对（drug_change 最正）
+cat("\nTop drug-enhanced cell pairs:\n")
+cell_pair_flow |> dplyr::arrange(desc(drug_change)) |> head(15)
+
+write.csv(cell_pair_flow, "Results/cellchat_network_remodeling.csv", row.names = FALSE)
+```
+
+
+```{r}
+#| label: plot-network-remodeling
+#| eval: false
+
+# 可视化：药物对 sender-receiver 通讯强度的改变
+top_pairs <- cell_pair_flow |>
+  dplyr::mutate(abs_drug_change = abs(drug_change)) |>
+  dplyr::slice_max(abs_drug_change, n = 20) |>
+  dplyr::mutate(pair = paste0(source, " → ", target),
+                direction = ifelse(drug_change > 0, "Enhanced", "Suppressed"))
+
+ggplot(top_pairs, aes(x = reorder(pair, drug_change), y = drug_change, fill = direction)) +
+  geom_col() +
+  scale_fill_manual(values = c("Suppressed" = "#D6604D", "Enhanced" = "#4393C3")) +
+  coord_flip() +
+  labs(x = NULL, y = "Drug-induced change in communication strength\n(QR056251 - Model)",
+       title = "Top 20 remodeled cell-cell communication pairs") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "top")
 ```
 
 
