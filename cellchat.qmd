@@ -1224,6 +1224,230 @@ ggplot(top_pairs, aes(x = reorder(pair, drug_change), y = drug_change, fill = di
 ```
 
 
+#### Drug Recovery Assessment
+
+评估药物将通讯"恢复"到 Normal 水平的程度。Recovery Index = 1 表示完全恢复，>1 过度抑制，0-1 部分恢复，<0 反向加剧。
+
+```{r}
+#| label: recovery-index
+#| eval: false
+
+recovery <- lr_merged |>
+  dplyr::filter(prob_Model != prob_Normal) |>
+  dplyr::mutate(
+    recovery_index = (prob_Model - prob_QR056251) / (prob_Model - prob_Normal),
+    recovery_category = dplyr::case_when(
+      recovery_index > 1.2 ~ "Over-corrected",
+      recovery_index >= 0.8 & recovery_index <= 1.2 ~ "Fully restored",
+      recovery_index > 0 & recovery_index < 0.8 ~ "Partially restored",
+      recovery_index <= 0 ~ "Not restored / Worsened"
+    )
+  )
+
+# 各类别的 L-R pair 数量
+table(recovery$recovery_category)
+
+# 按通路汇总恢复情况
+recovery_by_pathway <- recovery |>
+  dplyr::group_by(pathway_name) |>
+  dplyr::summarise(
+    n_LR = dplyr::n(),
+    mean_recovery = mean(recovery_index, na.rm = TRUE),
+    n_fully = sum(recovery_category == "Fully restored"),
+    n_partial = sum(recovery_category == "Partially restored"),
+    n_over = sum(recovery_category == "Over-corrected"),
+    n_worse = sum(recovery_category == "Not restored / Worsened"),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(desc(n_fully))
+
+head(recovery_by_pathway, 20)
+write.csv(recovery_by_pathway, "Results/cellchat_recovery_by_pathway.csv", row.names = FALSE)
+```
+
+
+```{r}
+#| label: plot-recovery
+#| eval: false
+
+# 饼图/柱状图展示整体恢复情况
+recovery_counts <- as.data.frame(table(recovery$recovery_category))
+colnames(recovery_counts) <- c("Category", "Count")
+recovery_counts$Pct <- round(recovery_counts$Count / sum(recovery_counts$Count) * 100, 1)
+
+ggplot(recovery_counts, aes(x = "", y = Count, fill = Category)) +
+  geom_col(width = 1) +
+  coord_polar("y") +
+  scale_fill_manual(values = c(
+    "Fully restored" = "#5AAE61",
+    "Partially restored" = "#FDB863",
+    "Over-corrected" = "#4393C3",
+    "Not restored / Worsened" = "#D6604D"
+  )) +
+  labs(title = "Drug recovery of cell-cell communications",
+       fill = NULL) +
+  theme_void(base_size = 12) +
+  geom_text(aes(label = paste0(Pct, "%")),
+            position = position_stack(vjust = 0.5), size = 4)
+```
+
+
+#### Communication Hub Identification
+
+鉴定药物作用下通讯变化最大的细胞类型——即药物的核心靶细胞。
+
+```{r}
+#| label: hub-cells
+#| eval: false
+
+# 每个细胞类型作为 sender 和 receiver 的总药物效应
+hub_sender <- lr_merged |>
+  dplyr::group_by(cell = source) |>
+  dplyr::summarise(
+    outgoing_change = sum(prob_QR056251 - prob_Model),
+    n_out = dplyr::n(),
+    .groups = "drop"
+  )
+
+hub_receiver <- lr_merged |>
+  dplyr::group_by(cell = target) |>
+  dplyr::summarise(
+    incoming_change = sum(prob_QR056251 - prob_Model),
+    n_in = dplyr::n(),
+    .groups = "drop"
+  )
+
+hub_score <- dplyr::full_join(hub_sender, hub_receiver, by = "cell") |>
+  dplyr::mutate(
+    total_change = dplyr::coalesce(outgoing_change, 0) + dplyr::coalesce(incoming_change, 0),
+    abs_total = abs(total_change)
+  ) |>
+  dplyr::arrange(desc(abs_total))
+
+hub_score
+write.csv(hub_score, "Results/cellchat_hub_cells.csv", row.names = FALSE)
+```
+
+
+```{r}
+#| label: plot-hub-cells
+#| eval: false
+
+ggplot(hub_score, aes(x = outgoing_change, y = incoming_change)) +
+  geom_point(aes(size = abs_total), alpha = 0.7) +
+  ggrepel::geom_text_repel(aes(label = cell), size = 3.5, max.overlaps = 20) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_size_continuous(range = c(2, 10), guide = "none") +
+  labs(x = "Drug effect on outgoing signals\n(QR056251 - Model)",
+       y = "Drug effect on incoming signals\n(QR056251 - Model)",
+       title = "Communication hub analysis: drug impact per cell type") +
+  theme_bw(base_size = 12)
+```
+
+
+#### Pathway Crosstalk
+
+同一个 sender→receiver 对之间有多个通路同时被药物逆转，提示这些通路可能协同作用。
+
+```{r}
+#| label: pathway-crosstalk
+#| eval: false
+
+crosstalk <- drug_reversed |>
+  dplyr::group_by(source, target) |>
+  dplyr::summarise(
+    pathways = paste(unique(pathway_name), collapse = ", "),
+    n_pathways = dplyr::n_distinct(pathway_name),
+    n_LR_pairs = dplyr::n(),
+    .groups = "drop"
+  ) |>
+  dplyr::filter(n_pathways >= 2) |>
+  dplyr::arrange(desc(n_pathways))
+
+head(crosstalk, 20)
+write.csv(crosstalk, "Results/cellchat_pathway_crosstalk.csv", row.names = FALSE)
+```
+
+
+#### Key Ligand & Receptor Genes
+
+统计在被药物逆转的通讯中反复出现的配体和受体基因，提示药物的潜在分子靶点。
+
+```{r}
+#| label: key-lr-genes
+#| eval: false
+
+top_ligands <- drug_reversed |>
+  dplyr::count(ligand, sort = TRUE) |>
+  dplyr::rename(n_reversed_interactions = n)
+
+top_receptors <- drug_reversed |>
+  dplyr::count(receptor, sort = TRUE) |>
+  dplyr::rename(n_reversed_interactions = n)
+
+cat("Top 15 ligands in drug-reversed communications:\n")
+head(top_ligands, 15)
+
+cat("\nTop 15 receptors in drug-reversed communications:\n")
+head(top_receptors, 15)
+
+write.csv(top_ligands, "Results/cellchat_top_ligands.csv", row.names = FALSE)
+write.csv(top_receptors, "Results/cellchat_top_receptors.csv", row.names = FALSE)
+```
+
+
+```{r}
+#| label: plot-key-genes
+#| eval: false
+
+p_lig <- ggplot(head(top_ligands, 15),
+                aes(x = reorder(ligand, n_reversed_interactions),
+                    y = n_reversed_interactions)) +
+  geom_col(fill = "#D6604D") +
+  coord_flip() +
+  labs(x = NULL, y = "Count", title = "Top ligands in drug-reversed communications") +
+  theme_bw(base_size = 12)
+
+p_rec <- ggplot(head(top_receptors, 15),
+                aes(x = reorder(receptor, n_reversed_interactions),
+                    y = n_reversed_interactions)) +
+  geom_col(fill = "#4393C3") +
+  coord_flip() +
+  labs(x = NULL, y = "Count", title = "Top receptors in drug-reversed communications") +
+  theme_bw(base_size = 12)
+
+p_lig + p_rec
+```
+
+
+#### Autocrine vs Paracrine Drug Effect
+
+药物主要影响的是自分泌（autocrine）还是旁分泌（paracrine）通讯？
+
+```{r}
+#| label: auto-vs-para
+#| eval: false
+
+auto_para <- lr_merged |>
+  dplyr::mutate(
+    comm_type = ifelse(source == target, "Autocrine", "Paracrine"),
+    drug_change = prob_QR056251 - prob_Model
+  ) |>
+  dplyr::group_by(comm_type) |>
+  dplyr::summarise(
+    n_total = dplyr::n(),
+    mean_drug_change = mean(drug_change),
+    n_reversed = sum(prob_Model > prob_Normal & prob_QR056251 < prob_Model),
+    n_enhanced = sum(prob_QR056251 > prob_Model),
+    pct_reversed = round(n_reversed / n_total * 100, 1),
+    .groups = "drop"
+  )
+
+auto_para
+```
+
+
 ## Part III: Replicate-Aware Analysis {#part-iii}
 
 ::: {.callout-tip}
