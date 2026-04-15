@@ -834,6 +834,148 @@ gg1 + gg2
 ```
 
 
+### Pathway-Specific Sender/Receiver Identification
+
+用上面 `rankNet()` 筛出的差异通路（如 FN1），进一步跨三组识别 **信号发出方 (sender)** 与 **信号接收方 (receiver)**。
+相比 `netVisual_heatmap`（三组 legend 各自归一化，难直接对比），下面三种方式更合理。
+
+#### 方式 A：`netAnalysis_signalingRole_heatmap`（官方推荐角色识别）
+
+```{r}
+#| label: pathway-role-heatmap
+#| eval: false
+#| fig-width: 14
+#| fig-height: 5
+
+pathway_of_interest <- "FN1"   # 替换为 rankNet 筛出的目标通路
+
+# Outgoing：谁在发出该通路信号
+ht_out <- lapply(names(cellchat_list), function(nm) {
+  netAnalysis_signalingRole_heatmap(
+    cellchat_list[[nm]], signaling = pathway_of_interest,
+    pattern = "outgoing", title = paste(nm, "- outgoing"),
+    color.heatmap = "Reds")
+})
+ComplexHeatmap::draw(ht_out[[1]] + ht_out[[2]] + ht_out[[3]],
+                     ht_gap = unit(0.5, "cm"))
+
+# Incoming：谁在接收该通路信号
+ht_in <- lapply(names(cellchat_list), function(nm) {
+  netAnalysis_signalingRole_heatmap(
+    cellchat_list[[nm]], signaling = pathway_of_interest,
+    pattern = "incoming", title = paste(nm, "- incoming"),
+    color.heatmap = "GnBu")
+})
+ComplexHeatmap::draw(ht_in[[1]] + ht_in[[2]] + ht_in[[3]],
+                     ht_gap = unit(0.5, "cm"))
+```
+
+#### 方式 B：自画统一 color scale 的 sender×receiver heatmap
+
+直接从 `netP$prob` 提取矩阵，三组使用**同一色阶**，可严格对比通讯强度。
+
+```{r}
+#| label: pathway-unified-heatmap
+#| eval: false
+#| fig-width: 15
+#| fig-height: 5
+
+library(ComplexHeatmap)
+library(circlize)
+
+pathway_of_interest <- "FN1"
+
+mats <- lapply(cellchat_list, function(x) {
+  if (pathway_of_interest %in% dimnames(x@netP$prob)[[3]]) {
+    x@netP$prob[, , pathway_of_interest]
+  } else {
+    matrix(0, nrow = nrow(x@netP$prob), ncol = ncol(x@netP$prob),
+           dimnames = dimnames(x@netP$prob)[1:2])
+  }
+})
+
+max_val <- max(sapply(mats, max))
+col_fun <- colorRamp2(c(0, max_val), c("white", "firebrick"))
+
+hts <- lapply(names(mats), function(nm) {
+  Heatmap(mats[[nm]], name = "prob", col = col_fun,
+          cluster_rows = FALSE, cluster_columns = FALSE,
+          column_title = paste(nm, "-", pathway_of_interest),
+          row_title = "Sender", column_title_side = "top",
+          row_names_side = "left",
+          column_names_rot = 45,
+          row_names_gp = gpar(fontsize = 9),
+          column_names_gp = gpar(fontsize = 9))
+})
+draw(hts[[1]] + hts[[2]] + hts[[3]], merge_legend = TRUE)
+```
+
+#### 方式 C：统一 Y 轴的 sender / receiver barplot（最直观对比）
+
+按 sender（outgoing = rowSums）与 receiver（incoming = colSums）分别汇总，
+三组共用同一 Y 轴，可直接比较哪类细胞在某通路中是主要发送/接收方、药物后是否变化。
+
+```{r}
+#| label: pathway-role-barplot
+#| eval: false
+#| fig-width: 12
+#| fig-height: 5
+
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(patchwork)
+
+pathway_of_interest <- "FN1"
+
+role_df <- map_dfr(names(cellchat_list), function(nm) {
+  cc <- cellchat_list[[nm]]
+  if (!pathway_of_interest %in% dimnames(cc@netP$prob)[[3]]) return(NULL)
+  m <- cc@netP$prob[, , pathway_of_interest]
+  tibble(
+    cell = rownames(m),
+    outgoing = rowSums(m),
+    incoming = colSums(m),
+    condition = nm
+  )
+}) |>
+  mutate(condition = factor(condition,
+                            levels = c("Normal", "Model", "QR056251")))
+
+p_out <- ggplot(role_df, aes(cell, outgoing, fill = condition)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  labs(title = paste(pathway_of_interest, "- Outgoing (Sender)"),
+       x = NULL, y = "Communication prob (sum)") +
+  theme_bw()
+
+p_in <- ggplot(role_df, aes(cell, incoming, fill = condition)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  labs(title = paste(pathway_of_interest, "- Incoming (Receiver)"),
+       x = NULL, y = "Communication prob (sum)") +
+  theme_bw()
+
+p_out + p_in
+```
+
+
+#### 方式 D：merged bubble plot（跨组定量对比）
+
+```{r}
+#| label: pathway-bubble-merged
+#| eval: false
+#| fig-width: 10
+#| fig-height: 7
+
+netVisual_bubble(cellchat_merged,
+                 signaling = pathway_of_interest,
+                 comparison = seq_along(cellchat_list),
+                 remove.isolate = TRUE,
+                 title.name = paste(pathway_of_interest, "- merged"))
+```
+
+
 ### Outgoing/Incoming Signal Comparison
 
 ```{r}
@@ -841,8 +983,30 @@ gg1 + gg2
 #| eval: false
 
 # 并排比较三个条件的 sender/receiver 角色
+# 注意：函数默认按各自对象独立 scale，三组 X/Y 轴不一致，视觉易误判
+# 下面先算跨组全局 max，再统一 xlim/ylim
+
+# 计算每组 outgoing (X) / incoming (Y) 的上限
+lims <- sapply(cellchat_list, function(x) {
+  centr <- x@netP$centr
+  out <- sum(sapply(centr, function(s) s$outdeg))
+  inc <- sum(sapply(centr, function(s) s$indeg))
+  c(max_out = max(sapply(centr, function(s) s$outdeg)),
+    max_in  = max(sapply(centr, function(s) s$indeg)))
+})
+# 但 scatter 显示的是每个细胞类型各通路求和后的 strength，直接从 net 计算更稳
+get_lims <- function(cc) {
+  out_str <- rowSums(cc@net$weight)   # sender strength
+  in_str  <- colSums(cc@net$weight)   # receiver strength
+  c(max(out_str), max(in_str))
+}
+global <- sapply(cellchat_list, get_lims)
+x_max <- max(global[1, ]) * 1.05
+y_max <- max(global[2, ]) * 1.05
+
 plots <- lapply(names(cellchat_list), function(nm) {
-  netAnalysis_signalingRole_scatter(cellchat_list[[nm]], title = nm)
+  netAnalysis_signalingRole_scatter(cellchat_list[[nm]], title = nm) +
+    xlim(0, x_max) + ylim(0, y_max)
 })
 wrap_plots(plots, ncol = 3)
 ```
@@ -1300,11 +1464,11 @@ ggplot(recovery_counts, aes(x = "", y = Count, fill = Category)) +
 #| label: hub-cells
 #| eval: false
 
-# 每个细胞类型作为 sender 和 receiver 的总药物效应
+# 每个细胞类型作为 sender 和 receiver 的平均药物效应（消除 L-R pair 数量的影响）
 hub_sender <- lr_merged |>
   dplyr::group_by(cell = source) |>
   dplyr::summarise(
-    outgoing_change = sum(prob_QR056251 - prob_Model),
+    outgoing_change = mean(prob_QR056251 - prob_Model),
     n_out = dplyr::n(),
     .groups = "drop"
   )
@@ -1312,7 +1476,7 @@ hub_sender <- lr_merged |>
 hub_receiver <- lr_merged |>
   dplyr::group_by(cell = target) |>
   dplyr::summarise(
-    incoming_change = sum(prob_QR056251 - prob_Model),
+    incoming_change = mean(prob_QR056251 - prob_Model),
     n_in = dplyr::n(),
     .groups = "drop"
   )
@@ -1339,8 +1503,8 @@ ggplot(hub_score, aes(x = outgoing_change, y = incoming_change)) +
   geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
   geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
   scale_size_continuous(range = c(2, 10), guide = "none") +
-  labs(x = "Drug effect on outgoing signals\n(QR056251 - Model)",
-       y = "Drug effect on incoming signals\n(QR056251 - Model)",
+  labs(x = "Mean drug effect on outgoing signals\n(QR056251 - Model)",
+       y = "Mean drug effect on incoming signals\n(QR056251 - Model)",
        title = "Communication hub analysis: drug impact per cell type") +
   theme_bw(base_size = 12)
 ```
