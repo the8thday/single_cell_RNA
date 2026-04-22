@@ -483,6 +483,11 @@ for (cond in conditions) {
   cc <- subsetData(cc)
   cc <- identifyOverExpressedGenes(cc)
   cc <- identifyOverExpressedInteractions(cc)
+
+  # 不使用 smoothData（与 Part I 保持一致）
+  # 若启用需在 Part I/II/III 同时启用，否则结果不可比
+  # cc <- smoothData(cc, adj = PPI.mouse)
+
   cc <- computeCommunProb(cc, type = "triMean")
   cc <- filterCommunication(cc, min.cells = 10)
   cc <- computeCommunProbPathway(cc)
@@ -1049,6 +1054,130 @@ netVisual_embeddingPairwise(cellchat_DvsM, type = "structural", label.size = 3.5
 ```
 
 
+#### Rank Pathway Remodeling (rankSimilarity)
+
+按两条件间的 embedding 距离排序通路，**距离越大 → 通路通讯模式被重塑越强**。
+可快速拿到"被疾病/药物重塑最强的 Top N 通路"。
+
+```{r}
+#| label: rank-similarity
+#| eval: false
+#| fig-width: 12
+#| fig-height: 6
+
+# 依赖前面已计算好的 functional similarity
+gg1 <- rankSimilarity(cellchat_MvsN, type = "functional") +
+  ggtitle("Pathway remodeling: Model vs Normal")
+gg2 <- rankSimilarity(cellchat_DvsM, type = "functional") +
+  ggtitle("Pathway remodeling: QR056251 vs Model")
+gg1 + gg2
+```
+
+
+#### Extract Up/Down-regulated Pathways (from rankNet)
+
+真正意义上的通路 up/down 筛选：基于 `rankNet(do.stat = TRUE)` 返回的 p 值和
+相对贡献，分离出显著上调 / 下调通路并导出 CSV。
+
+```{r}
+#| label: extract-up-down-pathways
+#| eval: false
+
+library(dplyr)
+
+# === Model vs Normal ===
+gg_mvn <- rankNet(cellchat_MvsN, mode = "comparison",
+                  comparison = c(1, 2), stacked = FALSE,
+                  do.stat = TRUE, return.data = TRUE)
+df_mvn <- gg_mvn$signaling.contribution
+
+# 先提取每个 pathway 的 p 值（两行中取第一个即可，它们相同）
+pvals_mvn <- df_mvn |>
+  group_by(name) |>
+  summarise(pvalues = first(pvalues), .groups = "drop")
+
+# 只保留 name/group/contribution 三列再 pivot，避免其他列阻止合并
+df_mvn_wide <- df_mvn |>
+  select(name, group, contribution) |>
+  tidyr::pivot_wider(names_from = group, values_from = contribution) |>
+  left_join(pvals_mvn, by = "name") |>
+  mutate(log2FC = log2((Model + 1e-6) / (Normal + 1e-6)))
+
+up_in_model   <- df_mvn_wide |> filter(pvalues < 0.05, log2FC > 0)  |> arrange(desc(log2FC))
+down_in_model <- df_mvn_wide |> filter(pvalues < 0.05, log2FC < 0)  |> arrange(log2FC)
+
+write.csv(up_in_model,   "Results/pathways_up_in_Model.csv",   row.names = FALSE)
+write.csv(down_in_model, "Results/pathways_down_in_Model.csv", row.names = FALSE)
+
+# === QR056251 vs Model ===
+gg_dvm <- rankNet(cellchat_DvsM, mode = "comparison",
+                  comparison = c(1, 2), stacked = FALSE,
+                  do.stat = TRUE, return.data = TRUE)
+df_dvm <- gg_dvm$signaling.contribution
+
+pvals_dvm <- df_dvm |>
+  group_by(name) |>
+  summarise(pvalues = first(pvalues), .groups = "drop")
+
+df_dvm_wide <- df_dvm |>
+  select(name, group, contribution) |>
+  tidyr::pivot_wider(names_from = group, values_from = contribution) |>
+  left_join(pvals_dvm, by = "name") |>
+  mutate(log2FC = log2((QR056251 + 1e-6) / (Model + 1e-6)))
+
+up_by_drug   <- df_dvm_wide |> filter(pvalues < 0.05, log2FC > 0) |> arrange(desc(log2FC))
+down_by_drug <- df_dvm_wide |> filter(pvalues < 0.05, log2FC < 0) |> arrange(log2FC)
+
+write.csv(up_by_drug,   "Results/pathways_up_by_QR056251.csv",   row.names = FALSE)
+write.csv(down_by_drug, "Results/pathways_down_by_QR056251.csv", row.names = FALSE)
+
+cat("Up in Model:",   nrow(up_in_model),   "| Down in Model:",   nrow(down_in_model),   "\n")
+cat("Up by Drug:",    nrow(up_by_drug),    "| Down by Drug:",    nrow(down_by_drug),    "\n")
+```
+
+
+#### Drug-Reversed Pathways (Triple-Condition Crosstalk)
+
+真正回答"药物纠正了哪些疾病通路"：
+**Model 中上调 且 QR056251 中下调** → 被药物逆转的病理通路
+**Model 中下调 且 QR056251 中上调** → 被药物恢复的生理通路
+
+```{r}
+#| label: drug-reversed-pathways
+#| eval: false
+#| fig-width: 8
+#| fig-height: 6
+
+library(dplyr)
+library(ggplot2)
+
+reversed_pathologic <- intersect(up_in_model$name, down_by_drug$name)
+restored_physiologic <- intersect(down_in_model$name, up_by_drug$name)
+
+cat("Drug-reversed pathologic pathways:", length(reversed_pathologic), "\n")
+print(reversed_pathologic)
+cat("\nDrug-restored physiologic pathways:", length(restored_physiologic), "\n")
+print(restored_physiologic)
+
+reversed_df <- bind_rows(
+  tibble(pathway = reversed_pathologic, category = "Reversed (Model↑ → Drug↓)"),
+  tibble(pathway = restored_physiologic, category = "Restored (Model↓ → Drug↑)")
+)
+write.csv(reversed_df, "Results/pathways_drug_reversed.csv", row.names = FALSE)
+
+# UpSet 图可视化三组筛选集合的交叉
+# install.packages("UpSetR")
+library(UpSetR)
+sets <- list(
+  Up_in_Model   = up_in_model$name,
+  Down_in_Model = down_in_model$name,
+  Up_by_Drug    = up_by_drug$name,
+  Down_by_Drug  = down_by_drug$name
+)
+upset(fromList(sets), order.by = "freq", nsets = 4)
+```
+
+
 ### Compare Specific L-R Pairs
 
 ```{r}
@@ -1585,6 +1714,107 @@ p_lig + p_rec
 ```
 
 
+#### Expression Validation of Drug-Reversed L-R Pairs
+
+**重要的可信度检查**：CellChat 推断的通讯变化应当由底层**配体/受体基因的实际表达变化**支持。
+这里用 Seurat `DotPlot` 直接可视化 top drug-reversed 配体/受体在 3 个条件下的表达，确认 CellChat 的结论不是统计噪音。
+
+```{r}
+#| label: expr-validation-drug-reversed
+#| eval: false
+#| fig-width: 14
+#| fig-height: 6
+
+library(Seurat)
+library(patchwork)
+
+# 取 top 10 反复出现的配体与受体基因（CellChat 基因名通常是大写或首字母大写）
+genes_lig <- head(top_ligands$ligand, 10)
+genes_rec <- head(top_receptors$receptor, 10)
+
+# 过滤一下：有些 receptor 是 complex（如 ITGA5_ITGB1），需拆开
+split_complex <- function(x) unique(unlist(strsplit(x, "_")))
+genes_rec <- split_complex(genes_rec)
+
+# 把 condition 作为 split.by 一起展示
+DefaultAssay(seurat_obj) <- "RNA"  # 一定用 RNA assay 的表达
+seurat_obj$group <- factor(seurat_obj$group,
+                           levels = c("Normal", "Model", "QR056251"))
+
+# Ligand 表达
+genes_lig_ok <- genes_lig[genes_lig %in% rownames(seurat_obj)]
+p_lig <- DotPlot(seurat_obj, features = genes_lig_ok,
+                 group.by = "cell_type", split.by = "group",
+                 cols = c("grey90", "firebrick")) +
+  RotatedAxis() +
+  labs(title = "Ligand expression (drug-reversed)")
+
+# Receptor 表达
+genes_rec_ok <- genes_rec[genes_rec %in% rownames(seurat_obj)]
+p_rec <- DotPlot(seurat_obj, features = genes_rec_ok,
+                 group.by = "cell_type", split.by = "group",
+                 cols = c("grey90", "steelblue")) +
+  RotatedAxis() +
+  labs(title = "Receptor expression (drug-reversed)")
+
+p_lig / p_rec
+```
+
+若 CellChat 的 prob 变化方向与这里 DotPlot 上表达变化方向一致，则结论可信；若完全不一致（prob 变高但表达反而下降），可能是其他 L-R pair 搭配造成的伪相关，应当谨慎解读。
+
+
+#### Sender → Receiver Pair Drug Effect Ranking
+
+把所有 L-R pair 汇总到**细胞对**层面，找出被药物影响最大的 sender → receiver 通讯通路
+（配合 Hub Identification：前者看单个细胞，这里看成对通讯）。
+
+```{r}
+#| label: sender-receiver-drug-effect
+#| eval: false
+#| fig-width: 10
+#| fig-height: 7
+
+library(dplyr)
+library(ggplot2)
+
+sr_effect <- lr_merged |>
+  group_by(source, target) |>
+  summarise(
+    n_pairs = n(),
+    mean_Normal    = mean(prob_Normal),
+    mean_Model     = mean(prob_Model),
+    mean_QR056251  = mean(prob_QR056251),
+    drug_change    = mean(prob_QR056251 - prob_Model),
+    disease_change = mean(prob_Model - prob_Normal),
+    .groups = "drop"
+  ) |>
+  mutate(
+    reversal_score = -drug_change * disease_change,  # 同时疾病↑药物↓ → 高正值
+    abs_drug = abs(drug_change)
+  ) |>
+  arrange(desc(reversal_score))
+
+# 存表
+write.csv(sr_effect,
+          "Results/cellchat_sender_receiver_drug_effect.csv",
+          row.names = FALSE)
+
+# 热图：sender × receiver 的 drug_change
+ggplot(sr_effect, aes(source, target, fill = drug_change)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       midpoint = 0) +
+  coord_equal() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Mean drug effect per sender → receiver pair",
+       fill = "QR056251 − Model")
+
+# Top 20 被药物逆转最强的细胞对
+head(sr_effect |> arrange(desc(reversal_score)), 20)
+```
+
+
 #### Autocrine vs Paracrine Drug Effect
 
 药物主要影响的是自分泌（autocrine）还是旁分泌（paracrine）通讯？
@@ -1660,6 +1890,11 @@ for (smp in samples) {
   cc <- subsetData(cc)
   cc <- identifyOverExpressedGenes(cc)
   cc <- identifyOverExpressedInteractions(cc)
+
+  # 不使用 smoothData（与 Part I 保持一致）
+  # 若启用需在 Part I/II/III 同时启用，否则结果不可比
+  # cc <- smoothData(cc, adj = PPI.mouse)
+
   cc <- computeCommunProb(cc, type = "triMean")
   cc <- filterCommunication(cc, min.cells = 10)
   cc <- computeCommunProbPathway(cc)
@@ -1774,6 +2009,81 @@ ggplot(df_plot, aes(x = pathway, y = prob, fill = group)) +
   theme_bw(base_size = 12) +
   theme(legend.position = "top")
 ```
+
+
+### Cross-Validation: Part II (Pooled) vs Part III (Replicate-Aware)
+
+**结果可信度检验**：Part II 把同条件样本合并成一个 CellChat 对象（descriptive），
+Part III 按样本跑（replicate-aware + 统计检验）。两者应当**大致一致**；若某些通路
+只在 Part II 出现但 Part III 不显著，很可能是样本间异质性或少数样本驱动的"假信号"。
+
+```{r}
+#| label: part2-part3-crosscheck
+#| eval: false
+#| fig-width: 10
+#| fig-height: 6
+
+library(dplyr)
+library(ggplot2)
+
+# Part II: rankNet 得到的 Model vs Normal 上调通路
+part2_up <- up_in_model$name
+part2_down <- down_in_model$name
+
+# Part III: 统计显著的通路（BH adj p < 0.05）
+part3_sig <- stat_results |>
+  filter(!is.na(p_adj), p_adj < 0.05)
+
+part3_up <- part3_sig |> filter(log2FC > 0) |> pull(pathway)
+part3_down <- part3_sig |> filter(log2FC < 0) |> pull(pathway)
+
+# 交叉对比
+concordant_up <- intersect(part2_up, part3_up)
+concordant_down <- intersect(part2_down, part3_down)
+only_part2_up <- setdiff(part2_up, part3_up)
+only_part3_up <- setdiff(part3_up, part2_up)
+
+cat("Concordant up (both Part II & III):", length(concordant_up), "\n")
+cat("Concordant down:", length(concordant_down), "\n")
+cat("Only in Part II up (maybe heterogeneity driven):", length(only_part2_up), "\n")
+cat("Only in Part III up (replicate-robust novel):", length(only_part3_up), "\n")
+
+# 可视化：两套结果的 log2FC 散点
+merged_fc <- df_mvn_wide |>
+  select(name, log2FC_pooled = log2FC, pvalues_pooled = pvalues) |>
+  inner_join(
+    stat_results |>
+      select(name = pathway, log2FC_replicate = log2FC, p_adj_replicate = p_adj),
+    by = "name"
+  )
+
+ggplot(merged_fc,
+       aes(log2FC_pooled, log2FC_replicate,
+           color = p_adj_replicate < 0.05)) +
+  geom_point(alpha = 0.7) +
+  ggrepel::geom_text_repel(
+    data = filter(merged_fc, p_adj_replicate < 0.05),
+    aes(label = name), size = 3, max.overlaps = 15
+  ) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+  geom_hline(yintercept = 0, color = "grey70") +
+  geom_vline(xintercept = 0, color = "grey70") +
+  scale_color_manual(values = c("TRUE" = "firebrick", "FALSE" = "grey60"),
+                     name = "Part III\np_adj < 0.05") +
+  labs(x = "log2FC (Part II, pooled)",
+       y = "log2FC (Part III, replicate-aware)",
+       title = "Concordance of pathway effect sizes: pooled vs replicate-aware") +
+  theme_bw()
+
+write.csv(merged_fc,
+          "Results/cellchat_part2_part3_concordance.csv",
+          row.names = FALSE)
+```
+
+**解读**：
+- 散点落在对角线附近 → 两种分析一致，结果可靠
+- 只有 Part II 显著但 Part III 不显著 → 可能被个别样本驱动，应谨慎
+- 落在 Part III 显著（红色）且偏离对角线 → replicate-aware 发现的更 robust 的效应
 
 
 ### Save Replicate-Aware Results
