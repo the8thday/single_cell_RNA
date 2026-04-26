@@ -1,0 +1,992 @@
+---
+title: "scMetabolism Single-Cell Metabolic Activity Analysis"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+---
+
+
+## Introduction
+
+`scMetabolism` 用于在单细胞分辨率下量化代谢通路活性。它对每个细胞计算 pathway activity score，
+适合回答下面几类问题：
+
+- 哪些细胞亚群偏向糖酵解、氧化磷酸化、脂肪酸代谢等代谢状态？
+- 不同条件/处理组之间，某一细胞类型的代谢程序是否发生系统性重塑？
+- 某些代谢通路的变化是否是全局现象，还是局限于特定 cell type？
+
+本模板参考 `cellchat.qmd` 的组织方式，但针对代谢分析做了以下调整：
+
+- 使用 **placeholder-first** 配置块，默认沿用 `cell_type` / `group` / `orig.ident` 命名
+- 默认采用 **Seurat 对象** 作为输入
+- 将 **单细胞描述性比较** 与 **pseudobulk replicate-aware 验证** 分开
+- 显式加入 **Seurat v5 / Assay5 兼容准备步骤**
+- 保留 **KEGG / REACTOME** 两套代谢通路分析入口
+
+::: {.callout-warning}
+## 使用前需要知道的限制
+
+- `scMetabolism` 官方仓库目前主要面向 **human scRNA-seq** 数据
+- 上游函数通常依赖 **RNA counts slot**；如果你的对象是 Seurat v5，建议使用本模板中的兼容准备步骤
+- 单细胞水平 Wilcoxon 检验适合做 **初筛/描述**，正式结论建议用样本级 pseudobulk 结果确认
+- 所有分析 chunk 默认设为 `eval: false`，适合在 RStudio / Quarto notebook 中交互运行
+:::
+
+
+## Setup
+
+```{r}
+#| label: load-packages
+#| include: false
+
+library(Seurat)
+library(scMetabolism)
+library(Matrix)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(patchwork)
+library(purrr)
+library(stringr)
+library(qs2)
+library(ComplexHeatmap)
+library(circlize)
+library(limma)
+
+options(future.globals.maxSize = 40 * 1024^3)
+set.seed(42)
+```
+
+
+## Configuration
+
+先在这里修改路径、元数据列名、物种和比较设置。后面所有代码都尽量从这一个配置块读取。
+
+```{r}
+#| label: configuration
+#| eval: false
+
+cfg <- list(
+  seurat_path = "datasets/harmonized_seurat.qs2",
+  output_dir = "Results/scMetabolism",
+  assay = "RNA",
+  reduction_priority = c("umap", "tsne"),
+
+  # 元数据列名：默认沿用你常用的命名
+  celltype_col = "cell_type",
+  group_col = "group",
+  sample_col = "orig.ident",
+
+  # scMetabolism 参数
+  method = "AUCell",              # 推荐先用 AUCell；VISION 对环境更敏感
+  metabolism_type = "KEGG",       # "KEGG" 或 "REACTOME"
+  imputation = FALSE,
+  ncores = 2,
+
+  # 可选子集
+  subset_groups = NULL,           # 例如 c("Normal", "Treatment")
+  subset_celltypes = NULL,        # 例如 c("Fibroblast", "Macrophage")
+  min_cells_per_celltype = 20,
+  min_cells_per_group_celltype = 10,
+
+  # 比较设置
+  reference_group = NULL,         # NULL 时默认取 group 的第一个 level
+  compare_groups = NULL,          # NULL 时默认比较除 reference_group 外的所有组
+
+  # 可视化设置
+  pathways_show = c(
+    "Glycolysis / Gluconeogenesis",
+    "Oxidative phosphorylation",
+    "Citrate cycle (TCA cycle)"
+  ),
+  top_n_heatmap = 30,
+  top_n_dotplot = 20,
+
+  # 物种说明：官方文档当前主要支持 human
+  species_note = "human"
+)
+
+dir.create(cfg$output_dir, recursive = TRUE, showWarnings = FALSE)
+cfg
+```
+
+
+## Helper Functions
+
+```{r}
+#| label: helper-functions
+#| eval: false
+
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+get_assay_matrix <- function(object, assay = "RNA", layer = "counts") {
+  DefaultAssay(object) <- assay
+
+  mat <- tryCatch(
+    GetAssayData(object, assay = assay, layer = layer),
+    error = function(e) NULL
+  )
+
+  if (is.null(mat)) {
+    mat <- tryCatch(
+      GetAssayData(object, assay = assay, slot = layer),
+      error = function(e) NULL
+    )
+  }
+
+  if (is.null(mat)) {
+    stop("Cannot extract assay matrix: ", assay, " / ", layer)
+  }
+
+  mat
+}
+
+choose_reduction <- function(object, candidates = c("umap", "tsne")) {
+  available <- Reductions(object)
+  hit <- intersect(candidates, available)
+  if (length(hit) == 0) return(NULL)
+  hit[[1]]
+}
+
+prepare_scmetabolism_input <- function(object, assay = "RNA",
+                                       reduction_priority = c("umap", "tsne")) {
+  counts_mat <- get_assay_matrix(object, assay = assay, layer = "counts")
+  counts_mat <- as(counts_mat, "dgCMatrix")
+
+  obj <- CreateSeuratObject(
+    counts = counts_mat,
+    meta.data = object@meta.data
+  )
+  DefaultAssay(obj) <- "RNA"
+
+  reduction_use <- choose_reduction(object, candidates = reduction_priority)
+  if (!is.null(reduction_use)) {
+    obj[[reduction_use]] <- object[[reduction_use]]
+  }
+
+  obj
+}
+
+clean_group_levels <- function(x, reference_group = NULL) {
+  x <- as.character(x)
+  x <- factor(x)
+
+  if (!is.null(reference_group) && reference_group %in% levels(x)) {
+    x <- relevel(x, ref = reference_group)
+  }
+
+  x
+}
+
+make_safe_names <- function(x) {
+  x |>
+    str_replace_all("[^A-Za-z0-9]+", "_") |>
+    str_replace_all("^_+|_+$", "") |>
+    make.unique()
+}
+```
+
+
+## Load Data
+
+```{r}
+#| label: load-data
+#| eval: false
+
+seurat_obj <- qs2::qs_read(cfg$seurat_path)
+DefaultAssay(seurat_obj) <- cfg$assay
+
+seurat_obj
+colnames(seurat_obj@meta.data)
+table(seurat_obj@meta.data[[cfg$celltype_col]])
+table(seurat_obj@meta.data[[cfg$group_col]])
+```
+
+
+## Standardize Metadata
+
+为了后面的代码可复用，这里统一生成标准列：`cell_type`、`group`、`sample_id`。
+即使原始对象列名不同，也只需要在配置块改一次。
+
+```{r}
+#| label: standardize-metadata
+#| eval: false
+
+stopifnot(cfg$celltype_col %in% colnames(seurat_obj@meta.data))
+stopifnot(cfg$group_col %in% colnames(seurat_obj@meta.data))
+stopifnot(cfg$sample_col %in% colnames(seurat_obj@meta.data))
+
+seurat_obj$cell_type <- seurat_obj@meta.data[[cfg$celltype_col]]
+seurat_obj$group <- seurat_obj@meta.data[[cfg$group_col]]
+seurat_obj$sample_id <- seurat_obj@meta.data[[cfg$sample_col]]
+
+seurat_obj$group <- clean_group_levels(
+  seurat_obj$group,
+  reference_group = cfg$reference_group
+)
+
+if (!is.null(cfg$subset_groups)) {
+  seurat_obj <- subset(seurat_obj, group %in% cfg$subset_groups)
+}
+
+if (!is.null(cfg$subset_celltypes)) {
+  seurat_obj <- subset(seurat_obj, cell_type %in% cfg$subset_celltypes)
+}
+
+table(seurat_obj$cell_type)
+table(seurat_obj$group)
+table(seurat_obj$sample_id)
+```
+
+
+## Preflight Checks
+
+这一步用来避免后面跑到一半才发现对象结构不符合要求。
+
+```{r}
+#| label: preflight-checks
+#| eval: false
+
+counts_mat <- get_assay_matrix(seurat_obj, assay = cfg$assay, layer = "counts")
+data_mat <- get_assay_matrix(seurat_obj, assay = cfg$assay, layer = "data")
+
+dim(counts_mat)
+dim(data_mat)
+
+celltype_counts <- table(seurat_obj$cell_type)
+group_counts <- table(seurat_obj$group)
+celltype_group_counts <- table(seurat_obj$cell_type, seurat_obj$group)
+
+celltype_counts
+group_counts
+celltype_group_counts
+
+rare_celltypes <- names(celltype_counts[celltype_counts < cfg$min_cells_per_celltype])
+rare_celltypes
+```
+
+
+## Filter Rare Cell Types
+
+如果某些 cell type 细胞数太少，代谢通路均值会非常不稳定。通常建议先过滤。
+
+```{r}
+#| label: filter-rare-celltypes
+#| eval: false
+
+keep_celltypes <- names(celltype_counts[celltype_counts >= cfg$min_cells_per_celltype])
+seurat_obj <- subset(seurat_obj, cell_type %in% keep_celltypes)
+
+table(seurat_obj$cell_type)
+table(seurat_obj$group)
+```
+
+
+## Prepare a scMetabolism-Compatible Seurat Object
+
+::: {.callout-note}
+## 为什么要单独准备一个兼容对象？
+
+`scMetabolism` 的部分实现对 Seurat 对象内部结构有较强假设，尤其是 `RNA` assay 的 counts slot。
+如果你当前对象来自 Seurat v5，直接运行可能会遇到 `Assay5` 相关报错。
+
+这里的做法是：
+
+- 从原对象中提取 counts matrix
+- 新建一个最小 Seurat 对象供 `scMetabolism` 运行
+- 尽量复制 `umap` / `tsne` reduction 方便后续画图
+- 结果再写回原对象
+:::
+
+```{r}
+#| label: prepare-compatible-object
+#| eval: false
+
+scmetab_obj <- prepare_scmetabolism_input(
+  seurat_obj,
+  assay = cfg$assay,
+  reduction_priority = cfg$reduction_priority
+)
+
+scmetab_obj$cell_type <- seurat_obj$cell_type
+scmetab_obj$group <- seurat_obj$group
+scmetab_obj$sample_id <- seurat_obj$sample_id
+
+scmetab_obj
+Reductions(scmetab_obj)
+```
+
+
+## Run scMetabolism
+
+```{r}
+#| label: run-scmetabolism
+#| eval: false
+#| message: false
+#| warning: false
+
+scmetab_obj <- sc.metabolism.Seurat(
+  obj = scmetab_obj,
+  method = cfg$method,
+  imputation = cfg$imputation,
+  ncores = cfg$ncores,
+  metabolism.type = cfg$metabolism_type
+)
+
+scmetab_obj
+Assays(scmetab_obj)
+```
+
+
+## Optional: Run a Second Reference Score Set
+
+同一数据常见的对照方式有两个：
+
+- **方法对照**：`AUCell` vs `VISION`
+- **通路库对照**：`KEGG` vs `REACTOME`
+
+不一定都要跑。建议先完成一套主分析，再视需要增加对照。
+
+```{r}
+#| label: optional-second-run
+#| eval: false
+
+# 例1：同方法，不同 pathway database
+scmetab_reactome <- sc.metabolism.Seurat(
+  obj = prepare_scmetabolism_input(seurat_obj, assay = cfg$assay,
+                                   reduction_priority = cfg$reduction_priority),
+  method = cfg$method,
+  imputation = cfg$imputation,
+  ncores = cfg$ncores,
+  metabolism.type = "REACTOME"
+)
+
+# 例2：同数据库，不同方法（VISION 环境更敏感）
+# scmetab_vision <- sc.metabolism.Seurat(
+#   obj = prepare_scmetabolism_input(seurat_obj, assay = cfg$assay,
+#                                    reduction_priority = cfg$reduction_priority),
+#   method = "VISION",
+#   imputation = cfg$imputation,
+#   ncores = cfg$ncores,
+#   metabolism.type = cfg$metabolism_type
+# )
+```
+
+
+## Extract Metabolism Score Matrix
+
+```{r}
+#| label: extract-score-matrix
+#| eval: false
+
+score_mat <- scmetab_obj@assays$METABOLISM$score
+score_mat <- as.matrix(score_mat)
+
+dim(score_mat)
+rownames(score_mat)[1:10]
+colnames(score_mat)[1:10]
+```
+
+
+## Add Scores Back to the Main Seurat Object
+
+这里把代谢得分放回原始对象中，便于与其他分析模块共用同一个 Seurat 对象。
+
+```{r}
+#| label: add-scores-to-seurat
+#| eval: false
+
+score_mat <- score_mat[, colnames(seurat_obj), drop = FALSE]
+
+seurat_obj[["METABOLISM"]] <- CreateAssayObject(data = score_mat)
+
+safe_pathway_names <- make_safe_names(rownames(score_mat))
+score_meta <- t(score_mat) |>
+  as.data.frame(check.names = FALSE)
+colnames(score_meta) <- safe_pathway_names
+
+pathway_key <- tibble(
+  pathway = rownames(score_mat),
+  pathway_safe = safe_pathway_names
+)
+
+seurat_obj <- AddMetaData(seurat_obj, metadata = score_meta)
+
+DefaultAssay(seurat_obj) <- "METABOLISM"
+seurat_obj
+head(pathway_key)
+```
+
+
+## Score Overview
+
+```{r}
+#| label: score-overview
+#| eval: false
+
+pathway_summary <- tibble(
+  pathway = rownames(score_mat),
+  mean_score = rowMeans(score_mat),
+  sd_score = apply(score_mat, 1, sd),
+  pct_nonzero = rowMeans(score_mat > 0) * 100
+) |>
+  arrange(desc(sd_score))
+
+pathway_summary |>
+  slice_head(n = 20)
+```
+
+
+## UMAP / tSNE Visualization
+
+优先使用对象里已有的降维结果。如果对象中没有 `umap` / `tsne`，先回到上游流程补齐。
+
+```{r}
+#| label: dimplot-metabolism
+#| eval: false
+#| fig-width: 14
+#| fig-height: 10
+
+show_pathways <- intersect(cfg$pathways_show, rownames(score_mat))
+show_pathways
+
+plot_reduction <- choose_reduction(scmetab_obj, cfg$reduction_priority)
+plot_reduction
+
+wrap_plots(
+  lapply(show_pathways, function(pw) {
+    DimPlot.metabolism(
+      obj = scmetab_obj,
+      pathway = pw,
+      dimention.reduction.type = plot_reduction,
+      dimention.reduction.run = FALSE,
+      size = 0.2
+    ) + ggtitle(pw)
+  }),
+  ncol = 2
+)
+```
+
+
+## Dot Plot by Cell Type
+
+```{r}
+#| label: dotplot-celltype
+#| eval: false
+#| fig-width: 14
+#| fig-height: 9
+
+DotPlot.metabolism(
+  obj = scmetab_obj,
+  pathway = show_pathways,
+  phenotype = "cell_type",
+  norm = "y"
+)
+```
+
+
+## Box Plot by Group
+
+```{r}
+#| label: boxplot-group
+#| eval: false
+#| fig-width: 14
+#| fig-height: 10
+
+BoxPlot.metabolism(
+  obj = scmetab_obj,
+  pathway = show_pathways,
+  phenotype = "group",
+  ncol = 1
+)
+```
+
+
+## Mean Activity per Cell Type
+
+```{r}
+#| label: mean-activity-celltype
+#| eval: false
+#| fig-width: 14
+#| fig-height: 10
+
+DefaultAssay(seurat_obj) <- "METABOLISM"
+
+mean_celltype <- AverageExpression(
+  seurat_obj,
+  assays = "METABOLISM",
+  group.by = "cell_type",
+  slot = "data",
+  return.seurat = FALSE
+)$METABOLISM
+
+pathway_var <- apply(mean_celltype, 1, var)
+top_pathways <- names(sort(pathway_var, decreasing = TRUE))[
+  seq_len(min(cfg$top_n_heatmap, length(pathway_var)))
+]
+
+Heatmap(
+  t(scale(t(mean_celltype[top_pathways, , drop = FALSE]))),
+  name = "Scaled\nscore",
+  col = colorRamp2(c(-2, 0, 2), c("#3B4CC0", "white", "#B40426")),
+  row_names_gp = gpar(fontsize = 8),
+  column_names_gp = gpar(fontsize = 10),
+  column_names_rot = 45
+)
+```
+
+
+## Mean Activity per Cell Type × Group
+
+```{r}
+#| label: mean-activity-celltype-group
+#| eval: false
+#| fig-width: 16
+#| fig-height: 10
+
+meta_with_scores <- seurat_obj@meta.data |>
+  select(cell_type, group, sample_id, all_of(safe_pathway_names))
+
+group_celltype_mean <- meta_with_scores |>
+  pivot_longer(cols = all_of(safe_pathway_names),
+               names_to = "pathway_safe",
+               values_to = "score") |>
+  left_join(pathway_key, by = "pathway_safe") |>
+  group_by(cell_type, group, pathway) |>
+  summarise(mean_score = mean(score), .groups = "drop") |>
+  mutate(label = paste(cell_type, group, sep = " | "))
+
+heatmap_mat <- group_celltype_mean |>
+  filter(pathway %in% top_pathways) |>
+  select(label, pathway, mean_score) |>
+  pivot_wider(names_from = label, values_from = mean_score) |>
+  column_to_rownames("pathway") |>
+  as.matrix()
+
+Heatmap(
+  heatmap_mat,
+  name = "Mean score",
+  col = colorRamp2(
+    c(min(heatmap_mat, na.rm = TRUE), median(heatmap_mat, na.rm = TRUE), max(heatmap_mat, na.rm = TRUE)),
+    c("navy", "white", "firebrick")
+  ),
+  row_names_gp = gpar(fontsize = 8),
+  column_names_gp = gpar(fontsize = 8),
+  column_names_rot = 45
+)
+```
+
+
+## Percent Active Dot Plot
+
+“active” 阈值没有统一金标准。这里用每条通路的全局 75% 分位数做一个实用型定义，
+更适合在不同 cell type 之间做相对比较。
+
+```{r}
+#| label: pct-active-dotplot
+#| eval: false
+#| fig-width: 14
+#| fig-height: 10
+
+global_thresholds <- meta_with_scores |>
+  select(all_of(safe_pathway_names)) |>
+  summarise(across(everything(), ~ quantile(.x, 0.75, na.rm = TRUE))) |>
+  pivot_longer(everything(), names_to = "pathway_safe", values_to = "threshold")
+
+dot_data <- meta_with_scores |>
+  select(cell_type, all_of(safe_pathway_names)) |>
+  pivot_longer(-cell_type, names_to = "pathway_safe", values_to = "score") |>
+  left_join(global_thresholds, by = "pathway_safe") |>
+  left_join(pathway_key, by = "pathway_safe") |>
+  group_by(cell_type, pathway) |>
+  summarise(
+    mean_score = mean(score),
+    pct_active = mean(score > threshold[1]) * 100,
+    .groups = "drop"
+  ) |>
+  group_by(pathway) |>
+  mutate(pathway_var = var(mean_score)) |>
+  ungroup() |>
+  arrange(desc(pathway_var))
+
+top_dot_pathways <- dot_data |>
+  distinct(pathway, pathway_var) |>
+  slice_max(pathway_var, n = cfg$top_n_dotplot) |>
+  pull(pathway)
+
+dot_data |>
+  filter(pathway %in% top_dot_pathways) |>
+  ggplot(aes(x = cell_type, y = pathway)) +
+  geom_point(aes(size = pct_active, color = mean_score)) +
+  scale_color_viridis_c(option = "inferno") +
+  scale_size_continuous(range = c(1, 6)) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 7)
+  ) +
+  labs(x = "Cell Type", y = "Pathway", color = "Mean score", size = "% Active")
+```
+
+
+## Per-Cell-Type Group Comparison
+
+按细胞类型分开看不同组之间的通路变化，通常最接近真实生物学问题。
+
+```{r}
+#| label: per-celltype-group-comparison
+#| eval: false
+#| fig-width: 16
+#| fig-height: 10
+
+compare_groups <- cfg$compare_groups %||% setdiff(levels(seurat_obj$group), levels(seurat_obj$group)[1])
+reference_group <- cfg$reference_group %||% levels(seurat_obj$group)[1]
+
+plot_pathways <- intersect(cfg$pathways_show, rownames(score_mat))
+plot_pathways_safe <- pathway_key |>
+  filter(pathway %in% plot_pathways) |>
+  pull(pathway_safe)
+
+plot_df <- meta_with_scores |>
+  select(cell_type, group, all_of(plot_pathways_safe)) |>
+  pivot_longer(cols = all_of(plot_pathways_safe),
+               names_to = "pathway_safe",
+               values_to = "score") |>
+  left_join(pathway_key, by = "pathway_safe")
+
+ggplot(plot_df, aes(x = cell_type, y = score, fill = group)) +
+  geom_boxplot(outlier.size = 0.2, linewidth = 0.25) +
+  facet_wrap(~ pathway, scales = "free_y", ncol = 2) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "top"
+  ) +
+  labs(x = "Cell Type", y = "Metabolism score")
+```
+
+
+## Wilcoxon Test at Single-Cell Level
+
+::: {.callout-warning}
+## 解释方式
+
+这一节适合做 **初筛**：
+
+- 找哪些 pathway 在哪些 cell type 中变化最大
+- 排序和可视化
+- 生成候选通路列表
+
+但不应用它单独作为“严谨差异统计”的最终依据，因为细胞并不是独立重复。
+:::
+
+```{r}
+#| label: wilcoxon-single-cell
+#| eval: false
+
+reference_group <- cfg$reference_group %||% levels(seurat_obj$group)[1]
+compare_groups <- cfg$compare_groups %||% setdiff(levels(seurat_obj$group), reference_group)
+
+stat_input <- meta_with_scores |>
+  select(cell_type, group, all_of(safe_pathway_names)) |>
+  pivot_longer(cols = all_of(safe_pathway_names),
+               names_to = "pathway_safe",
+               values_to = "score") |>
+  left_join(pathway_key, by = "pathway_safe")
+
+wilcox_results <- map_dfr(compare_groups, function(g2) {
+  stat_input |>
+    filter(group %in% c(reference_group, g2)) |>
+    group_by(cell_type, pathway, pathway_safe) |>
+    summarise(
+      n_ref = sum(group == reference_group),
+      n_cmp = sum(group == g2),
+      mean_ref = mean(score[group == reference_group], na.rm = TRUE),
+      mean_cmp = mean(score[group == g2], na.rm = TRUE),
+      delta_score = mean_cmp - mean_ref,
+      p_value = tryCatch(
+        wilcox.test(score ~ group)$p.value,
+        error = function(e) NA_real_
+      ),
+      .groups = "drop"
+    ) |>
+    mutate(
+      comparison = paste(g2, "vs", reference_group),
+      p_adj = p.adjust(p_value, method = "BH")
+    )
+})
+
+wilcox_results |>
+  arrange(p_adj, desc(abs(delta_score))) |>
+  slice_head(n = 30)
+```
+
+
+## Volcano-Like Ranking Plot
+
+```{r}
+#| label: volcano-like-plot
+#| eval: false
+#| fig-width: 12
+#| fig-height: 8
+
+target_cell_type <- unique(wilcox_results$cell_type)[1]
+target_comparison <- unique(wilcox_results$comparison)[1]
+label_df <- wilcox_results |>
+  filter(cell_type == target_cell_type, comparison == target_comparison) |>
+  slice_max(order_by = abs(delta_score), n = 15)
+
+wilcox_results |>
+  filter(cell_type == target_cell_type, comparison == target_comparison) |>
+  mutate(
+    pathway_label = str_trunc(pathway, 40),
+    score_sig = case_when(
+      p_adj < 0.001 ~ "***",
+      p_adj < 0.01 ~ "**",
+      p_adj < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+  ) |>
+  ggplot(aes(x = delta_score, y = -log10(p_adj))) +
+  geom_point(aes(color = delta_score), size = 2) +
+  scale_color_gradient2(low = "#3B4CC0", mid = "grey90", high = "#B40426", midpoint = 0) +
+  geom_text(data = label_df, aes(label = pathway_label), size = 3, check_overlap = TRUE) +
+  theme_classic() +
+  labs(
+    title = paste(target_cell_type, "-", target_comparison),
+    x = "Delta score",
+    y = "-log10(FDR)"
+  )
+```
+
+
+## Pseudobulk Validation with limma
+
+如果每组存在多个 biological replicates，这一节通常比单细胞 Wilcoxon 更值得写进结果部分。
+
+```{r}
+#| label: pseudobulk-limma
+#| eval: false
+
+pseudobulk_scores <- meta_with_scores |>
+  select(cell_type, group, sample_id, all_of(safe_pathway_names)) |>
+  group_by(cell_type, group, sample_id) |>
+  summarise(across(all_of(safe_pathway_names), mean), .groups = "drop")
+
+limma_results <- map_dfr(unique(pseudobulk_scores$cell_type), function(ct) {
+  ct_data <- pseudobulk_scores |>
+    filter(cell_type == ct)
+
+  if (nrow(ct_data) == 0) return(NULL)
+  if (nlevels(factor(ct_data$group)) < 2) return(NULL)
+  if (min(table(ct_data$group)) < 2) return(NULL)
+
+  grp <- factor(ct_data$group)
+  grp <- clean_group_levels(grp, reference_group = cfg$reference_group)
+
+  ref <- levels(grp)[1]
+  cmp_levels <- setdiff(levels(grp), ref)
+
+  mat <- ct_data |>
+    select(all_of(safe_pathway_names)) |>
+    t()
+  colnames(mat) <- ct_data$sample_id
+
+  map_dfr(cmp_levels, function(cmp) {
+    keep_idx <- grp %in% c(ref, cmp)
+    mat_sub <- mat[, keep_idx, drop = FALSE]
+    grp_sub <- droplevels(grp[keep_idx])
+
+    if (min(table(grp_sub)) < 2) return(NULL)
+
+    design <- model.matrix(~ 0 + grp_sub)
+    colnames(design) <- levels(grp_sub)
+
+    fit <- lmFit(mat_sub, design)
+    contrast_mat <- makeContrasts(
+      contrasts = paste0(cmp, " - ", ref),
+      levels = design
+    )
+    fit2 <- contrasts.fit(fit, contrast_mat)
+    fit2 <- eBayes(fit2)
+
+    topTable(fit2, number = Inf) |>
+      rownames_to_column("pathway_safe") |>
+      left_join(pathway_key, by = "pathway_safe") |>
+      mutate(
+        cell_type = ct,
+        comparison = paste(cmp, "vs", ref)
+      )
+  })
+})
+
+limma_results |>
+  arrange(adj.P.Val, desc(abs(logFC))) |>
+  slice_head(n = 30)
+```
+
+
+## Concordance Between Wilcoxon and limma
+
+最可靠的候选通路通常满足两点：
+
+- Wilcoxon 与 limma 都显著
+- 变化方向一致
+
+```{r}
+#| label: method-concordance
+#| eval: false
+
+concordance <- wilcox_results |>
+  select(cell_type, comparison, pathway_safe, pathway,
+         wilcox_padj = p_adj, wilcox_delta = delta_score) |>
+  inner_join(
+    limma_results |>
+      select(cell_type, comparison, pathway_safe,
+             limma_padj = adj.P.Val, limma_logFC = logFC),
+    by = c("cell_type", "comparison", "pathway_safe")
+  ) |>
+  mutate(
+    wilcox_sig = wilcox_padj < 0.05,
+    limma_sig = limma_padj < 0.05,
+    both_sig = wilcox_sig & limma_sig,
+    consistent_direction = sign(wilcox_delta) == sign(limma_logFC)
+  )
+
+concordance |>
+  filter(both_sig, consistent_direction) |>
+  arrange(limma_padj) |>
+  slice_head(n = 50)
+```
+
+
+## Delta Heatmap
+
+按 cell type 汇总不同组之间的代谢差值，适合快速定位“哪类细胞变了、变在哪条 pathway”。
+
+```{r}
+#| label: delta-heatmap
+#| eval: false
+#| fig-width: 14
+#| fig-height: 10
+
+reference_group <- cfg$reference_group %||% levels(seurat_obj$group)[1]
+target_group <- (cfg$compare_groups %||% setdiff(levels(seurat_obj$group), reference_group))[1]
+
+delta_heatmap_df <- meta_with_scores |>
+  select(cell_type, group, all_of(safe_pathway_names)) |>
+  pivot_longer(cols = all_of(safe_pathway_names),
+               names_to = "pathway_safe",
+               values_to = "score") |>
+  filter(group %in% c(reference_group, target_group)) |>
+  group_by(cell_type, group, pathway_safe) |>
+  summarise(mean_score = mean(score), .groups = "drop") |>
+  pivot_wider(names_from = group, values_from = mean_score) |>
+  mutate(delta = .data[[target_group]] - .data[[reference_group]]) |>
+  left_join(pathway_key, by = "pathway_safe")
+
+delta_mat <- delta_heatmap_df |>
+  select(pathway, cell_type, delta) |>
+  pivot_wider(names_from = cell_type, values_from = delta) |>
+  column_to_rownames("pathway") |>
+  as.matrix()
+
+top_delta <- names(sort(apply(delta_mat, 1, function(x) max(abs(x), na.rm = TRUE)),
+                        decreasing = TRUE))[
+  seq_len(min(cfg$top_n_heatmap, nrow(delta_mat)))
+]
+
+delta_mat <- delta_mat[top_delta, , drop = FALSE]
+max_abs <- max(abs(delta_mat), na.rm = TRUE)
+
+Heatmap(
+  delta_mat,
+  name = paste0("Delta\n", target_group, " - ", reference_group),
+  col = colorRamp2(c(-max_abs, 0, max_abs), c("#3B4CC0", "white", "#B40426")),
+  row_names_gp = gpar(fontsize = 8),
+  column_names_gp = gpar(fontsize = 10),
+  column_names_rot = 45
+)
+```
+
+
+## Compare KEGG and REACTOME Results (Optional)
+
+如果同一批数据分别跑了 `KEGG` 和 `REACTOME`，可以在这一节对照：
+
+- 哪些 cell type 的整体代谢重塑方向一致
+- KEGG 是否更聚焦于经典代谢通路
+- REACTOME 是否提供更细分的代谢子模块
+
+```{r}
+#| label: compare-kegg-reactome
+#| eval: false
+
+reactome_score_mat <- scmetab_reactome@assays$METABOLISM$score
+reactome_score_mat <- as.matrix(reactome_score_mat)
+
+dim(score_mat)
+dim(reactome_score_mat)
+
+intersect(
+  rownames(score_mat),
+  rownames(reactome_score_mat)
+)[1:20]
+```
+
+
+## Suggested Interpretation Workflow
+
+::: {.callout-tip}
+## 推荐阅读顺序
+
+1. 先看 `DotPlot.metabolism` / `Heatmap`，确定主要变化发生在哪些 cell type
+2. 再看 `Wilcoxon` 排名，筛选 effect size 最大的 pathway
+3. 如果有 replicate，优先检查 `pseudobulk + limma`
+4. 最后回到 UMAP / boxplot，确认这些变化是不是由少数异常细胞驱动
+:::
+
+
+## Save Results
+
+```{r}
+#| label: save-results
+#| eval: false
+
+qs2::qs_save(seurat_obj, file.path(cfg$output_dir, "seurat_with_scMetabolism.qs2"))
+qs2::qs_save(scmetab_obj, file.path(cfg$output_dir, "scmetabolism_scoring_object.qs2"))
+
+write.csv(pathway_key,
+          file.path(cfg$output_dir, "pathway_name_mapping.csv"),
+          row.names = FALSE)
+
+write.csv(pathway_summary,
+          file.path(cfg$output_dir, paste0("pathway_summary_", cfg$metabolism_type, "_", cfg$method, ".csv")),
+          row.names = FALSE)
+
+write.csv(wilcox_results,
+          file.path(cfg$output_dir, paste0("wilcox_results_", cfg$metabolism_type, "_", cfg$method, ".csv")),
+          row.names = FALSE)
+
+write.csv(limma_results,
+          file.path(cfg$output_dir, paste0("limma_results_", cfg$metabolism_type, "_", cfg$method, ".csv")),
+          row.names = FALSE)
+
+write.csv(concordance,
+          file.path(cfg$output_dir, paste0("concordance_", cfg$metabolism_type, "_", cfg$method, ".csv")),
+          row.names = FALSE)
+
+saveRDS(score_mat,
+        file.path(cfg$output_dir, paste0("score_matrix_", cfg$metabolism_type, "_", cfg$method, ".rds")))
+
+message("scMetabolism template analysis finished.")
+```
+
+
+## Session Notes
+
+- 如果你的对象没有 `umap` / `tsne`，请先在上游流程中完成降维，再回到本模板运行可视化部分
+- 如果是小鼠数据，可以先试跑，但结果应按“基于 human geneset 的探索性代谢打分”谨慎解释
+- 如果 `VISION` 安装或运行不稳定，优先使用 `AUCell`

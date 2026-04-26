@@ -1,0 +1,715 @@
+---
+title: "CellRank 2: Cell Fate Mapping with Multiple Kernels"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+jupyter: python3
+---
+
+
+## Introduction
+
+CellRank 2 是当前 scRNA-seq 细胞命运推断的 state-of-the-art 工具，核心概念是把
+**细胞间转移概率（transition probability）** 建模为 Markov chain，然后识别：
+
+- **Initial states** — 分化起点（未分化/干性细胞）
+- **Terminal states** — 分化终点（成熟/病理态）
+- **Fate probabilities** — 每个细胞到达各终末态的概率
+- **Driver genes** — 驱动每个命运的基因
+
+**核心优势：Kernel-based 架构**
+
+不依赖 RNA velocity，支持多种数据源构建转移矩阵：
+
+| Kernel | 输入 | 本项目是否可用 |
+|--------|------|---------------|
+| `VelocityKernel` | scVelo 计算的 velocity | ✗ 需要 spliced/unspliced（未定量） |
+| `PseudotimeKernel` | 任意 pseudotime（monocle3、DPT 等） | ✓ 可用 monocle3 结果 |
+| `CytoTRACEKernel` | CytoTRACE 分数 | ✓ 可用 CytoTRACE2 结果 |
+| `ConnectivityKernel` | KNN graph | ✓ 总能用 |
+| `RealTimeKernel` | 真实时间点（developmental series） | ✗ 三组不是时间序列 |
+
+**本项目策略：**
+
+用 `CytoTRACEKernel`（主）+ `PseudotimeKernel`（验证）+ `ConnectivityKernel`（平滑）组合。
+核心科学问题是 **BLM 是否把细胞推向某个纤维化终末态？QR056251 能否逆转这种命运转移？**
+
+**数据：** BLM 小鼠肺组织 3 组（Normal / Model / QR056251），已完成 CytoTRACE2 和 monocle3 分析。
+
+
+## Part 0: Export Seurat to AnnData (R)
+
+把 Seurat 对象 + CytoTRACE2 + monocle3 pseudotime 一起导出到 `.h5ad`。
+
+```{r}
+#| label: export-seurat
+#| eval: false
+
+library(Seurat)
+library(anndataR)
+library(qs2)
+
+seurat_obj <- qs2::qs_read("datasets/harmonized_seurat.qs2")
+
+# 移除 Multiplets
+seurat_obj <- subset(seurat_obj, cell_type != "Multiplets")
+
+DefaultAssay(seurat_obj) <- "RNA"
+
+# --- 检查所需 metadata 列是否存在 ---
+required <- c("cell_type", "group", "CytoTRACE2_Score")
+missing <- setdiff(required, colnames(seurat_obj@meta.data))
+if (length(missing) > 0) {
+  stop("缺少 metadata 列: ", paste(missing, collapse = ", "),
+       "\n请先跑 CytoTRACE2.qmd")
+}
+
+# monocle3 pseudotime（可选，若有则一起导出）
+has_pseudotime <- "monocle3_pseudotime" %in% colnames(seurat_obj@meta.data)
+
+obs_cols <- c(
+  cell_type        = "cell_type",
+  group            = "group",
+  orig.ident       = "orig.ident",
+  CytoTRACE2_Score = "CytoTRACE2_Score",
+  CytoTRACE2_Potency = "CytoTRACE2_Potency"
+)
+if (has_pseudotime) {
+  obs_cols <- c(obs_cols, monocle3_pseudotime = "monocle3_pseudotime")
+}
+
+adata <- as_AnnData(
+  seurat_obj,
+  assay_name = "RNA",
+  x_mapping = "counts",
+  layers_mapping = c(logcounts = "data"),
+  obs_mapping = obs_cols,
+  obsm_mapping = list(X_pca = "pca", X_umap = "umap")
+)
+
+dir.create("CellRank", showWarnings = FALSE)
+adata$write_h5ad("CellRank/input.h5ad")
+
+cat("Export complete. pseudotime included:", has_pseudotime, "\n")
+```
+
+
+## Part 1: Python Environment
+
+```bash
+# CellRank 2.x 推荐 Python 3.10-3.11
+uv venv .venv-cellrank --python 3.11
+source .venv-cellrank/bin/activate
+
+uv pip install cellrank scanpy anndata
+uv pip install "cellrank[external]"   # 包含 CytoTRACE kernel 需要的依赖
+```
+
+
+## Part 2: Load AnnData and Inspect
+
+```{python}
+#| label: py-setup
+#| eval: false
+
+import os
+import numpy as np
+import pandas as pd
+import scanpy as sc
+import cellrank as cr
+import matplotlib.pyplot as plt
+
+os.makedirs("CellRank", exist_ok=True)
+sc.settings.set_figure_params(dpi=100, frameon=False)
+sc.settings.verbosity = 2
+
+adata = sc.read_h5ad("CellRank/input.h5ad")
+print(adata)
+print("\nGroups:", adata.obs["group"].value_counts().to_dict())
+print("\nCell types:", adata.obs["cell_type"].value_counts().to_dict())
+```
+
+
+### Normalize and Build KNN Graph (if not present)
+
+CellRank 的所有 kernel 都需要 `adata.obsp["connectivities"]`（KNN 图）和
+`adata.obsm["X_pca"]`（PCA）。导出的数据通常已有，但需检查。
+
+```{python}
+#| label: py-knn
+#| eval: false
+
+# 如果导出的是 raw counts，先做 log-normalize 放到 X 上
+if "logcounts" in adata.layers:
+    adata.X = adata.layers["logcounts"].copy()
+else:
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+
+# 检查/重建 KNN
+if "connectivities" not in adata.obsp:
+    sc.pp.neighbors(adata, n_neighbors=30, use_rep="X_pca")
+
+# 计算 diffusion map（CytoTRACEKernel 需要）
+if "X_diffmap" not in adata.obsm:
+    sc.tl.diffmap(adata, n_comps=15)
+```
+
+
+## Part 3: Build Kernels
+
+### Kernel A: CytoTRACEKernel (Primary)
+
+CellRank 2 的 CytoTRACEKernel 默认会**内部重新计算** CytoTRACE 分数。
+但我们已经有 CytoTRACE2 的分数，更准确，所以用 **PseudotimeKernel + 反向 CytoTRACE2 分数** 的方式外挂。
+
+CytoTRACE2_Score 越大 = 越未分化，所以用 `1 - score` 作为 pseudotime（越大越分化）。
+
+```{python}
+#| label: py-kernel-cytotrace
+#| eval: false
+
+# 把 CytoTRACE2 分数转为 pseudotime（反向）
+adata.obs["ct2_pseudotime"] = 1.0 - adata.obs["CytoTRACE2_Score"].astype(float)
+
+# 可视化验证方向
+sc.pl.umap(adata, color=["CytoTRACE2_Score", "ct2_pseudotime", "cell_type"],
+           ncols=3, cmap="viridis")
+
+# 构建 PseudotimeKernel（基于 CytoTRACE2）
+from cellrank.kernels import PseudotimeKernel
+k_ct = PseudotimeKernel(adata, time_key="ct2_pseudotime")
+k_ct.compute_transition_matrix()
+
+print(k_ct)
+```
+
+
+### Kernel B: PseudotimeKernel (monocle3, if available)
+
+```{python}
+#| label: py-kernel-monocle
+#| eval: false
+
+# 只有当 Seurat 里有 monocle3 pseudotime 时才跑
+if "monocle3_pseudotime" in adata.obs.columns:
+    # 过滤掉 inf（monocle3 未连接到根节点的细胞）
+    mask = np.isfinite(adata.obs["monocle3_pseudotime"])
+    adata_sub = adata[mask].copy()
+
+    from cellrank.kernels import PseudotimeKernel
+    k_mono = PseudotimeKernel(adata_sub, time_key="monocle3_pseudotime")
+    k_mono.compute_transition_matrix()
+    print(k_mono)
+else:
+    k_mono = None
+    print("No monocle3 pseudotime. Skipping.")
+```
+
+
+### Kernel C: ConnectivityKernel (Smoothing)
+
+```{python}
+#| label: py-kernel-connectivity
+#| eval: false
+
+from cellrank.kernels import ConnectivityKernel
+k_conn = ConnectivityKernel(adata).compute_transition_matrix()
+print(k_conn)
+```
+
+
+### Combined Kernel
+
+推荐做法：主 kernel（方向性）+ ConnectivityKernel（平滑噪音）加权组合。
+
+```{python}
+#| label: py-combined-kernel
+#| eval: false
+
+# 0.8 * CytoTRACE + 0.2 * Connectivity
+combined = 0.8 * k_ct + 0.2 * k_conn
+combined.compute_transition_matrix()
+print(combined)
+```
+
+
+## Part 4: GPCCA Estimator — Identify Macrostates
+
+GPCCA (Generalized Perron Cluster Cluster Analysis) 是 CellRank 2 的默认 estimator，
+把细胞分为若干 **macrostates**（稳定的细胞状态簇），再挑出 initial 和 terminal states。
+
+```{python}
+#| label: py-gpcca
+#| eval: false
+
+g = cr.estimators.GPCCA(combined)
+
+# 1. Schur 分解，判断 macrostate 数量（看特征值 gap）
+g.compute_schur(n_components=20)
+g.plot_spectrum(real_only=True)
+plt.savefig("CellRank/schur_spectrum.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+# 2. 根据 spectrum 选择 macrostate 数量
+# 经验：肺纤维化 + 3 组，通常 5-10 个 macrostates
+N_STATES = 8   # 根据 spectrum 调整
+
+g.compute_macrostates(n_states=N_STATES, cluster_key="cell_type")
+g.plot_macrostates(which="all", basis="umap", legend_loc="right")
+plt.savefig("CellRank/macrostates.png", dpi=150, bbox_inches="tight")
+plt.show()
+```
+
+
+### Predict Initial & Terminal States
+
+```{python}
+#| label: py-init-term
+#| eval: false
+
+# 自动预测 initial states（分化起点，高 CytoTRACE 分数聚集的 macrostate）
+g.predict_initial_states(n_states=1)
+g.plot_macrostates(which="initial", basis="umap", legend_loc="right")
+plt.savefig("CellRank/initial_states.png", dpi=150, bbox_inches="tight")
+
+# 自动预测 terminal states（吸收态，分化终点）
+g.predict_terminal_states(method="top_n", n_states=3)  # 根据 macrostates 调
+g.plot_macrostates(which="terminal", basis="umap", legend_loc="right")
+plt.savefig("CellRank/terminal_states.png", dpi=150, bbox_inches="tight")
+
+print("Initial states:", g.initial_states.cat.categories.tolist())
+print("Terminal states:", g.terminal_states.cat.categories.tolist())
+```
+
+::: {.callout-note}
+如果自动预测的 terminal state 不符合预期（比如没抓到成纤维化亚群），
+可以手动指定：`g.set_terminal_states(["Myofibroblasts_1", "AT2_damaged"])`
+:::
+
+
+## Part 5: Fate Probabilities
+
+每个细胞到达各 terminal state 的概率。这是 CellRank 的核心输出。
+
+```{python}
+#| label: py-fate-prob
+#| eval: false
+
+g.compute_fate_probabilities()
+
+# UMAP 可视化：每个细胞染色为各 terminal state 的概率
+g.plot_fate_probabilities(same_plot=False, basis="umap", ncols=3)
+plt.savefig("CellRank/fate_probabilities.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+# 取出 fate_probabilities 矩阵
+fate_probs = g.fate_probabilities.X   # cells × terminal_states
+fate_df = pd.DataFrame(
+    fate_probs,
+    index=adata.obs_names,
+    columns=g.fate_probabilities.names,
+)
+fate_df.to_csv("CellRank/fate_probabilities.csv")
+print(fate_df.head())
+```
+
+
+### Aggregated Fate per Cell Type
+
+每种细胞类型整体上倾向于哪些命运？
+
+```{python}
+#| label: py-fate-per-celltype
+#| eval: false
+
+fate_by_ct = fate_df.groupby(adata.obs["cell_type"].values).mean()
+
+import seaborn as sns
+plt.figure(figsize=(8, 6))
+sns.heatmap(fate_by_ct, cmap="Reds", annot=True, fmt=".2f",
+            cbar_kws={"label": "Mean fate probability"})
+plt.title("Mean fate probability per cell type")
+plt.tight_layout()
+plt.savefig("CellRank/fate_by_celltype.png", dpi=150, bbox_inches="tight")
+plt.show()
+```
+
+
+## Part 6: 3-Group Comparison — Drug Effect on Fate
+
+**核心问题**：QR056251 是否改变了细胞的命运概率？
+
+```{python}
+#| label: py-fate-by-group
+#| eval: false
+
+# 把 fate 概率拼进 obs
+for col in fate_df.columns:
+    adata.obs[f"fate_{col}"] = fate_df[col].values
+
+# 每种细胞类型 × 每个 group 的平均 fate
+fate_by_ct_group = (
+    adata.obs.groupby(["cell_type", "group"])
+    [[f"fate_{c}" for c in fate_df.columns]]
+    .mean()
+    .reset_index()
+)
+fate_by_ct_group.to_csv("CellRank/fate_by_celltype_group.csv", index=False)
+
+# Fibrotic/damage 相关的 terminal state（根据实际命名调整）
+# 看每个 group 里这种命运的概率分布
+TARGET_FATE = fate_df.columns[0]   # ← 替换为你的纤维化 terminal state
+
+import matplotlib.pyplot as plt
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# 左：按 group 分组 boxplot（所有细胞）
+sns.boxplot(data=adata.obs, x="group", y=f"fate_{TARGET_FATE}",
+            order=["Normal", "Model", "QR056251"],
+            palette={"Normal": "#4393C3", "Model": "#D6604D",
+                     "QR056251": "#5AAE61"},
+            ax=axes[0])
+axes[0].set_title(f"Fate prob → {TARGET_FATE} (all cells)")
+axes[0].set_ylabel("Fate probability")
+
+# 右：按 cell_type + group
+plot_df = adata.obs.copy()
+plot_df["group"] = pd.Categorical(plot_df["group"],
+                                   categories=["Normal", "Model", "QR056251"])
+sns.boxplot(data=plot_df, x="cell_type", y=f"fate_{TARGET_FATE}",
+            hue="group", palette={"Normal": "#4393C3", "Model": "#D6604D",
+                                  "QR056251": "#5AAE61"}, ax=axes[1])
+axes[1].set_title(f"Fate prob → {TARGET_FATE} (per cell type)")
+axes[1].tick_params(axis="x", rotation=45)
+
+plt.tight_layout()
+plt.savefig(f"CellRank/fate_comparison_{TARGET_FATE}.png",
+            dpi=150, bbox_inches="tight")
+plt.show()
+```
+
+
+### Statistical Test: Group-Wise Fate Differences
+
+```{python}
+#| label: py-fate-stat
+#| eval: false
+
+from scipy.stats import mannwhitneyu
+from statsmodels.stats.multitest import multipletests
+
+def compare_fate(obs, fate_col, g1, g2):
+    mask1 = obs["group"] == g1
+    mask2 = obs["group"] == g2
+    rows = []
+    for ct in obs["cell_type"].unique():
+        ct_mask = obs["cell_type"] == ct
+        x1 = obs.loc[mask1 & ct_mask, fate_col].dropna().values
+        x2 = obs.loc[mask2 & ct_mask, fate_col].dropna().values
+        if len(x1) < 10 or len(x2) < 10:
+            continue
+        stat, p = mannwhitneyu(x1, x2, alternative="two-sided")
+        rows.append({
+            "cell_type": ct,
+            "fate":      fate_col.replace("fate_", ""),
+            "mean_g1":   x1.mean(),
+            "mean_g2":   x2.mean(),
+            "diff":      x2.mean() - x1.mean(),
+            "p_value":   p,
+            "comparison": f"{g2} vs {g1}",
+        })
+    return pd.DataFrame(rows)
+
+stat_all = []
+for fate_col in [c for c in adata.obs.columns if c.startswith("fate_")]:
+    stat_all.append(compare_fate(adata.obs, fate_col, "Normal", "Model"))
+    stat_all.append(compare_fate(adata.obs, fate_col, "Model", "QR056251"))
+
+stat_df = pd.concat(stat_all, ignore_index=True)
+stat_df["p_adj"] = multipletests(stat_df["p_value"], method="fdr_bh")[1]
+stat_df = stat_df.sort_values("p_adj")
+
+stat_df.to_csv("CellRank/fate_stat_tests.csv", index=False)
+print(stat_df.head(20))
+```
+
+
+### Drug-Reversed Fates
+
+哪些 cell_type × fate 被 BLM 推高、又被 QR056251 压下？
+
+```{python}
+#| label: py-drug-reversed-fate
+#| eval: false
+
+mvn = stat_df[stat_df["comparison"] == "Model vs Normal"][
+    ["cell_type", "fate", "diff", "p_adj"]
+].rename(columns={"diff": "diff_disease", "p_adj": "p_adj_disease"})
+
+dvm = stat_df[stat_df["comparison"] == "QR056251 vs Model"][
+    ["cell_type", "fate", "diff", "p_adj"]
+].rename(columns={"diff": "diff_drug", "p_adj": "p_adj_drug"})
+
+reversed_fate = mvn.merge(dvm, on=["cell_type", "fate"])
+reversed_fate["category"] = np.select(
+    [
+        (reversed_fate["diff_disease"] > 0) & (reversed_fate["diff_drug"] < 0) &
+            (reversed_fate["p_adj_disease"] < 0.05) &
+            (reversed_fate["p_adj_drug"] < 0.05),
+        (reversed_fate["diff_disease"] < 0) & (reversed_fate["diff_drug"] > 0) &
+            (reversed_fate["p_adj_disease"] < 0.05) &
+            (reversed_fate["p_adj_drug"] < 0.05),
+    ],
+    ["Pathologic fate reversed", "Physiologic fate restored"],
+    default="Not reversed",
+)
+
+print(reversed_fate["category"].value_counts())
+reversed_fate.to_csv("CellRank/drug_reversed_fates.csv", index=False)
+
+# 散点图
+fig, ax = plt.subplots(figsize=(10, 8))
+palette = {"Pathologic fate reversed":   "#D6604D",
+           "Physiologic fate restored":  "#5AAE61",
+           "Not reversed":                "grey"}
+for cat, sub in reversed_fate.groupby("category"):
+    ax.scatter(sub["diff_disease"], sub["diff_drug"],
+               c=palette[cat], s=60, alpha=0.7, label=cat)
+
+sig = reversed_fate[reversed_fate["category"] != "Not reversed"]
+for _, r in sig.iterrows():
+    ax.annotate(f"{r['cell_type']}→{r['fate']}",
+                (r["diff_disease"], r["diff_drug"]), fontsize=8)
+
+ax.axhline(0, color="grey", ls="--", lw=0.5)
+ax.axvline(0, color="grey", ls="--", lw=0.5)
+ax.set_xlabel("Fate prob change (Model - Normal)")
+ax.set_ylabel("Fate prob change (QR056251 - Model)")
+ax.set_title("Drug-reversed cell fates")
+ax.legend()
+plt.tight_layout()
+plt.savefig("CellRank/drug_reversed_fate_scatter.png",
+            dpi=150, bbox_inches="tight")
+plt.show()
+```
+
+
+## Part 7: Driver Genes for Each Terminal State
+
+找出驱动每个 terminal state 的基因（与 fate probability 相关性最强的基因）。
+
+```{python}
+#| label: py-drivers
+#| eval: false
+
+# 对每个 terminal state 找 top 20 driver genes
+drivers = g.compute_lineage_drivers(
+    lineages=g.fate_probabilities.names,
+    cluster_key="cell_type",
+)
+
+# 保存所有 driver 结果
+drivers.to_csv("CellRank/lineage_drivers.csv")
+
+# 可视化 top 驱动基因
+TARGET_FATE = g.fate_probabilities.names[0]   # 替换为感兴趣 fate
+top_drivers = (
+    drivers[[f"{TARGET_FATE}_corr", f"{TARGET_FATE}_pval"]]
+    .sort_values(f"{TARGET_FATE}_corr", ascending=False)
+    .head(20)
+)
+print(top_drivers)
+
+# UMAP 上展示 top driver
+sc.pl.umap(adata, color=top_drivers.index[:6].tolist(),
+           ncols=3, cmap="Reds", vmin=0, vmax="p99")
+plt.savefig(f"CellRank/drivers_{TARGET_FATE}.png",
+            dpi=150, bbox_inches="tight")
+```
+
+
+### Gene Expression Trends Along Fate
+
+沿着命运轨迹（按 fate probability 排序），基因表达如何变化？
+
+```{python}
+#| label: py-gene-trends
+#| eval: false
+
+# 需要先装 scanpy-tutorials 相关依赖，或用 CellRank 内置
+import cellrank as cr
+
+model = cr.models.GAMR(adata)   # 如果 GAMR 装不上，用 cr.models.GAM
+
+# 画 top driver 基因沿 fate 的表达趋势
+cr.pl.gene_trends(
+    adata,
+    model=model,
+    genes=top_drivers.index[:6].tolist(),
+    lineages=TARGET_FATE,
+    data_key="X",
+    time_key="ct2_pseudotime",
+    same_plot=True,
+    hide_cells=False,
+    figsize=(10, 5),
+)
+plt.savefig(f"CellRank/gene_trends_{TARGET_FATE}.png",
+            dpi=150, bbox_inches="tight")
+plt.show()
+```
+
+
+## Part 8: Export Results Back to Seurat
+
+把 CellRank 的关键结果导出为 CSV，在 R 里重新加回 Seurat metadata。
+
+```{python}
+#| label: py-export-for-seurat
+#| eval: false
+
+export_df = adata.obs[[
+    "cell_type", "group",
+    "CytoTRACE2_Score",
+    "ct2_pseudotime",
+]].copy()
+
+# 加入 macrostate 分配
+export_df["macrostate"] = adata.obs.get("macrostates", pd.NA)
+export_df["initial_state"] = adata.obs.get("initial_states", pd.NA)
+export_df["terminal_state"] = adata.obs.get("terminal_states", pd.NA)
+
+# 加入每个 fate 的概率
+for fate_col in [c for c in adata.obs.columns if c.startswith("fate_")]:
+    export_df[fate_col] = adata.obs[fate_col]
+
+export_df.to_csv("CellRank/cellrank_results_for_seurat.csv", index=True)
+print(f"Exported {len(export_df)} cells with CellRank results")
+```
+
+
+### Merge Back in R
+
+```{r}
+#| label: merge-back-r
+#| eval: false
+
+library(Seurat)
+library(qs2)
+library(readr)
+library(dplyr)
+
+seurat_obj <- qs2::qs_read("datasets/harmonized_seurat.qs2")
+cr_results <- read_csv("CellRank/cellrank_results_for_seurat.csv")
+
+# 第一列是细胞名
+names(cr_results)[1] <- "cell_id"
+
+# 选择要加入的列（避免重复已有的列）
+new_cols <- setdiff(names(cr_results), c("cell_id", colnames(seurat_obj@meta.data)))
+cr_meta <- cr_results %>%
+  select(cell_id, all_of(new_cols)) %>%
+  as.data.frame()
+rownames(cr_meta) <- cr_meta$cell_id
+cr_meta$cell_id <- NULL
+
+seurat_obj <- AddMetaData(seurat_obj, metadata = cr_meta)
+
+# UMAP 可视化验证
+FeaturePlot(seurat_obj,
+            features = grep("^fate_", colnames(seurat_obj@meta.data), value = TRUE),
+            min.cutoff = 0, max.cutoff = "q99",
+            ncol = 3)
+
+# 按 group 比较 fate 概率
+VlnPlot(seurat_obj,
+        features = grep("^fate_", colnames(seurat_obj@meta.data), value = TRUE)[1],
+        group.by = "cell_type",
+        split.by = "group",
+        pt.size = 0)
+
+# 保存合并结果
+qs2::qs_save(seurat_obj,
+             "datasets/harmonized_seurat_with_cellrank.qs2")
+```
+
+
+## Part 9: Save AnnData with Results
+
+```{python}
+#| label: py-save-adata
+#| eval: false
+
+# 清理 uns 里无法序列化的对象再存
+adata.write_h5ad("CellRank/adata_with_cellrank.h5ad")
+```
+
+
+## Appendix: Kernel Comparison (Sanity Check)
+
+不同 kernel 的结果是否一致？如果 CytoTRACEKernel 和 PseudotimeKernel 结论一致，
+说明 fate 推断稳健；如果不一致，需要审视哪个 kernel 更合适。
+
+```{python}
+#| label: py-kernel-compare
+#| eval: false
+
+# 对每个 kernel 独立跑 GPCCA，对比 fate 结果
+kernels_to_compare = {
+    "CytoTRACE": k_ct,
+    "Connectivity": k_conn,
+}
+if k_mono is not None:
+    kernels_to_compare["monocle3"] = k_mono
+
+fate_results = {}
+for name, kernel in kernels_to_compare.items():
+    est = cr.estimators.GPCCA(kernel)
+    est.compute_schur(n_components=15)
+    est.compute_macrostates(n_states=N_STATES, cluster_key="cell_type")
+    est.predict_terminal_states(method="top_n", n_states=3)
+    est.compute_fate_probabilities()
+    fp = pd.DataFrame(est.fate_probabilities.X,
+                      index=adata.obs_names,
+                      columns=est.fate_probabilities.names)
+    fate_results[name] = fp
+
+# 计算 kernel 两两之间 fate 相关性（同名终末态才可比）
+# 这里只做定性对比：每个细胞的"最可能命运" agreement
+for name, fp in fate_results.items():
+    adata.obs[f"top_fate_{name}"] = fp.idxmax(axis=1).values
+
+# 三个 kernel 推断的 top fate 是否一致
+agreement = (
+    (adata.obs.get("top_fate_CytoTRACE") == adata.obs.get("top_fate_Connectivity"))
+    .mean()
+)
+print(f"CytoTRACE vs Connectivity agreement: {agreement:.2%}")
+```
+
+
+## Notes
+
+- **Kernel 选择**：有 velocity 就用 VelocityKernel；没有时 CytoTRACEKernel（若发育/分化方向明确）
+  或 PseudotimeKernel（有可靠 pseudotime）最好。ConnectivityKernel 单用容易方向性差，
+  适合作为加权辅助。
+- **Macrostate 数量**：看 Schur spectrum，找到特征值明显 gap 的位置。
+  对于几千到几万细胞、10 几个细胞类型的数据，5-12 个 macrostates 是常见范围。
+- **Terminal state 手动指定**：自动预测不完美，结合生物学知识手动指定
+  （`g.set_terminal_states([...])`）通常结果更好。
+- **Replicate-aware**：默认 CellRank 把所有样本混在一起推断命运。若要 replicate 层级
+  统计，用 Part 6 的 `compare_fate()` + Wilcoxon。
+
+
+## Session Info
+
+```{python}
+#| label: py-session
+#| eval: false
+
+import cellrank, scanpy, anndata
+print(f"cellrank: {cellrank.__version__}")
+print(f"scanpy:   {scanpy.__version__}")
+print(f"anndata:  {anndata.__version__}")
+```

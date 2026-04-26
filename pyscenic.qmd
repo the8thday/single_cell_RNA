@@ -1,0 +1,964 @@
+---
+title: "pySCENIC Gene Regulatory Network Analysis"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+jupyter: python3
+---
+
+
+## Introduction
+
+pySCENIC 是 SCENIC 的 Python 实现（R 版已 deprecated），速度快 10-100 倍，
+推荐用于 TF 调控网络推断。核心三步：
+
+1. **GRN inference (GRNBoost2)** — 基于梯度提升推断 TF 与靶基因的共表达关系
+2. **cisTarget (ctx)** — motif 富集分析筛选直接调控的 TF-target 关系，形成 regulon
+3. **AUCell** — 对每个细胞评估 regulon 活性
+
+**流程概览：**
+
+- **R 端**（少量）：用 `anndataR` 把 Seurat 对象转成 `.h5ad`
+- **Python 端**（主体）：下载数据库 → 跑 pySCENIC 三步 → scanpy 下游分析
+
+**数据：** BLM 小鼠肺组织单细胞，3 组（Normal / Model / QR056251）
+
+
+## Part 0: Export Seurat to AnnData (R)
+
+在 R 端把 Seurat 对象转成 AnnData `.h5ad`。
+
+```{r}
+#| label: export-seurat
+#| eval: false
+
+library(Seurat)
+library(anndataR)
+library(qs2)
+
+seurat_obj <- qs2::qs_read("datasets/harmonized_seurat.qs2")
+
+# 确保用 RNA assay 的 raw counts（pySCENIC 需要 counts）
+DefaultAssay(seurat_obj) <- "RNA"
+
+# Seurat v5: 合并多 layer 的 counts，否则 as_AnnData 取到的是分片
+# 不 JoinLayers 会导致 X 矩阵不完整，pySCENIC 跑出来的 regulon 偏少
+seurat_obj <- JoinLayers(seurat_obj, assay = "RNA")
+
+# 移除 Multiplets
+seurat_obj <- subset(seurat_obj, cell_type != "Multiplets")
+
+# 转为 AnnData
+adata <- as_AnnData(
+  seurat_obj,
+  assay_name = "RNA",
+  x_mapping = "counts",                     # X 存 raw counts（pySCENIC 需要）
+  layers_mapping = c(logcounts = "data"),   # 保留 log-normalized 数据
+  obs_mapping = c(
+    cell_type  = "cell_type",
+    group      = "group",
+    orig.ident = "orig.ident",
+    nCount_RNA = "nCount_RNA",
+    nFeature_RNA = "nFeature_RNA"
+  ),
+  obsm_mapping = list(X_pca = "pca", X_umap = "umap")
+)
+
+dir.create("SCENIC", showWarnings = FALSE)
+adata$write_h5ad("SCENIC/input.h5ad")
+```
+
+
+## Part 1: Environment Setup
+
+### Install pySCENIC
+
+pySCENIC 对 Python 版本敏感（推荐 3.10-3.11，3.13 可能有依赖问题）。
+建议单独建一个 venv：
+
+```bash
+# 用 uv 创建 pySCENIC 专用环境
+uv venv .venv-pyscenic --python 3.11
+source .venv-pyscenic/bin/activate
+
+uv pip install pyscenic scanpy anndata pyarrow loompy
+uv pip install numpy==1.23.5 pandas==1.5.3   # pySCENIC 0.12.x 对 numpy/pandas 版本敏感
+```
+
+
+### Download cisTarget Databases (Mouse)
+
+pySCENIC 用的数据库格式与旧版 R SCENIC 一致（feather），
+推荐下载 **v10 clustered databases**（比 v9 mc9nr 更全）。
+
+```bash
+mkdir -p SCENIC/cisTarget
+cd SCENIC/cisTarget
+
+# v10 clustered motif databases (small-RNA + 10kb)
+# 小鼠：mm10 + v10 clustered motifs
+wget https://resources.aertslab.org/cistarget/databases/mus_musculus/mm10/refseq_r80/mc_v10_clust/gene_based/mm10_500bp_up_100bp_down_full_tx_v10_clust.genes_vs_motifs.rankings.feather
+
+wget https://resources.aertslab.org/cistarget/databases/mus_musculus/mm10/refseq_r80/mc_v10_clust/gene_based/mm10_10kbp_up_10kbp_down_full_tx_v10_clust.genes_vs_motifs.rankings.feather
+
+# Motif annotation（TF ↔ motif 映射表）
+wget https://resources.aertslab.org/cistarget/motif2tf/motifs-v10nr_clust-nr.mgi-m0.001-o0.0.tbl
+
+# TF 列表（~1600 个小鼠 TF）
+wget https://resources.aertslab.org/cistarget/tf_lists/allTFs_mm.txt
+
+cd ../..
+```
+
+
+## Part 2: Prepare Input (Python)
+
+```{python}
+#| label: py-setup
+#| eval: false
+
+import os
+import numpy as np
+import pandas as pd
+import scanpy as sc
+import anndata as ad
+import loompy as lp
+
+os.makedirs("SCENIC", exist_ok=True)
+sc.settings.verbosity = 2
+```
+
+
+### Load AnnData and Subsample (Optional)
+
+```{python}
+#| label: py-load
+#| eval: false
+
+adata = sc.read_h5ad("SCENIC/input.h5ad")
+print(adata)
+print(adata.obs["group"].value_counts())
+print(adata.obs["cell_type"].value_counts())
+
+# 大数据集建议降采样（分层抽样保留每种细胞类型）
+# GRNBoost2 对 >20k cells 仍然吃力，10k 以下更稳
+N_SUBSAMPLE = 10000
+if adata.n_obs > N_SUBSAMPLE:
+    sc.pp.subsample(adata, n_obs=N_SUBSAMPLE, random_state=42)
+    print(f"Subsampled to {adata.n_obs} cells")
+```
+
+
+### Gene Filtering
+
+```{python}
+#| label: py-filter
+#| eval: false
+
+# pySCENIC 推荐的基因过滤标准
+# 总计数 >= 3 * 0.01 * nCells，且在 >= 1% 细胞中表达
+n_cells = adata.n_obs
+sc.pp.filter_genes(adata, min_counts=3 * 0.01 * n_cells)
+sc.pp.filter_genes(adata, min_cells=int(0.01 * n_cells))
+
+print(f"Genes after filtering: {adata.n_vars}")
+```
+
+
+### Export to Loom (pySCENIC Input Format)
+
+```{python}
+#| label: py-to-loom
+#| eval: false
+
+# pySCENIC CLI 接受 loom 文件：row_attrs={Gene}, col_attrs={CellID}
+row_attrs = {"Gene": np.array(adata.var_names)}
+col_attrs = {
+    "CellID": np.array(adata.obs_names),
+    "nGene": np.array(np.sum(adata.X.transpose() > 0, axis=0)).flatten(),
+    "nUMI":  np.array(np.sum(adata.X.transpose(),     axis=0)).flatten(),
+}
+
+# 注意：loom 的矩阵是 genes × cells，需要转置 AnnData.X
+lp.create(
+    "SCENIC/input.loom",
+    adata.X.transpose().toarray() if hasattr(adata.X, "toarray") else adata.X.T,
+    row_attrs,
+    col_attrs,
+)
+print("Loom file saved to SCENIC/input.loom")
+```
+
+
+## Part 3: pySCENIC Pipeline (Command Line)
+
+三步命令行分开跑，便于查看中间结果和排查问题。
+也可以用 pySCENIC 的 Python API（见本文件末尾）。
+
+### Step 1: GRN Inference (GRNBoost2)
+
+推断 TF 与靶基因的共表达关系，生成 adjacency 表。**最耗时的步骤**，10k 细胞约 1-3 小时。
+
+```bash
+pyscenic grn \
+  SCENIC/input.loom \
+  SCENIC/cisTarget/allTFs_mm.txt \
+  -o SCENIC/adj.csv \
+  --num_workers 16 \
+  --seed 42
+```
+
+输出：`SCENIC/adj.csv`（TF、target、importance 三列）
+
+
+### Step 2: cisTarget (Motif Enrichment + Build Regulons)
+
+基于 motif 富集筛选出有直接调控证据的 TF-target 关系，构建 regulons。
+
+```bash
+pyscenic ctx \
+  SCENIC/adj.csv \
+  SCENIC/cisTarget/mm10_500bp_up_100bp_down_full_tx_v10_clust.genes_vs_motifs.rankings.feather \
+  SCENIC/cisTarget/mm10_10kbp_up_10kbp_down_full_tx_v10_clust.genes_vs_motifs.rankings.feather \
+  --annotations_fname SCENIC/cisTarget/motifs-v10nr_clust-nr.mgi-m0.001-o0.0.tbl \
+  --expression_mtx_fname SCENIC/input.loom \
+  --mode "custom_multiprocessing" \
+  --output SCENIC/regulons.csv \
+  --num_workers 16
+```
+
+输出：`SCENIC/regulons.csv`（每个 TF 的 regulon 成员基因和 motif 证据）
+
+
+### Step 3: AUCell (Score Regulon Activity)
+
+对**所有细胞**（不只是降采样的）评估 regulon 活性。
+
+```bash
+# 如果之前做了降采样，先重新导出全细胞 loom
+# 或直接用 input.loom（降采样后的也行）
+
+pyscenic aucell \
+  SCENIC/input.loom \
+  SCENIC/regulons.csv \
+  -o SCENIC/output.loom \
+  --num_workers 16
+```
+
+输出：`SCENIC/output.loom`（包含 regulon AUC 矩阵）
+
+
+## Part 4: Downstream Analysis (Python)
+
+### Load pySCENIC Output
+
+```{python}
+#| label: py-load-output
+#| eval: false
+
+import loompy as lp
+import json
+import zlib, base64
+
+lf = lp.connect("SCENIC/output.loom", mode="r+", validate=False)
+
+# regulon AUC 矩阵：cells × regulons
+auc_mtx = pd.DataFrame(
+    lf.ca.RegulonsAUC,
+    index=lf.ca.CellID
+)
+
+# regulon 成员基因（每个 TF 对应的靶基因）
+regulons_raw = lf.ra.Regulons
+regulon_names = auc_mtx.columns.tolist()
+
+# 关闭 loom
+lf.close()
+
+print(f"AUC matrix shape: {auc_mtx.shape}")
+print(f"Number of regulons: {len(regulon_names)}")
+print("Top 10 regulons:", regulon_names[:10])
+```
+
+
+### Merge AUC into AnnData
+
+```{python}
+#| label: py-merge-auc
+#| eval: false
+
+# 重新加载原始 AnnData（未降采样的）
+adata_full = sc.read_h5ad("SCENIC/input.h5ad")
+
+# 只保留 pySCENIC 覆盖的细胞
+common_cells = adata_full.obs_names.intersection(auc_mtx.index)
+adata_full = adata_full[common_cells].copy()
+auc_mtx = auc_mtx.loc[common_cells]
+
+# 把 AUC 矩阵存到 obsm
+adata_full.obsm["X_aucell"] = auc_mtx.values
+
+# 把每个 regulon 作为单独的 obs 列（方便 scanpy 可视化）
+for reg in auc_mtx.columns:
+    adata_full.obs[f"AUC_{reg}"] = auc_mtx[reg].values
+
+adata_full.uns["regulon_names"] = regulon_names
+print(adata_full)
+```
+
+
+### Visualize Top Regulons on UMAP
+
+```{python}
+#| label: py-umap-regulons
+#| eval: false
+#| fig-width: 14
+#| fig-height: 10
+
+import matplotlib.pyplot as plt
+
+# 选择方差最大的 top regulons
+regulon_var = auc_mtx.var(axis=0).sort_values(ascending=False)
+top_regulons = regulon_var.head(12).index.tolist()
+
+sc.pl.umap(
+    adata_full,
+    color=[f"AUC_{r}" for r in top_regulons],
+    ncols=4,
+    cmap="Reds",
+    vmin=0, vmax="p99",
+    frameon=False,
+    show=False,
+)
+plt.tight_layout()
+plt.savefig("SCENIC/umap_top_regulons.png", dpi=150, bbox_inches="tight")
+plt.show()
+```
+
+
+### Regulon Specificity Score (RSS) per Cell Type
+
+```{python}
+#| label: py-rss
+#| eval: false
+#| fig-width: 12
+#| fig-height: 8
+
+from pyscenic.rss import regulon_specificity_scores
+from pyscenic.plotting import plot_rss
+import seaborn as sns
+
+# 计算 RSS（每种细胞类型中 regulon 的特异性分数）
+rss = regulon_specificity_scores(auc_mtx, adata_full.obs["cell_type"])
+rss.to_csv("SCENIC/rss_celltype.csv")
+
+# 热图：每种细胞类型的 top 5 特异性 regulons
+top_per_type = {}
+for ct in rss.index:
+    top_per_type[ct] = rss.loc[ct].sort_values(ascending=False).head(5).index.tolist()
+
+all_top = list(set(sum(top_per_type.values(), [])))
+
+# 按细胞类型分组的 AUC 热图
+auc_by_ct = auc_mtx[all_top].groupby(
+    adata_full.obs["cell_type"].values
+).mean()
+
+# Z-score 标准化
+from scipy.stats import zscore
+auc_z = auc_by_ct.apply(zscore, axis=0).fillna(0)
+
+plt.figure(figsize=(12, 10))
+sns.heatmap(auc_z.T, cmap="RdBu_r", center=0,
+            cbar_kws={"label": "Z-score"},
+            xticklabels=True, yticklabels=True)
+plt.title("Top regulon activity per cell type (Z-scaled)")
+plt.tight_layout()
+plt.savefig("SCENIC/rss_heatmap.png", dpi=150, bbox_inches="tight")
+plt.show()
+```
+
+
+### Differential Regulon Activity: 3-Group Comparison
+
+```{python}
+#| label: py-diff-regulons
+#| eval: false
+
+from scipy.stats import mannwhitneyu
+from statsmodels.stats.multitest import multipletests
+
+def compare_regulons(auc, groups, g1, g2):
+    """Wilcoxon 检验比较两组间所有 regulon 的 AUC"""
+    mask1 = groups == g1
+    mask2 = groups == g2
+    results = []
+    for reg in auc.columns:
+        x1 = auc.loc[mask1, reg].values
+        x2 = auc.loc[mask2, reg].values
+        try:
+            stat, pval = mannwhitneyu(x1, x2, alternative="two-sided")
+        except Exception:
+            stat, pval = np.nan, np.nan
+        results.append({
+            "regulon": reg,
+            "mean_g1": x1.mean(),
+            "mean_g2": x2.mean(),
+            "diff":    x2.mean() - x1.mean(),
+            "log2FC":  np.log2((x2.mean() + 1e-10) / (x1.mean() + 1e-10)),
+            "p_value": pval,
+        })
+    df = pd.DataFrame(results)
+    df["p_adj"] = multipletests(df["p_value"].fillna(1), method="fdr_bh")[1]
+    df["comparison"] = f"{g2} vs {g1}"
+    return df.sort_values("p_adj")
+
+
+groups = adata_full.obs["group"]
+
+# Model vs Normal：疾病带来的 regulon 变化
+diff_MvsN = compare_regulons(auc_mtx, groups, "Normal", "Model")
+
+# QR056251 vs Model：药物治疗的效果
+diff_DvsM = compare_regulons(auc_mtx, groups, "Model", "QR056251")
+
+diff_all = pd.concat([diff_MvsN, diff_DvsM])
+diff_all.to_csv("SCENIC/diff_regulons.csv", index=False)
+
+print("=== Model vs Normal (Top 10) ===")
+print(diff_MvsN.head(10))
+print("\n=== QR056251 vs Model (Top 10) ===")
+print(diff_DvsM.head(10))
+```
+
+
+### Drug-Reversed Regulons
+
+核心问题：BLM 激活 + QR056251 抑制的 regulons（被药物逆转的病理 TF）
+
+```{python}
+#| label: py-drug-reversed
+#| eval: false
+#| fig-width: 10
+#| fig-height: 8
+
+# 合并两组比较，找出被逆转的 regulon
+reversed_df = diff_MvsN[["regulon", "diff", "p_adj"]].rename(
+    columns={"diff": "diff_disease", "p_adj": "p_adj_disease"}
+).merge(
+    diff_DvsM[["regulon", "diff", "p_adj"]].rename(
+        columns={"diff": "diff_drug", "p_adj": "p_adj_drug"}
+    ),
+    on="regulon"
+)
+
+# 疾病上调 + 药物下调 = pathologic regulon 被逆转
+reversed_df["category"] = np.select(
+    [
+        (reversed_df["diff_disease"] > 0) & (reversed_df["diff_drug"] < 0) &
+            (reversed_df["p_adj_disease"] < 0.05) & (reversed_df["p_adj_drug"] < 0.05),
+        (reversed_df["diff_disease"] < 0) & (reversed_df["diff_drug"] > 0) &
+            (reversed_df["p_adj_disease"] < 0.05) & (reversed_df["p_adj_drug"] < 0.05),
+    ],
+    [
+        "Disease-up, drug-reversed",
+        "Disease-down, drug-restored",
+    ],
+    default="Not reversed",
+)
+
+print(reversed_df["category"].value_counts())
+reversed_df.to_csv("SCENIC/drug_reversed_regulons.csv", index=False)
+
+# 散点图：X = 疾病变化，Y = 药物变化
+fig, ax = plt.subplots(figsize=(10, 8))
+palette = {
+    "Disease-up, drug-reversed":   "#D6604D",
+    "Disease-down, drug-restored": "#5AAE61",
+    "Not reversed": "grey",
+}
+for cat, sub in reversed_df.groupby("category"):
+    ax.scatter(sub["diff_disease"], sub["diff_drug"],
+               c=palette[cat], alpha=0.7, s=40, label=cat)
+
+# 标注显著的逆转 regulons
+sig = reversed_df[reversed_df["category"] != "Not reversed"]
+for _, row in sig.iterrows():
+    ax.annotate(row["regulon"].replace("(+)", ""),
+                (row["diff_disease"], row["diff_drug"]),
+                fontsize=8, alpha=0.8)
+
+ax.axhline(0, color="grey", lw=0.5, ls="--")
+ax.axvline(0, color="grey", lw=0.5, ls="--")
+ax.set_xlabel("AUC change (Model - Normal)")
+ax.set_ylabel("AUC change (QR056251 - Model)")
+ax.set_title("Drug-reversed regulons: disease vs drug effect")
+ax.legend(loc="best", fontsize=9)
+plt.tight_layout()
+plt.savefig("SCENIC/drug_reversed_scatter.png", dpi=150, bbox_inches="tight")
+plt.show()
+```
+
+
+### Per Cell Type × Group Heatmap
+
+哪种细胞类型中 regulon 变化最显著？
+
+```{python}
+#| label: py-celltype-group-heatmap
+#| eval: false
+#| fig-width: 14
+#| fig-height: 10
+
+# 按 cell_type × group 计算平均 AUC
+meta = adata_full.obs[["cell_type", "group"]].copy()
+meta["label"] = meta["cell_type"].astype(str) + " | " + meta["group"].astype(str)
+
+# 选择显著差异的 regulons
+sig_regs = diff_all[diff_all["p_adj"] < 0.05]["regulon"].unique()
+print(f"Significant regulons: {len(sig_regs)}")
+
+avg_auc = auc_mtx[sig_regs].groupby(meta["label"].values).mean()
+
+# 按 cell_type 排序
+avg_auc["cell_type"] = [x.split(" | ")[0] for x in avg_auc.index]
+avg_auc["group"] = [x.split(" | ")[1] for x in avg_auc.index]
+avg_auc = avg_auc.sort_values(["cell_type", "group"])
+
+mat = avg_auc.drop(columns=["cell_type", "group"])
+mat_z = mat.apply(zscore, axis=0).fillna(0)
+
+plt.figure(figsize=(14, min(0.25 * mat.shape[1] + 4, 20)))
+sns.heatmap(mat_z.T, cmap="RdBu_r", center=0,
+            cbar_kws={"label": "Z-score"},
+            xticklabels=True, yticklabels=True)
+plt.title("Significant regulon activity: cell_type × group")
+plt.xticks(rotation=45, ha="right")
+plt.tight_layout()
+plt.savefig("SCENIC/regulon_heatmap_celltype_group.png", dpi=150, bbox_inches="tight")
+plt.show()
+```
+
+
+### Per Cell Type Differential Regulons
+
+对每种细胞类型单独做 Model vs Normal 和 QR056251 vs Model 比较，
+找出药物在哪种细胞中作用最强。
+
+```{python}
+#| label: py-per-celltype-diff
+#| eval: false
+
+per_ct_results = []
+for ct in adata_full.obs["cell_type"].unique():
+    mask = adata_full.obs["cell_type"] == ct
+    if mask.sum() < 50:
+        continue
+    auc_sub = auc_mtx.loc[mask]
+    groups_sub = adata_full.obs.loc[mask, "group"]
+
+    # 确保三组都有足够细胞
+    gc = groups_sub.value_counts()
+    if (gc < 10).any():
+        continue
+
+    try:
+        d_mvn = compare_regulons(auc_sub, groups_sub, "Normal", "Model")
+        d_dvm = compare_regulons(auc_sub, groups_sub, "Model", "QR056251")
+        d_mvn["cell_type"] = ct
+        d_dvm["cell_type"] = ct
+        per_ct_results.extend([d_mvn, d_dvm])
+    except Exception as e:
+        print(f"Skipped {ct}: {e}")
+
+per_ct_df = pd.concat(per_ct_results)
+per_ct_df.to_csv("SCENIC/diff_regulons_per_celltype.csv", index=False)
+print(per_ct_df.head())
+```
+
+
+## Part 5: Extract TF Targets & Motifs
+
+### Parse Regulons CSV
+
+```{python}
+#| label: py-parse-regulons
+#| eval: false
+
+from pyscenic.utils import load_motifs
+from pyscenic.transform import df2regulons
+
+# 解析 regulons.csv（来自 ctx 步骤）
+motifs = load_motifs("SCENIC/regulons.csv")
+regulons = df2regulons(motifs)
+
+# 查看某个感兴趣 TF 的 regulon 成员
+tf_of_interest = "Stat3"  # 替换为感兴趣的 TF
+for reg in regulons:
+    if reg.transcription_factor == tf_of_interest:
+        print(f"{reg.name}: {len(reg.genes)} targets")
+        print("Top 20 targets:", list(reg.genes)[:20])
+        break
+```
+
+
+### Export TF → Target Table
+
+```{python}
+#| label: py-export-tf-targets
+#| eval: false
+
+# 构建 TF → target 长表
+tf_target_list = []
+for reg in regulons:
+    for gene in reg.genes:
+        tf_target_list.append({
+            "TF":     reg.transcription_factor,
+            "target": gene,
+            "weight": reg.gene2weight.get(gene, np.nan),
+        })
+
+tf_target_df = pd.DataFrame(tf_target_list)
+tf_target_df.to_csv("SCENIC/tf_target_table.csv", index=False)
+print(f"Total TF-target relations: {len(tf_target_df)}")
+print(f"Unique TFs: {tf_target_df['TF'].nunique()}")
+```
+
+
+## Part 6: Save Results
+
+```{python}
+#| label: py-save
+#| eval: false
+
+# 保存带 AUC 的 AnnData
+adata_full.write_h5ad("SCENIC/adata_with_regulons.h5ad")
+
+# 单独保存 AUC 矩阵（cells × regulons）
+auc_mtx.to_csv("SCENIC/auc_matrix.csv")
+
+# RSS
+rss.to_csv("SCENIC/rss_celltype.csv")
+```
+
+
+## Part 7: Bring AUC Back to Seurat (R)
+
+把 AUC 矩阵作为新 Assay 加回 Seurat，后续可直接复用 `FindMarkers / DotPlot /
+VlnPlot / FeaturePlot`，跟平时的 Seurat 工作流无缝衔接。
+
+```{r}
+#| label: r-auc-to-seurat
+#| eval: false
+
+library(Seurat)
+library(qs2)
+library(dplyr)
+
+# 1. 重新加载完整 Seurat (未降采样的)
+seurat_obj <- qs2::qs_read("datasets/harmonized_seurat.qs2")
+DefaultAssay(seurat_obj) <- "RNA"
+seurat_obj <- JoinLayers(seurat_obj, assay = "RNA")
+seurat_obj <- subset(seurat_obj, cell_type != "Multiplets")
+
+# 2. 读 AUC 矩阵 (cells × regulons)
+auc <- read.csv("SCENIC/auc_matrix.csv", row.names = 1, check.names = FALSE)
+
+# 3. 对齐细胞 (pySCENIC 可能丢掉极少数全零细胞，或上游做过降采样)
+common <- intersect(colnames(seurat_obj), rownames(auc))
+seurat_obj <- subset(seurat_obj, cells = common)
+auc        <- auc[common, , drop = FALSE]
+
+# 4. 清洗 regulon 名字: "Stat3(+)" -> "Stat3"
+#    pySCENIC 默认只输出激活型 (+); 名字里的括号会让 Seurat formula 报错
+clean_names <- gsub("\\(\\+\\)", "", colnames(auc))
+clean_names <- gsub("\\(-\\)",  "_neg", clean_names)
+auc_mat <- t(as.matrix(auc))                 # Seurat assay: features × cells
+rownames(auc_mat) <- clean_names
+
+# 5. 创建 AUCell assay
+#    AUC 已是 0-1 的活性分数，不要再 NormalizeData; 直接放 data slot
+seurat_obj[["AUCell"]] <- CreateAssayObject(data = auc_mat)
+DefaultAssay(seurat_obj) <- "AUCell"
+seurat_obj <- ScaleData(seurat_obj, features = rownames(auc_mat))
+
+qs2::qs_save(seurat_obj, "datasets/harmonized_with_regulons.qs2")
+```
+
+
+### Visualize Regulon Activity (Seurat style)
+
+```{r}
+#| label: r-auc-vis
+#| eval: false
+#| fig-width: 14
+#| fig-height: 10
+
+DefaultAssay(seurat_obj) <- "AUCell"
+
+# UMAP 上看几个感兴趣 TF
+FeaturePlot(seurat_obj,
+            features = c("Stat3", "Spi1", "Foxp3", "Klf4"),
+            order = TRUE,
+            cols  = c("lightgrey", "#D6604D"),
+            ncol  = 2)
+
+# DotPlot: 每种细胞类型的 top regulons (取方差 top 20)
+top_regs <- names(sort(apply(GetAssayData(seurat_obj, slot = "data"), 1, var),
+                       decreasing = TRUE))[1:20]
+DotPlot(seurat_obj, features = top_regs, group.by = "cell_type") +
+  RotatedAxis()
+
+# VlnPlot: 三组之间比较单个 regulon
+VlnPlot(seurat_obj, features = "Stat3",
+        group.by = "group", pt.size = 0)
+```
+
+
+### Differential Regulons via FindMarkers
+
+复用 Seurat 的 Wilcoxon。AUC 是 0-1 连续值，不是 counts，
+要把 `logfc.threshold` 和 `min.pct` 调到 0，否则会过滤掉大部分 regulon。
+
+```{r}
+#| label: r-findmarkers-regulons
+#| eval: false
+
+DefaultAssay(seurat_obj) <- "AUCell"
+Idents(seurat_obj) <- "group"
+
+# Model vs Normal: 疾病激活的 regulon
+mk_MvsN <- FindMarkers(
+  seurat_obj,
+  ident.1 = "Model", ident.2 = "Normal",
+  test.use        = "wilcox",
+  logfc.threshold = 0,
+  min.pct         = 0,
+  slot            = "data"
+)
+mk_MvsN$regulon <- rownames(mk_MvsN)
+
+# QR056251 vs Model: 药物作用
+mk_DvsM <- FindMarkers(
+  seurat_obj,
+  ident.1 = "QR056251", ident.2 = "Model",
+  test.use        = "wilcox",
+  logfc.threshold = 0,
+  min.pct         = 0,
+  slot            = "data"
+)
+mk_DvsM$regulon <- rownames(mk_DvsM)
+
+write.csv(mk_MvsN, "SCENIC/seurat_diff_MvsN.csv", row.names = FALSE)
+write.csv(mk_DvsM, "SCENIC/seurat_diff_DvsM.csv", row.names = FALSE)
+```
+
+
+### Drug-Reversed Regulons (Seurat side)
+
+和 Part 4 Python 端思路一致，用 R 端 FindMarkers 的结果再做一次：
+**疾病显著上调 + 药物显著下调** 的 regulon = 被药物逆转的病理 TF。
+
+```{r}
+#| label: r-drug-reversed
+#| eval: false
+#| fig-width: 9
+#| fig-height: 7
+
+library(ggplot2)
+
+reversed <- mk_MvsN %>%
+  select(regulon, avg_log2FC_disease = avg_log2FC, p_adj_disease = p_val_adj) %>%
+  inner_join(
+    mk_DvsM %>%
+      select(regulon, avg_log2FC_drug = avg_log2FC, p_adj_drug = p_val_adj),
+    by = "regulon"
+  ) %>%
+  mutate(category = case_when(
+    avg_log2FC_disease > 0 & avg_log2FC_drug < 0 &
+      p_adj_disease < 0.05 & p_adj_drug < 0.05 ~ "Disease-up, drug-reversed",
+    avg_log2FC_disease < 0 & avg_log2FC_drug > 0 &
+      p_adj_disease < 0.05 & p_adj_drug < 0.05 ~ "Disease-down, drug-restored",
+    TRUE ~ "Not reversed"
+  ))
+
+write.csv(reversed, "SCENIC/seurat_drug_reversed.csv", row.names = FALSE)
+
+ggplot(reversed, aes(avg_log2FC_disease, avg_log2FC_drug, color = category)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey60") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey60") +
+  geom_point(alpha = 0.7, size = 2) +
+  ggrepel::geom_text_repel(
+    data = subset(reversed, category != "Not reversed"),
+    aes(label = regulon), size = 3, max.overlaps = 30
+  ) +
+  scale_color_manual(values = c(
+    "Disease-up, drug-reversed"   = "#D6604D",
+    "Disease-down, drug-restored" = "#5AAE61",
+    "Not reversed"                = "grey70"
+  )) +
+  labs(x = "log2FC (Model vs Normal)",
+       y = "log2FC (QR056251 vs Model)",
+       title = "Drug-reversed regulons") +
+  theme_classic(base_size = 12)
+```
+
+
+### Per Cell Type × Group (Pseudobulk Heatmap)
+
+```{r}
+#| label: r-celltype-group-heatmap
+#| eval: false
+#| fig-width: 12
+#| fig-height: 10
+
+library(pheatmap)
+
+DefaultAssay(seurat_obj) <- "AUCell"
+auc_data <- GetAssayData(seurat_obj, slot = "data")  # regulons × cells
+
+meta <- seurat_obj@meta.data %>%
+  mutate(label = paste(cell_type, group, sep = " | "))
+
+# 按 cell_type | group 分组求平均 AUC
+auc_avg <- sapply(unique(meta$label), function(lab) {
+  cells <- rownames(meta)[meta$label == lab]
+  rowMeans(auc_data[, cells, drop = FALSE])
+})
+
+# 选显著差异的 regulon
+sig_regs <- union(
+  rownames(mk_MvsN)[mk_MvsN$p_val_adj < 0.05],
+  rownames(mk_DvsM)[mk_DvsM$p_val_adj < 0.05]
+)
+auc_avg <- auc_avg[sig_regs, , drop = FALSE]
+
+# Z-score by row (regulon)
+auc_z <- t(scale(t(auc_avg)))
+auc_z[is.na(auc_z)] <- 0
+
+# 列注释
+col_anno <- data.frame(
+  cell_type = sapply(strsplit(colnames(auc_z), " \\| "), `[`, 1),
+  group     = sapply(strsplit(colnames(auc_z), " \\| "), `[`, 2),
+  row.names = colnames(auc_z)
+)
+col_anno <- col_anno[order(col_anno$cell_type, col_anno$group), ]
+auc_z    <- auc_z[, rownames(col_anno)]
+
+pheatmap(auc_z,
+         annotation_col = col_anno,
+         cluster_cols   = FALSE,
+         show_colnames  = FALSE,
+         color          = colorRampPalette(c("#2166AC", "white", "#B2182B"))(50),
+         filename       = "SCENIC/regulon_heatmap_celltype_group_R.png",
+         width = 12, height = 10)
+```
+
+
+## Appendix A: Python API Alternative (No CLI)
+
+如果不想用命令行，可以用 pySCENIC 的 Python API 一次跑完三步。
+适合 < 10k 细胞的数据集，大数据集仍建议用 CLI 并行跑。
+
+```{python}
+#| label: py-api-alternative
+#| eval: false
+
+from dask.diagnostics import ProgressBar
+from arboreto.algo import grnboost2
+from pyscenic.utils import modules_from_adjacencies
+from pyscenic.prune import prune2df, df2regulons
+from pyscenic.aucell import aucell
+from ctxcore.rnkdb import FeatherRankingDatabase
+
+# --- Step 1: GRN ---
+ex_matrix = pd.DataFrame(
+    adata.X.toarray() if hasattr(adata.X, "toarray") else adata.X,
+    index=adata.obs_names,
+    columns=adata.var_names,
+)
+tf_names = [line.strip() for line in open("SCENIC/cisTarget/allTFs_mm.txt")]
+tf_names = [tf for tf in tf_names if tf in ex_matrix.columns]
+
+with ProgressBar():
+    adjacencies = grnboost2(
+        expression_data=ex_matrix,
+        tf_names=tf_names,
+        verbose=True,
+        seed=42,
+    )
+adjacencies.to_csv("SCENIC/adj.csv", index=False)
+
+# --- Step 2: cisTarget ---
+db_files = [
+    "SCENIC/cisTarget/mm10_500bp_up_100bp_down_full_tx_v10_clust.genes_vs_motifs.rankings.feather",
+    "SCENIC/cisTarget/mm10_10kbp_up_10kbp_down_full_tx_v10_clust.genes_vs_motifs.rankings.feather",
+]
+dbs = [FeatherRankingDatabase(fname=f, name=os.path.basename(f)) for f in db_files]
+
+modules = list(modules_from_adjacencies(adjacencies, ex_matrix))
+
+with ProgressBar():
+    df = prune2df(dbs, modules,
+                  "SCENIC/cisTarget/motifs-v10nr_clust-nr.mgi-m0.001-o0.0.tbl")
+regulons = df2regulons(df)
+
+df.to_csv("SCENIC/regulons.csv")
+
+# --- Step 3: AUCell ---
+auc_mtx = aucell(ex_matrix, regulons, num_workers=8)
+auc_mtx.to_csv("SCENIC/auc_matrix.csv")
+```
+
+
+## Appendix B: Loom → AnnData Conversion
+
+如果只有 loom 没有 h5ad，或想重新从 output.loom 提取所有信息：
+
+```{python}
+#| label: py-loom-to-adata
+#| eval: false
+
+def loom_to_adata(loom_path):
+    lf = lp.connect(loom_path, mode="r", validate=False)
+    adata = ad.AnnData(
+        X=lf[:, :].T,
+        obs=pd.DataFrame({k: lf.ca[k] for k in lf.ca.keys()},
+                         index=lf.ca.CellID),
+        var=pd.DataFrame({k: lf.ra[k] for k in lf.ra.keys()},
+                         index=lf.ra.Gene),
+    )
+    if "RegulonsAUC" in lf.ca.keys():
+        adata.obsm["X_aucell"] = lf.ca.RegulonsAUC
+    lf.close()
+    return adata
+
+adata_from_loom = loom_to_adata("SCENIC/output.loom")
+print(adata_from_loom)
+```
+
+
+## Notes
+
+- **pySCENIC vs SCENIC+**：pySCENIC 仅基于 scRNA-seq；SCENIC+ 需要 multiome（scATAC + scRNA），能整合染色质可及性证据，结果更严格。本流程用 pySCENIC，与你现有数据兼容。
+- **GRNBoost2 随机性**：每次结果会略有不同，建议固定 `--seed 42`；若需更稳定结果，可以跑 3-5 次取 regulon 交集。
+- **Regulon 命名**：`Stat3(+)` 表示激活型 regulon（正相关 target），`Stat3(-)` 表示抑制型。默认只推断 `(+)` regulon。
+- **多机/大数据**：GRNBoost2 支持 Dask 分布式，百万细胞建议上集群。
+
+
+## Session Info
+
+```{python}
+#| label: py-session-info
+#| eval: false
+
+import sys
+print(sys.version)
+
+import pyscenic, scanpy, anndata
+print(f"pySCENIC: {pyscenic.__version__}")
+print(f"scanpy:   {scanpy.__version__}")
+print(f"anndata:  {anndata.__version__}")
+```

@@ -1,0 +1,359 @@
+---
+title: "cell annotation"
+format: html
+---
+
+## 细胞注释
+
+
+细胞注释麻烦起来可真麻烦呀。
+
+
+### 
+
+```{r}
+# 如果加载了GPTCelltype官方的包，我们需要取消加载并卸载原有的包
+detach("package:GPTCelltype", unload = T)
+detach("package:openai", unload = T)
+remove.packages("GPTCelltype") 
+remove.packages("openai")
+
+# 安装数信院AI助手的适配包
+install.packages("remotes")
+remotes::install_github("EddieLv/openai")
+remotes::install_github("EddieLv/GPTCelltype")
+
+#设置API
+
+
+Sys.setenv(http_proxy  = "http://127.0.0.1:7890")  # HTTP 代理
+Sys.setenv(https_proxy = "http://127.0.0.1:7890")  # HTTPS 代理
+
+
+
+#加载包
+ library(GPTCelltype)
+ library(openai)
+# seurat5 需要先合并矩阵
+seob_sct_singlets <- JoinLayers(seob_sct)
+all.markers <- FindAllMarkers(object = seob_WT)
+
+# Run gptcelltype function
+res <- gptcelltype(all.markers, tissuename = 'xxx', model = 'gpt-4')
+
+# 添加到原来的对象中
+seob_harmony_singlets@meta.data$celltype <- as.factor(res[as.character(Idents(seob_harmony_singlets))])
+
+# Visualize the result using DimPlot
+DimPlot(seob_harmony_singlets, group.by = 'celltype')
+
+# 对某个细胞注释名进行
+res[1] <- 'Classical monocytes'
+
+
+# 检测openai网络
+tryCatch(
+  {
+    models <- openai::list_models()
+    print("成功连接到 OpenAI API！")
+    print(models)
+  },
+  error = function(e) {
+    print("连接失败，请检查网络或 API key")
+    print(e)
+  }
+)
+```
+
+
+```{r}
+0:BHLHE22,SATB2-AS1,NHLH1,SLA,SATB2                       
+1:SYNPR,SYT10,DLX6-AS1,TSHZ1,ERBB4                        
+2:HOPX,FAM107A,ATP1A2,BCAN,SNHG18                         
+3:H2AC14,H3C2,DLGAP5,CDC20,H1-5                   
+4:NTS,LMO3,CDH7,GPR22,LPL                                 
+5:CCSER1,KCNIP4,MALAT1,DSCAM,LINGO2                       
+6:DDIT3,CDKN1A,DLK1,ENSG00000289578,GADD45A               
+7:LHX5-AS1,LHX1,ONECUT3,LHX5,ONECUT1                      
+8:ENSG00000274441,LINC01965,FBXL7,ENSG00000271860,MIR99AHG
+9:EBF1,LINC00581,SEMA3C,ZNF503,TAC1                       
+10:GNRH1,FGF3,ISL1,FGF19,GFRA1                             
+11:P2RY1,SIX3,SIX3-AS1,LINC01833,NRGN                      
+12:AQP4,RSPO1,RSPO2,ID3,GFAP  
+
+
+
+
+0:BHLHE22,SATB2-AS1,NHLH1,SLA,SATB2,ADRA2A,PALMD,PLXNA4,NEUROD…
+1:SYNPR,SYT10,DLX6-AS1,TSHZ1,ERBB4,VSTM2A,DLX5,PBX3,SP8,GAD2   
+2:HOPX,FAM107A,ATP1A2,BCAN,SNHG18,PTN,PON2,S1PR1,ENSG000002846…
+3:H2AC14,H3C2,DLGAP5,CDC20,H1-5,TOP2A,ASPM,NUSAP1,UBE2C,MKI67  
+4:NTS,LMO3,CDH7,GPR22,LPL,FEZF2,IGFBP5,NR4A2,PLXDC2,LMO7       
+5:CCSER1,KCNIP4,MALAT1,DSCAM,LINGO2,ADARB2,CACNA1C,MIAT,CSMD1,…
+6:DDIT3,CDKN1A,DLK1,ENSG00000289578,GADD45A,FTL,HLA-B,CEBPB,CI…
+7:LHX5-AS1,LHX1,ONECUT3,LHX5,ONECUT1,DIO3,SAMD3,SNCG,PCSK1,ONE…
+8:ENSG00000274441,LINC01965,FBXL7,ENSG00000271860,MIR99AHG,ADA…
+9:EBF1,LINC00581,SEMA3C,ZNF503,TAC1,GABRA1,TSHZ2,ZFHX3,PEG10,S…
+10:GNRH1,FGF3,ISL1,FGF19,GFRA1,TNNI1,ZIC4,NEFL,C22orf42,ZIC3    
+11:P2RY1,SIX3,SIX3-AS1,LINC01833,NRGN,PLCXD3,MAFB,GUCY1A1,TLE4,…
+12:AQP4,RSPO1,RSPO2,ID3,GFAP,PMP2,APOE,PTGDS,RSPO3,S100B 
+
+
+
+0:BHLHE22,SATB2-AS1,NHLH1,SLA,ADRA2A                      
+1:SYNPR,SYT10,DLX6-AS1,VSTM2A,TSHZ1                       
+2:HOPX,FAM107A,ATP1A2,BCAN,PTN                            
+3:H2AC14,DLGAP5,H3C2,H1-5,CDC20                           
+4:NTS,CRYM,LMO3,CDH7,GPR22                                
+5:KCNIP4,CCSER1,DSCAM,LINGO2,ADARB2
+6:DDIT3,CDKN1A,TUBA4A,EEF1AKMT4,DLK1                      
+7:LHX5-AS1,LHX1,ONECUT3,LHX5,ONECUT1                      
+8:ENSG00000274441,LINC01965,FBXL7,ENSG00000271860,MIR99AHG
+9:EBF1,LINC00581,SEMA3C,ZNF503,TAC1                       
+10:GNRH1,FGF3,ISL1,FGF19,TNNI1                             
+11:P2RY1,SIX3-AS1,SIX3,LINC01833,NRGN                      
+12:AQP4,RSPO1,AGT,ID3,RSPO2
+```
+
+
+
+
+###
+
+TransferData
+
+Seurat V5 中的 TransferData 用于在单细胞 RNA-seq 数据集之间进行细胞类型注释、数据整合、交叉数据集分析，以及其他多模态数据集之间的信息转移。它的核心原理是通过找到参考数据集和目标数据集之间的共同特征或结构（锚点，anchors），将参考数据集中的信息（如细胞类型、基因表达等）转移到目标数据集中。
+
+TransferData 通常与 FindTransferAnchors 配合使用。FindTransferAnchors 负责识别两个数据集之间的锚点，TransferData 则负责通过这些锚点将参考数据中的信息传递到目标数据集。
+
+选择参考数据集：首先，你需要一个带有已知注释（例如细胞类型）的参考数据集。
+
+目标数据集：这是你希望注释或整合的目标数据集。
+
+找到锚点：使用 FindTransferAnchors 函数找到两个数据集之间的共同结构。
+
+转移注释：使用 TransferData 函数将参考数据中的注释信息（如细胞类型或其他特征）传递到目标数据集中。
+
+
+```{r}
+# 准备待注释数据,确保数据只有一个 layers。
+seob <- JoinLayers(seob, assay = "RNA")
+
+# 准备参考数据集
+## 1. 查看可用数据集
+library(SeuratData)
+AvailableData() -> temp
+
+## 2. 安装数据集
+## InstallData("pbmc3k")
+## install.packages("pbmc3k.SeuratData_3.1.4.tar.gz", repos = NULL, type = "source")
+
+## 3. 加载数据集
+pbmc3k <- LoadData("pbmc3k")
+
+## 4. 更新到 V5 格式
+pbmc3k <- UpdateSeuratObject(pbmc3k)
+
+# 处理参考数据集
+library(tidyverse)
+pbmc3k <- SCTransform(object = pbmc3k) %>%
+             RunPCA(verbose = FALSE) %>%
+             RunUMAP(dims = 1:30, verbose = FALSE)
+
+# 自动注释
+## 找到锚点：是在两个数据集中找到相似的细胞，计算它们的相似性锚点。
+anchors <- FindTransferAnchors(
+  reference = pbmc3k,  # 参考数据集
+  query = seob,          # 目标数据集
+  normalization.method = "SCT",  # SCTransform 标准化
+  reference.reduction = "pca",
+  dims = 1:30             # 使用 PCA 的前 30 个主成分
+)
+
+## 传递注释：将参考数据集中的细胞类型注释转移到目标数据集中
+transfer <- TransferData(
+  anchorset = anchors,
+  refdata = pbmc3k$seurat_annotations, # 参考数据集中的细胞类型注释
+  dims = 1:30)
+
+## 添加注释
+seob <- AddMetaData(
+  seob, 
+  metadata = transfer, 
+  col.name = "predicted.id")
+
+# 可视化
+DimPlot(seob, 
+        reduction = "umap", 
+        group.by  = c("seurat_clusters", "predicted.id"),
+        label = T) 
+
+```
+
+
+### marker 整理
+
+
+常用的一些marker基因
+
+```{r}
+T Cells (CD3D, CD3E, CD8A,PTPRC,CD4,CD2), 
+B cells (CD19, CD79A, MS4A1 [CD20]), 
+Plasma cells (IGHG1, MZB1, SDC1, CD79A), 
+Monocytes and macrophages (CD68, CD163, CD14),
+NK Cells (FGFBP2, FCG3RA, CX3CR1),
+Fibroblasts (FGF7, MME,GSN,LUM,DCN), 
+Endothelial cells (PECAM1, VWF). 
+epi or tumor (EPCAM, KRT19, PROM1, ALDH1A1, CD24).
+immune (CD45+,PTPRC),
+epithelial/cancer (EpCAM+,EPCAM), 
+stromal (CD10+,MME,fibo or CD31+,PECAM1,endo) 
+Mast(CPA3, CST3, KIT, TPSAB1, TPSB2, MS4A2)
+
+#髓系
+macrophages (Adgre1, Cd14, and Fcgr3,LYZ,CD68,CD163),
+cDCs (Xcr1, Flt3, Ccr7,CD1E),
+pDCs (Siglech, Clec10a,  Clec12a,CLEC4C), 
+monocytes (Ly6c2 , Spn,CD300E), 
+neutrophils (Csf3r, S100a8, and Cxcl3),
+```
+
+```{r}
+pbmc_markers <- data.frame(
+  cell_type = c("Naive CD4 T cells", "CD14+ Monocytes", "Memory CD4 T cells", "CD8 T cells", 
+                "NK cells", "B cells", "FCGR3A+ Monocytes", "Dendritic cells", "Platelets"),
+  markers = c("CD3, CD4, CCR7, CD45RA", 
+              "CD14, LYZ", 
+              "CD3, CD4, CD45RO, CCR7", 
+              "CD3, CD8A, GZMB, PRF1", 
+              "NCAM1 (CD56), KLRD1 (CD94), NKG2A", 
+              "CD19, MS4A1 (CD20), CD79A", 
+              "FCGR3A (CD16), LYZ, S100A8/A9", 
+              "FCER1A, CD1C, CLEC9A, IL3RA", 
+              "ITGA2B (CD41), ITGB3 (CD61), GP9 (CD42a), GP1BA (CD42b)"),
+  stringsAsFactors = FALSE
+)
+```
+
+
+PBMC样本的常见marker基因
+
+```{r}
+c(
+  "Naive CD4 T", IL7R, CCR7
+  "CD14+ Mono", CD14, LYZ
+  "Memory CD4 T", S100A4
+  "B", MS4A1
+  "CD8 T", CD8A
+  "FCGR3A+ Mono",FCGR3A, MS4A7
+  "NK", GNLY, NKG7
+  "DC",CST3, FCER1A
+  "Platelet" PPBP
+)
+```
+
+
+又是一些marker基因
+```{r}
+Bcells <- c("PTPRC", "MS4A1", "CD79A", "CD19" )
+Dendritic <- c("PTPRC", "IL3RA", "IRF7", "IRF8", "GZMB", "CD4", "CLEC4C", "PTGDS", "JCHAIN", "PLAC8", "PLD4", "TCF4", "BCL11A", "GPR183", "CCDC50", "LILRA4", "TSPAN13", "CLIC3", "MPEG1")
+Endothelial <- c("CLEC14A", "PECAM1", "VWF", "CAV1", "EMCN", "CDH5", "MCAM", "IL3RA", "IGFBP7", "COL4A1", "COL4A2", "COL15A1", "SPARCL1", "A2M", "HSPG2", "PLVAP", "AQP1", "ENG", "RAMP2", "GNG11", "EGFL7", "CLDN5", "INSR")
+Fibroblast <- c("COL1A1", "COL3A1", "WT1", "ACTA2", "CAV1", "COL1A2", "DCN", "SPARC", "COL6A1", "CCDC80", "LUM", "COL6A2", "COL6A3", "CALD1", "RARRES2", "MGP", "CTHRC1", "AEBP1", "POSTN", "COL5A2", "FBLN1", "TAGLN", "C1S", "C1R", "NNMT", "MMP2", "IGFBP5", "TIMP1", "FN1", "IGFBP7", "C3", "COL5A1", "LGALS1")
+Myeloid <- c("PTPRC", "CD14", "FCER1G", "FCGR3A", "LYZ", "CTSS", "CD33", "CD68", "CD163", "ITGAX", "ITGAM", "CD4", "MRC1", "VSIG4", "SPP1", "APOE", "C1QA", "C1QB", "C1QC", "APOC1", "FTL", "S100A9", "TYROBP", "AIF1", "CD74", "PSAP", "CTSB")
+Epi <- c("WFDC2", "CD24", "CLDN3", "KRT7", "KRT8", "KRT17", "KRT18", "KRT19", "EPCAM", "WT1", "CLDN4", "MSLN", "FOLR1", "MUC1")
+Plasma <- c("PTPRC", "IGKC", "IGHG1", "CD79A", "IGHG2", "IGLC2", "IGLC3", "IGHG3", "IGHG4", "JCHAIN", "MZB1", "XBP1")
+Tcells <- c("PTPRC", "CD2", "CD3D", "TRAC", "GZMA", "NKG7", "CD3E", "CD3G", "CD4", "TCF7", "CD8A", "PRF1", "GZMB", "CCL5", "CCL4", "IL32", "CD52")
+Mast <- c("PTPRC", "KIT", "CPA3", "CTSG", "MS4A2", "TPSAB1", "TPSB2", "HPGD", "HPGDS", "GATA2")
+SMC=c('NOTCH3','RGS5','NDUFA4L2','MYH11','COX4I2','PLN')
+cycle=c('RRM2','MKI67','BIRC5','UBE2C','TOP2A','AURKB')
+```
+
+
+T细胞亚群marker基因
+TCellAtlas 数据库和T细胞自动化注释工具STCAT，超全的T细胞亚型数据库包含68 T-cell subtypes and states
+```{r}
+# T细胞亚群
+
+# GNLY（颗粒溶素）：细胞毒性T细胞（CD8+ T细胞）和 NK细胞 的标志物，参与杀伤靶细胞。
+# IL17A：Th17细胞（辅助性T细胞亚群）的特异性标志，介导炎症反应。
+# CXCL13：滤泡辅助性T细胞（Tfh） 的标志物，促进B细胞活化和生发中心形成。
+# CCL3/CCL4/CCL20：趋化因子，常见于活化的T细胞（如Th1、Th17）或 调节性T细胞（Treg），参与招募免疫细胞。
+
+###CD4T
+CD4_markers_list =list(
+  Tc=c("CD3D","CD3E"),
+  CD4=c("CD4" ),
+  Treg=c("TNFRSF4","BATF","TNFRSF18","FOXP3","IL2RA","IKZF2"),
+  naive=c("CCR7","SELL","CD5"),
+  Tfh=c("CXCR5","BCL6","ICA1","TOX","TOX2","IL6ST"),#滤泡辅助性T细胞
+  ILC=c("TNFRSF25","KRT81","LST1","AREG","LTB","CD69")
+) 
+
+###CD8T
+CD8_markers_list1 =list(
+  CD8=c("CD8A","CD8B"),
+  TN_TCM=c("CCR7","SELL","TCF7","LEF1"),
+  TEM=c("GZMK"  ),
+  TEFF=c("TBX21","FCGR3A","FGFBP2"),
+  TRM=c("XCL1","XCL2","ITGAE","CD69"),
+  IEL_T = c("TMIGD2"),
+  yT1c=c("GNLY","PTGDS","GZMB","TRDC"),
+  yT2c=c("TMN1","HMGB2","TYMS"),
+  MAIT_T = c("SLC4A10")
+) 
+
+
+CD8_markers_list2 =list(
+  CD8T=c("CD8A","CD8B"),
+  MAIT=c("ZBTB16","NCR3","RORA"),
+  ExhaustedCD8T=c("LAG3","TIGIT","PDCD1","HAVCR2","CTLA4"),
+  EffMemoryCD8=c("EOMES","ITM2C"),
+  Resting_NK=c("XCL1","XCL2","KLRC1"),
+  Cytotoxic_NK=c("CX3CR1","FGFBP2","FCGR3A","KLRD1"),
+  Pre_exhausted=c("IFNG","PRF1","GNLY","GZMA","NKG7","GZMK")
+)
+
+```
+
+
+GSE242889-肝细胞癌微血管侵袭
+
+```{r}
+last_markers = c('PTPRC', 'CD3D', 'CD3E', 'CD4','CD8A',
+                   'CD19', 'CD79A', 'MS4A1' ,
+                   'IGHG1', 'MZB1', 'SDC1',
+                   'CD68', 'CD163', 'CD14', 
+                   'TPSAB1' , 'TPSB2',  # mast cells,
+                   'RCVRN','FPR1' , 'ITGAM' ,
+                   'C1QA',  'C1QB',  # mac
+                   'S100A9', 'S100A8', 'MMP19',# monocyte
+                   'FCGR3A',
+                   'LAMP3', 'IDO1','IDO2',## DC3 
+                   'CD1E','CD1C', # DC2
+                   'KLRB1','NCR1', # NK 
+                   'FGF7','MME', 'ACTA2', ## human  fibo 
+                 'GJB2', 'RGS5',
+                   'DCN', 'LUM',  'GSN' , ## mouse PDAC fibo 
+                   'MKI67' , 'TOP2A', 
+                   'PECAM1', 'VWF',  ## endo 
+                 "PLVAP",'PROX1','ACKR1','CA4','HEY1',
+                   'EPCAM' , 'KRT19','KRT7', # epi 
+                   'FYXD2', 'TM4SF4', 'ANXA4',# cholangiocytes
+                   'APOC3', 'FABP1',  'APOA1',  # hepatocytes
+                   'Serpina1c',
+                   'PROM1', 'ALDH1A1' )
+```
+
+神经元相关marker基因
+
+```{r}
+astrocytes = c("AQP4", "ADGRV1", "GPC5", "RYR3") 
+endothelial = c("CLDN5", "ABCB1", "EBF1") 
+excitatory = c("CAMK2A", "CBLN2", "LDB2") 
+inhibitory = c("GAD1", "LHFPL3", "PCDH15") 
+microglia = c("C3", "LRMDA", "DOCK8") 
+oligodendrocytes = c("MBP", "PLP1", "ST18") 
+OPC='Tnr,Igsf21,Neu4,Gpr17'
+Ependymal='Cfap126,Fam183b,Tmem212,pifo,Tekt1,Dnah12'
+pericyte=c(  'DCN', 'LUM',  'GSN' ,'FGF7','MME', 'ACTA2','RGS5')
+```

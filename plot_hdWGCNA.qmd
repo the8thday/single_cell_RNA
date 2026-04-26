@@ -1,0 +1,247 @@
+---
+title: "hdWGCNA module-focused plots"
+format: html
+---
+
+针对单个模块的聚焦分析：Hub genes、ME 组间比较、GO/KEGG/Reactome 富集、Enrichr top terms 可视化。
+改动 `target_module` 一处即可切换模块，所有变量名、标题、输出路径自动跟随。
+
+```{r}
+#| label: setup
+
+library(hdWGCNA)
+library(Seurat)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(forcats)
+library(cowplot)
+library(patchwork)
+library(tidytext)
+library(statsExpressions)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(ReactomePA)
+library(enrichplot)
+
+# ---- 单一真源：切模块只改这里 ----
+target_module <- "M12"
+org_db        <- org.Mm.eg.db
+kegg_org      <- "mmu"
+reactome_org  <- "mouse"
+
+out_dir <- file.path("Results/hdwgcna", target_module)
+# dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+
+## 1. Enrichr top terms 可视化
+
+依赖：seurat_sub 已跑过 `RunEnrichr`，`enrich_target` 已从 `GetEnrichrTable` 过滤到 `target_module`。
+
+```{r}
+#| label: enrichr-plots
+
+enrich_top <- enrich_target %>%
+  group_by(db) %>%
+  slice_min(P.value, n = 5) %>%
+  ungroup() %>%
+  mutate(
+    neg_log10_p = -log10(P.value),
+    Term_short = ifelse(
+      nchar(Term) > 60,
+      paste0(substr(Term, 1, 57), "..."),
+      Term
+    ),
+    n_genes = lengths(strsplit(as.character(Genes), ";"))
+  )
+
+plot_title <- paste0(target_module, " Enrichr top 5 per database")
+
+# 方案 A：分面条形图
+p_bar <- enrich_top %>%
+  mutate(Term_short = reorder_within(Term_short, neg_log10_p, db)) %>%
+  ggplot(aes(x = neg_log10_p, y = Term_short, fill = db)) +
+  geom_col(show.legend = FALSE) +
+  scale_y_reordered() +
+  facet_wrap(~ db, scales = "free_y", ncol = 1) +
+  labs(title = plot_title, x = expression(-log[10] ~ italic(P)), y = NULL) +
+  theme_cowplot() +
+  theme(
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold")
+  )
+
+# 方案 B：点图（大小=命中基因数，颜色=-log10 p）
+p_dot <- enrich_top %>%
+  mutate(Term_short = reorder_within(Term_short, neg_log10_p, db)) %>%
+  ggplot(aes(x = neg_log10_p, y = Term_short,
+             size = n_genes, color = neg_log10_p)) +
+  geom_point() +
+  scale_y_reordered() +
+  scale_color_gradient(low = "#4DBBD5", high = "#E64B35") +
+  scale_size_continuous(range = c(2, 6)) +
+  facet_wrap(~ db, scales = "free_y", ncol = 1) +
+  labs(
+    title = plot_title,
+    x = expression(-log[10] ~ italic(P)),
+    y = NULL,
+    size = "Gene count",
+    color = expression(-log[10] ~ italic(P))
+  ) +
+  theme_cowplot() +
+  theme(
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold")
+  )
+
+print(p_bar)
+print(p_dot)
+```
+
+
+## 2. Hub genes (top kME)
+
+```{r}
+#| label: hub-genes
+
+kME_col <- paste0("kME_", target_module)
+
+module_genes <- GetModules(seurat_sub) %>%
+  filter(module == target_module) %>%
+  arrange(desc(!!sym(kME_col)))
+
+hub_top20 <- module_genes %>% head(20)
+print(hub_top20[, c("gene_name", "module", kME_col)])
+
+# write.csv(module_genes, file.path(out_dir, paste0(target_module, "_all_genes_kME.csv")), row.names = FALSE)
+# write.csv(hub_top20,    file.path(out_dir, paste0(target_module, "_top20_hub.csv")),     row.names = FALSE)
+```
+
+
+## 3. Module Eigengene 组间比较
+
+Kruskal-Wallis + Dunn 两两比较（BH 校正），手动在 violin+boxplot 上标注 p 值。
+
+```{r}
+#| label: me-boxplot
+
+hMEs <- GetMEs(seurat_sub, harmonized = TRUE)
+me_df <- data.frame(
+  cell  = rownames(hMEs),
+  ME    = hMEs[, target_module],
+  group = seurat_sub$group
+) %>%
+  filter(!is.na(ME)) %>%
+  mutate(group = factor(group, levels = c("Normal", "Model", "QR056251")))
+
+kw_res <- oneway_anova(data = me_df, x = group, y = ME, type = "nonparametric")
+pw_res <- pairwise_comparisons(
+  data = me_df, x = group, y = ME,
+  type = "nonparametric", p.adjust.method = "BH"
+)
+print(kw_res)
+print(pw_res)
+
+kw_label <- sprintf(
+  "Kruskal-Wallis: chi2 = %.2f, p = %.2e",
+  kw_res$statistic, kw_res$p.value
+)
+
+p_box <- ggplot(me_df, aes(x = group, y = ME, fill = group)) +
+  geom_violin(alpha = 0.4, trim = FALSE, scale = "width") +
+  geom_boxplot(width = 0.2, outlier.shape = NA, alpha = 0.8) +
+  scale_fill_manual(values = c(
+    Normal = "#4DBBD5", Model = "#E64B35", QR056251 = "#00A087"
+  )) +
+  labs(
+    title = paste0(target_module, " Module Eigengene across groups"),
+    subtitle = kw_label,
+    x = NULL, y = "Harmonized ME"
+  ) +
+  theme_cowplot() +
+  theme(legend.position = "none")
+
+# 两两 p 值
+y_max  <- max(me_df$ME, na.rm = TRUE)
+y_step <- diff(range(me_df$ME, na.rm = TRUE)) * 0.08
+pw_res <- pw_res %>% mutate(y_pos = y_max + y_step * seq_len(n()))
+grp_levels <- levels(me_df$group)
+
+for (i in seq_len(nrow(pw_res))) {
+  x1 <- match(pw_res$group1[i], grp_levels)
+  x2 <- match(pw_res$group2[i], grp_levels)
+  p_box <- p_box +
+    annotate("segment",
+             x = x1, xend = x2,
+             y = pw_res$y_pos[i], yend = pw_res$y_pos[i]) +
+    annotate("text",
+             x = (x1 + x2) / 2,
+             y = pw_res$y_pos[i] + y_step * 0.3,
+             label = sprintf("p = %.2g", pw_res$p.value[i]),
+             size = 3.5)
+}
+
+print(p_box)
+# ggsave(file.path(out_dir, paste0(target_module, "_ME_boxplot_by_group.pdf")),
+#        p_box, width = 5.5, height = 5)
+```
+
+
+## 4. 功能富集：GO BP / KEGG / Reactome (mouse)
+
+```{r}
+#| label: enrichment
+
+entrez_tbl <- bitr(
+  module_genes$gene_name,
+  fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org_db
+) %>%
+  distinct(SYMBOL, .keep_all = TRUE)
+
+ego_bp <- enrichGO(
+  gene = entrez_tbl$ENTREZID, OrgDb = org_db, keyType = "ENTREZID",
+  ont = "BP", pAdjustMethod = "BH",
+  pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable = TRUE
+)
+
+ekegg <- enrichKEGG(
+  gene = entrez_tbl$ENTREZID, organism = kegg_org,
+  pAdjustMethod = "BH", pvalueCutoff = 0.05
+)
+if (!is.null(ekegg) && nrow(ekegg) > 0) {
+  ekegg <- setReadable(ekegg, OrgDb = org_db, keyType = "ENTREZID")
+}
+
+ereac <- enrichPathway(
+  gene = entrez_tbl$ENTREZID, organism = reactome_org,
+  pAdjustMethod = "BH", pvalueCutoff = 0.05, readable = TRUE
+)
+
+# 统一画图（结果为空时返回 NULL，避免报错）
+safe_dotplot <- function(x, title, show = 15) {
+  if (is.null(x) || nrow(x) == 0) return(NULL)
+  dotplot(x, showCategory = show) + ggtitle(title)
+}
+
+p_go   <- safe_dotplot(ego_bp, paste0(target_module, " GO BP"))
+p_kegg <- safe_dotplot(ekegg,  paste0(target_module, " KEGG"))
+p_reac <- safe_dotplot(ereac,  paste0(target_module, " Reactome"))
+
+print(p_go)
+print(p_kegg)
+print(p_reac)
+
+# 保存（按需取消注释）
+# save_if <- function(res, p, tag) {
+#   if (is.null(res) || nrow(res) == 0) return(invisible())
+#   write.csv(as.data.frame(res),
+#             file.path(out_dir, paste0(target_module, "_", tag, ".csv")),
+#             row.names = FALSE)
+#   ggsave(file.path(out_dir, paste0(target_module, "_", tag, "_dotplot.pdf")),
+#          p, width = 8, height = 6)
+# }
+# save_if(ego_bp, p_go,   "GO_BP")
+# save_if(ekegg,  p_kegg, "KEGG")
+# save_if(ereac,  p_reac, "Reactome")
+```

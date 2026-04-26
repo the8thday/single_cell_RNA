@@ -1,0 +1,650 @@
+---
+title: "PROGENy Pathway Activity Analysis"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+---
+
+
+## Introduction
+
+PROGENy（Pathway RespOnsive GENes）通过**转录足迹（footprint）**推断信号通路活性，
+与传统基因集方法（GSVA）不同，它使用从大量扰动实验中学习到的**通路响应基因权重**，
+而非通路成员基因本身。
+
+支持 14 条核心信号通路：Androgen, EGFR, Estrogen, Hypoxia, JAK-STAT, MAPK,
+NFkB, p53, PI3K, TGFb, TNFa, Trail, VEGF, WNT。
+
+本分析使用 `decoupleR` 包调用 PROGENy 模型权重，在单细胞水平推断通路活性，
+并比较 Normal / Model（BLM）/ QR056251（ROCK1/2 抑制剂）三组间的差异。
+
+
+## Setup
+
+```{r}
+#| label: load-packages
+#| include: false
+
+library(Seurat)
+library(decoupleR)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(patchwork)
+library(qs2)
+
+set.seed(42)
+```
+
+
+## Load Data
+
+```{r}
+#| label: load-data
+#| eval: false
+
+seurat_obj <- qs2::qs_read("datasets/harmonized_seurat.qs2")
+
+# 移除 Multiplets
+seurat_obj <- subset(seurat_obj, cell_type != "Multiplets")
+
+DefaultAssay(seurat_obj) <- "RNA"
+
+# 确认分组信息
+seurat_obj$group <- factor(seurat_obj$group,
+                           levels = c("Normal", "Model", "QR056251"))
+table(seurat_obj$group)
+table(seurat_obj$cell_type)
+```
+
+
+## Get PROGENy Model Weights
+
+```{r}
+#| label: get-progeny-model
+#| eval: false
+
+# 获取 PROGENy 模型权重（小鼠）
+# top = 500：每条通路取前 500 个响应基因（默认 100，增大可提高覆盖率）
+# organism = "mouse"：使用小鼠同源基因映射
+progeny_model <- decoupleR::get_progeny(organism = "mouse", top = 500)
+
+# 查看模型结构
+head(progeny_model)
+table(progeny_model$source)  # 14 条通路
+```
+
+
+## Run PROGENy at Single-Cell Level
+
+```{r}
+#| label: run-progeny
+#| eval: false
+
+# 提取 normalized 表达矩阵（log-normalized data）
+# decoupleR 需要 genes × cells 矩阵
+expr_mat <- GetAssayData(seurat_obj, layer = "data")
+
+# 使用 multivariate linear model（MLM）方法推断通路活性
+# 这是 decoupleR 推荐的方法，速度快且准确
+progeny_scores <- decoupleR::run_mlm(
+  mat = expr_mat,
+  net = progeny_model,
+  .source = "source",
+  .target = "target",
+  .mor = "weight",
+  minsize = 5
+)
+
+head(progeny_scores)
+```
+
+
+## Add PROGENy Scores to Seurat Object
+
+```{r}
+#| label: add-to-seurat
+#| eval: false
+
+# 将通路活性分数转为宽格式矩阵，添加到 Seurat metadata
+progeny_wide <- progeny_scores |>
+  filter(statistic == "mlm") |>
+  select(source, condition, score) |>
+  pivot_wider(names_from = source, values_from = score) |>
+  column_to_rownames("condition")
+
+# 确保细胞顺序一致
+progeny_wide <- progeny_wide[colnames(seurat_obj), ]
+
+# 添加到 metadata
+seurat_obj <- AddMetaData(seurat_obj, metadata = progeny_wide)
+
+# 也创建一个单独的 assay 方便后续可视化
+progeny_assay <- CreateAssayObject(data = t(as.matrix(progeny_wide)))
+seurat_obj[["progeny"]] <- progeny_assay
+```
+
+
+## Visualization: UMAP Feature Plot
+
+在 UMAP 上可视化每条通路的活性分布。
+
+```{r}
+#| label: umap-progeny
+#| eval: false
+#| fig-width: 14
+#| fig-height: 10
+
+DefaultAssay(seurat_obj) <- "progeny"
+
+# 与 ROCK/纤维化相关的核心通路
+pathways_of_interest <- c("TGFb", "Hypoxia", "TNFa", "NFkB",
+                          "VEGF", "JAK-STAT", "PI3K", "WNT")
+
+FeaturePlot(seurat_obj,
+            features = pathways_of_interest,
+            min.cutoff = "q05", max.cutoff = "q95",
+            cols = c("lightgrey", "darkred"),
+            ncol = 4) &
+  theme(plot.title = element_text(size = 12))
+```
+
+
+## Visualization: Violin Plot per Group
+
+按 Normal / Model / QR056251 分组比较通路活性。
+
+```{r}
+#| label: violin-per-group
+#| eval: false
+#| fig-width: 16
+#| fig-height: 10
+
+DefaultAssay(seurat_obj) <- "progeny"
+
+all_pathways <- rownames(seurat_obj[["progeny"]])
+
+VlnPlot(seurat_obj,
+        features = all_pathways,
+        group.by = "group",
+        pt.size = 0,
+        ncol = 5) &
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(size = 11)) &
+  stat_summary(fun = median, geom = "point", size = 2, color = "black")
+```
+
+
+## Heatmap: Mean Pathway Activity per Cell Type × Group
+
+```{r}
+#| label: heatmap-celltype-group
+#| eval: false
+#| fig-width: 14
+#| fig-height: 8
+
+library(ComplexHeatmap)
+library(circlize)
+
+# 计算每个 cell_type × group 的平均通路活性
+mean_activity <- seurat_obj@meta.data |>
+  select(cell_type, group, all_of(all_pathways)) |>
+  group_by(cell_type, group) |>
+  summarise(across(all_of(all_pathways), mean), .groups = "drop") |>
+  mutate(label = paste0(cell_type, " | ", group))
+
+# 转为矩阵
+mat <- mean_activity |>
+  select(label, all_of(all_pathways)) |>
+  column_to_rownames("label") |>
+  as.matrix()
+
+# Z-score 标准化（按通路/列）
+mat_scaled <- scale(mat)
+
+# 行注释：cell_type 和 group
+row_anno <- mean_activity |>
+  select(label, cell_type, group) |>
+  column_to_rownames("label")
+
+ha <- rowAnnotation(
+  Group = row_anno$group,
+  CellType = row_anno$cell_type,
+  col = list(
+    Group = c("Normal" = "#4393C3", "Model" = "#D6604D", "QR056251" = "#5AAE61")
+  )
+)
+
+Heatmap(mat_scaled,
+        name = "Z-score",
+        left_annotation = ha,
+        cluster_columns = TRUE,
+        cluster_rows = TRUE,
+        row_names_gp = gpar(fontsize = 8),
+        column_names_gp = gpar(fontsize = 10),
+        column_title = "PROGENy pathway activity (Z-scaled)")
+```
+
+
+## Per-Cell-Type Comparison Across Groups
+
+对每种细胞类型，比较三组间的通路活性差异。
+
+```{r}
+#| label: per-celltype-comparison
+#| eval: false
+#| fig-width: 16
+#| fig-height: 6
+
+# 选择感兴趣的通路（与纤维化/ROCK相关）
+pathways_plot <- c("TGFb", "Hypoxia", "TNFa", "NFkB", "WNT", "VEGF")
+
+# 转为长格式
+df_long <- seurat_obj@meta.data |>
+  select(cell_type, group, all_of(pathways_plot)) |>
+  pivot_longer(cols = all_of(pathways_plot),
+               names_to = "pathway",
+               values_to = "activity")
+
+# 分面图：每个通路一行，X 轴为细胞类型，颜色为 group
+ggplot(df_long, aes(x = cell_type, y = activity, fill = group)) +
+  geom_boxplot(outlier.size = 0.3, linewidth = 0.3) +
+  facet_wrap(~ pathway, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = c("Normal" = "#4393C3",
+                                "Model" = "#D6604D",
+                                "QR056251" = "#5AAE61")) +
+  theme_bw(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "top",
+        strip.text = element_text(size = 12, face = "bold")) +
+  labs(x = NULL, y = "PROGENy activity score", fill = NULL)
+```
+
+
+## Statistical Testing: Wilcoxon Test per Cell Type × Pathway
+
+```{r}
+#| label: stat-test
+#| eval: false
+
+# 对每种细胞类型 × 通路，做 Model vs Normal 和 QR056251 vs Model 的 Wilcoxon 检验
+df_all <- seurat_obj@meta.data |>
+  select(cell_type, group, all_of(all_pathways)) |>
+  pivot_longer(cols = all_of(all_pathways),
+               names_to = "pathway",
+               values_to = "activity")
+
+run_comparison <- function(df, group1, group2) {
+  df |>
+    filter(group %in% c(group1, group2)) |>
+    group_by(cell_type, pathway) |>
+    summarise(
+      mean_g1 = mean(activity[group == group1]),
+      mean_g2 = mean(activity[group == group2]),
+      diff = mean_g2 - mean_g1,
+      p_value = tryCatch(
+        wilcox.test(activity[group == group1],
+                    activity[group == group2])$p.value,
+        error = function(e) NA_real_
+      ),
+      .groups = "drop"
+    ) |>
+    mutate(
+      p_adj = p.adjust(p_value, method = "BH"),
+      comparison = paste0(group2, " vs ", group1)
+    )
+}
+
+# Model vs Normal：疾病带来的变化
+stat_MvsN <- run_comparison(df_all, "Normal", "Model")
+
+# QR056251 vs Model：药物治疗的效果
+stat_DvsM <- run_comparison(df_all, "Model", "QR056251")
+
+stat_all <- bind_rows(stat_MvsN, stat_DvsM)
+head(stat_all)
+
+write.csv(stat_all, "Results/progeny_stat_tests.csv", row.names = FALSE)
+```
+
+
+## Dot Plot: Effect Size with Significance
+
+```{r}
+#| label: dotplot-effect
+#| eval: false
+#| fig-width: 14
+#| fig-height: 10
+
+# 只展示 BH adj p < 0.05 的结果
+stat_sig <- stat_all |>
+  filter(p_adj < 0.05)
+
+# Model vs Normal
+p1 <- ggplot(stat_sig |> filter(comparison == "Model vs Normal"),
+             aes(x = pathway, y = cell_type, size = -log10(p_adj), color = diff)) +
+  geom_point() +
+  scale_color_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                        midpoint = 0, name = "Activity\ndifference") +
+  scale_size_continuous(range = c(1, 8), name = "-log10(p.adj)") +
+  theme_bw(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = NULL, y = NULL, title = "Model vs Normal (BLM-induced changes)")
+
+# QR056251 vs Model
+p2 <- ggplot(stat_sig |> filter(comparison == "QR056251 vs Model"),
+             aes(x = pathway, y = cell_type, size = -log10(p_adj), color = diff)) +
+  geom_point() +
+  scale_color_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                        midpoint = 0, name = "Activity\ndifference") +
+  scale_size_continuous(range = c(1, 8), name = "-log10(p.adj)") +
+  theme_bw(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = NULL, y = NULL, title = "QR056251 vs Model (drug effect)")
+
+p1 / p2
+```
+
+
+## Drug-Reversed Pathway Activity
+
+核心问题：哪些通路被 BLM 激活，又被 QR056251 逆转？
+
+```{r}
+#| label: drug-reversed
+#| eval: false
+#| fig-width: 12
+#| fig-height: 8
+
+# 合并两组比较结果，找出被药物逆转的通路
+reversed <- stat_MvsN |>
+  select(cell_type, pathway, diff_disease = diff, p_adj_disease = p_adj) |>
+  inner_join(
+    stat_DvsM |>
+      select(cell_type, pathway, diff_drug = diff, p_adj_drug = p_adj),
+    by = c("cell_type", "pathway")
+  ) |>
+  mutate(
+    # 疾病上调 + 药物下调 = 逆转
+    reversed = (diff_disease > 0 & diff_drug < 0) |
+               (diff_disease < 0 & diff_drug > 0),
+    # 至少一个比较显著
+    sig_disease = p_adj_disease < 0.05,
+    sig_drug = p_adj_drug < 0.05,
+    category = case_when(
+      reversed & sig_disease & sig_drug ~ "Significantly reversed",
+      reversed & sig_disease ~ "Disease-sig, drug-trend reversed",
+      reversed & sig_drug ~ "Drug-sig reversed",
+      TRUE ~ "Not reversed"
+    )
+  )
+
+# 汇总
+table(reversed$category)
+
+# 可视化：散点图，X = 疾病变化，Y = 药物变化
+# 第二象限（疾病↑药物↓）和第四象限（疾病↓药物↑）= 被逆转
+ggplot(reversed, aes(x = diff_disease, y = diff_drug, color = category)) +
+  geom_point(alpha = 0.7, size = 2) +
+  ggrepel::geom_text_repel(
+    data = filter(reversed, category == "Significantly reversed"),
+    aes(label = paste0(cell_type, "\n", pathway)),
+    size = 2.5, max.overlaps = 30
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_color_manual(values = c(
+    "Significantly reversed" = "#D6604D",
+    "Disease-sig, drug-trend reversed" = "#FDB863",
+    "Drug-sig reversed" = "#74ADD1",
+    "Not reversed" = "grey80"
+  )) +
+  labs(x = "Activity change (Model - Normal)",
+       y = "Activity change (QR056251 - Model)",
+       title = "PROGENy: drug-reversed pathway activity per cell type",
+       color = NULL) +
+  theme_bw(base_size = 12)
+
+write.csv(reversed, "Results/progeny_drug_reversed.csv", row.names = FALSE)
+```
+
+
+## Tile Plot: Pathway Activity Changes Across Cell Types
+
+双层 tile plot，上层为疾病变化，下层为药物变化，便于整体审视。
+
+```{r}
+#| label: tile-plot
+#| eval: false
+#| fig-width: 12
+#| fig-height: 10
+
+tile_df <- reversed |>
+  select(cell_type, pathway, diff_disease, diff_drug,
+         p_adj_disease, p_adj_drug) |>
+  pivot_longer(
+    cols = c(diff_disease, diff_drug),
+    names_to = "comparison",
+    values_to = "diff"
+  ) |>
+  mutate(
+    comparison = recode(comparison,
+                        "diff_disease" = "Model vs Normal",
+                        "diff_drug" = "QR056251 vs Model"),
+    p_adj = ifelse(comparison == "Model vs Normal", p_adj_disease, p_adj_drug),
+    sig_label = ifelse(p_adj < 0.05, "*", "")
+  )
+
+ggplot(tile_df, aes(x = pathway, y = cell_type, fill = diff)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = sig_label), size = 4, color = "black") +
+  facet_wrap(~ comparison, ncol = 1) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       midpoint = 0, name = "Activity\ndifference") +
+  theme_bw(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text = element_text(size = 12, face = "bold")) +
+  labs(x = NULL, y = NULL,
+       title = "PROGENy pathway activity changes (* = BH p.adj < 0.05)")
+```
+
+
+## Focus: Fibrosis-Related Pathways
+
+聚焦与肺纤维化和 ROCK 信号密切相关的通路。
+
+```{r}
+#| label: fibrosis-focus
+#| eval: false
+#| fig-width: 14
+#| fig-height: 8
+
+# TGFb 是纤维化核心驱动通路，ROCK 是其下游效应分子
+# Hypoxia、TNFa、NFkB 与炎症-纤维化轴密切相关
+fibrosis_pathways <- c("TGFb", "Hypoxia", "TNFa", "NFkB", "WNT")
+
+df_fibrosis <- seurat_obj@meta.data |>
+  select(cell_type, group, all_of(fibrosis_pathways)) |>
+  pivot_longer(cols = all_of(fibrosis_pathways),
+               names_to = "pathway",
+               values_to = "activity")
+
+# 每个通路单独画，展示细胞类型间的差异
+plot_list <- lapply(fibrosis_pathways, function(pw) {
+  ggplot(filter(df_fibrosis, pathway == pw),
+         aes(x = cell_type, y = activity, fill = group)) +
+    geom_boxplot(outlier.size = 0.2, linewidth = 0.3) +
+    scale_fill_manual(values = c("Normal" = "#4393C3",
+                                  "Model" = "#D6604D",
+                                  "QR056251" = "#5AAE61")) +
+    theme_bw(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none") +
+    labs(x = NULL, y = "Activity", title = pw)
+})
+
+# 最后一个图加 legend
+plot_list[[length(plot_list)]] <- plot_list[[length(plot_list)]] +
+  theme(legend.position = "right")
+
+wrap_plots(plot_list, ncol = 2)
+```
+
+
+## Pseudobulk-Level PROGENy (Sample-Aware)
+
+在 pseudobulk 水平运行 PROGENy，考虑生物学重复间的变异。
+
+```{r}
+#| label: pseudobulk-progeny
+#| eval: false
+
+# 按 sample × cell_type 构建 pseudobulk
+pseudo_list <- list()
+
+for (smp in unique(seurat_obj$orig.ident)) {
+  for (ct in unique(seurat_obj$cell_type)) {
+    cells <- colnames(seurat_obj)[seurat_obj$orig.ident == smp &
+                                    seurat_obj$cell_type == ct]
+    if (length(cells) < 10) next
+
+    expr <- GetAssayData(seurat_obj, layer = "data")[, cells]
+    # pseudobulk：取平均表达
+    pseudo_expr <- Matrix::rowMeans(expr)
+    label <- paste0(smp, "___", ct)
+    pseudo_list[[label]] <- pseudo_expr
+  }
+}
+
+pseudo_mat <- do.call(cbind, pseudo_list)
+colnames(pseudo_mat) <- names(pseudo_list)
+
+# 对 pseudobulk 矩阵运行 PROGENy
+pseudo_scores <- decoupleR::run_mlm(
+  mat = pseudo_mat,
+  net = progeny_model,
+  .source = "source",
+  .target = "target",
+  .mor = "weight",
+  minsize = 5
+)
+
+# 解析 sample 和 cell_type
+pseudo_result <- pseudo_scores |>
+  filter(statistic == "mlm") |>
+  mutate(
+    sample = sub("___.*", "", condition),
+    cell_type = sub(".*___", "", condition)
+  ) |>
+  left_join(
+    seurat_obj@meta.data |>
+      distinct(orig.ident, group) |>
+      rename(sample = orig.ident),
+    by = "sample"
+  )
+
+head(pseudo_result)
+```
+
+
+### Pseudobulk Statistical Test
+
+```{r}
+#| label: pseudobulk-stat
+#| eval: false
+
+# 与单细胞水平类似，但在 sample 水平做检验
+run_pseudo_comparison <- function(df, group1, group2) {
+  df |>
+    filter(group %in% c(group1, group2)) |>
+    group_by(cell_type, source) |>
+    summarise(
+      mean_g1 = mean(score[group == group1]),
+      mean_g2 = mean(score[group == group2]),
+      diff = mean_g2 - mean_g1,
+      n_g1 = sum(group == group1),
+      n_g2 = sum(group == group2),
+      p_value = tryCatch(
+        wilcox.test(score[group == group1],
+                    score[group == group2])$p.value,
+        error = function(e) NA_real_
+      ),
+      .groups = "drop"
+    ) |>
+    mutate(
+      p_adj = p.adjust(p_value, method = "BH"),
+      comparison = paste0(group2, " vs ", group1)
+    )
+}
+
+pseudo_stat_MvsN <- run_pseudo_comparison(pseudo_result, "Normal", "Model")
+pseudo_stat_DvsM <- run_pseudo_comparison(pseudo_result, "Model", "QR056251")
+
+pseudo_stat_all <- bind_rows(pseudo_stat_MvsN, pseudo_stat_DvsM)
+
+write.csv(pseudo_stat_all, "Results/progeny_pseudobulk_stat.csv", row.names = FALSE)
+
+# 与单细胞水平结果比较
+cat("Pseudobulk significant (p.adj < 0.05):\n")
+pseudo_stat_all |> filter(p_adj < 0.05) |> print(n = 30)
+```
+
+
+### Pseudobulk Visualization
+
+```{r}
+#| label: pseudobulk-plot
+#| eval: false
+#| fig-width: 14
+#| fig-height: 8
+
+# 展示 pseudobulk 水平的 TGFb 通路活性
+pseudo_result |>
+  filter(source %in% fibrosis_pathways) |>
+  mutate(group = factor(group, levels = c("Normal", "Model", "QR056251"))) |>
+  ggplot(aes(x = cell_type, y = score, fill = group)) +
+  geom_boxplot(outlier.size = 0.5) +
+  geom_jitter(aes(color = group), width = 0.15, size = 1, alpha = 0.7) +
+  facet_wrap(~ source, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = c("Normal" = "#4393C3",
+                                "Model" = "#D6604D",
+                                "QR056251" = "#5AAE61")) +
+  scale_color_manual(values = c("Normal" = "#4393C3",
+                                 "Model" = "#D6604D",
+                                 "QR056251" = "#5AAE61")) +
+  theme_bw(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "top",
+        strip.text = element_text(size = 12, face = "bold")) +
+  labs(x = NULL, y = "PROGENy activity (pseudobulk)", fill = NULL, color = NULL)
+```
+
+
+## Save Results
+
+```{r}
+#| label: save-results
+#| eval: false
+
+dir.create("Results", showWarnings = FALSE)
+
+# 保存带 PROGENy 分数的 Seurat 对象
+qs2::qs_save(seurat_obj, "datasets/seurat_with_progeny.qs2")
+
+# 保存原始分数
+write.csv(progeny_scores |> filter(statistic == "mlm"),
+          "Results/progeny_single_cell_scores.csv", row.names = FALSE)
+write.csv(pseudo_result,
+          "Results/progeny_pseudobulk_scores.csv", row.names = FALSE)
+```
+
+
+## Session Info
+
+```{r}
+#| label: session-info
+
+sessionInfo()
+```

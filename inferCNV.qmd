@@ -1,0 +1,1033 @@
+---
+title: "inferCNV Copy Number Variation Analysis"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+---
+
+
+## Introduction
+
+inferCNV 通过对单细胞 RNA-seq 数据中基因表达的染色体位置排序，推断大规模拷贝数变异（CNV）信号，用于区分恶性细胞与正常细胞。核心原理：
+
+- **表达偏移 → CNV 推断** — 同一染色体臂上连续多个基因同时高/低表达，提示该区域存在扩增/缺失
+- **参考细胞基线** — 以已知非恶性细胞（免疫/基质）作为正常参考，计算 tumor 细胞相对偏移
+- **去噪 + HMM** — `denoise = TRUE` 去除随机噪声；`HMM = TRUE` 用隐马尔可夫模型分段检测 CNV 事件
+- **CNV score 可回写 Seurat** — 用于后续恶性细胞评分、亚克隆鉴定、与表达/轨迹分析整合
+
+**典型应用场景：**
+
+- 确认 tumor cluster 的恶性身份（结合已知标记基因）
+- 识别亚克隆：不同 CNV profile 对应不同进化分支
+- 肿瘤纯度评估：区分恶性/非恶性细胞
+- 多样本比较：不同患者/条件间的 CNV 模式差异
+
+本文件基于已处理的 Seurat 对象进行 inferCNV 分析，所有分析 chunk 设为 `eval: false`，适合在 RStudio 中逐步交互运行。
+
+
+## Setup
+
+```{r}
+#| label: load-packages
+#| include: false
+
+library(Seurat)
+library(infercnv)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(readr)
+library(stringr)
+library(rlang)
+library(ggplot2)
+library(patchwork)
+library(ComplexHeatmap)
+library(circlize)
+library(future)
+library(qs2)
+
+options(future.globals.maxSize = 40 * 1024^3)
+set.seed(42)
+```
+
+
+```{r}
+#| label: parallel
+#| eval: false
+
+# 根据机器配置调整 workers 数量
+# inferCNV 的 num_threads 参数控制内部线程数
+plan("multicore", workers = 4)
+```
+
+
+## Load Data
+
+```{r}
+#| label: load-data
+#| eval: false
+
+seurat_obj <- qs2::qs_read("datasets/harmonized_seurat.qs2")
+
+# 确保使用 RNA assay 的 raw counts（inferCNV 需要原始计数矩阵）
+DefaultAssay(seurat_obj) <- "RNA"
+
+# Seurat v5 对象需要先 JoinLayers，确保 counts slot 完整可用
+seurat_obj <- JoinLayers(seurat_obj)
+
+seurat_obj
+table(seurat_obj$cell_type)
+table(seurat_obj$group)
+table(seurat_obj$orig.ident)
+```
+
+
+## Part I: Prepare Inputs {#part-i}
+
+::: {.callout-note}
+## inferCNV 需要三个输入
+
+1. **Raw counts matrix** — 基因 x 细胞的原始计数矩阵（非 normalized）
+2. **Annotation file** — 每个细胞的分组标签（恶性 vs 参考）
+3. **Gene order file** — 基因的染色体位置信息（chr, start, end）
+
+这三个输入的质量直接决定 inferCNV 结果的可靠性。
+:::
+
+
+### Define Cell Groups
+
+::: {.callout-important}
+## 参考细胞的选择至关重要
+
+**理想的参考细胞应当：**
+
+- 来自已知的非恶性细胞类型（如 T 细胞、B 细胞、NK 细胞、内皮细胞）
+- 细胞数量充足（建议每种 ≥100 个，总计 ≥500 个）
+- 不包含可能受肿瘤微环境影响的 CNV 变化的细胞（如 CAF 可能有部分 CNV）
+
+**恶性细胞组：**
+
+- 可以是通过 marker 基因或聚类已初步判断的 tumor cluster
+- 也可以包含"未确定"的 cluster，让 inferCNV 帮助鉴定
+:::
+
+```{r}
+#| label: define-groups
+#| eval: false
+
+# 查看可用的细胞类型
+table(seurat_obj$cell_type)
+
+# 指定参考细胞类型（非恶性，作为 CNV 基线）
+reference_groups <- c("T_cells", "B_cells", "NK_cells", "Endothelial")
+
+# 恶性/待鉴定细胞类型
+# 不在 reference_groups 中的所有细胞类型都会作为 observation（待检测 CNV）
+# 也可以显式指定：
+# malignant_groups <- c("Tumor", "Epithelial_unresolved")
+
+# 检查参考组的细胞数量是否充足
+ref_counts <- table(seurat_obj$cell_type[seurat_obj$cell_type %in% reference_groups])
+cat("Reference cell counts:\n")
+print(ref_counts)
+cat("Total reference cells:", sum(ref_counts), "\n")
+
+if (sum(ref_counts) < 500) {
+  warning("Reference cell count < 500. Consider adding more reference types for stable baseline.")
+}
+```
+
+
+### Prepare Annotation File
+
+```{r}
+#| label: write-annotation
+#| eval: false
+
+# 构建注释表：cell_id | group_label
+# inferCNV 需要 TSV 格式，无列名，第一列为 cell barcode，第二列为分组标签
+annotation_col <- "cell_type"
+
+metadata_tbl <- seurat_obj@meta.data %>%
+  tibble::rownames_to_column("cell_id") %>%
+  dplyr::select(cell_id, group = !!rlang::sym(annotation_col))
+
+# 确保标签与 Seurat 中一致
+stopifnot(all(reference_groups %in% metadata_tbl$group))
+
+# 写出注释文件
+output_base <- "inferCNV"
+dir.create(output_base, showWarnings = FALSE, recursive = TRUE)
+
+annotation_path <- file.path(output_base, "annotations.tsv")
+write_tsv(metadata_tbl, annotation_path, col_names = FALSE)
+cat("Annotation file written:", annotation_path, "\n")
+cat("Unique groups:", paste(unique(metadata_tbl$group), collapse = ", "), "\n")
+```
+
+
+### Prepare Gene Order File
+
+::: {.callout-tip}
+## 基因位置文件的来源
+
+**推荐方式（按优先级）：**
+
+1. **使用 inferCNV 内置的基因位置文件** — 最简单，适合标准分析
+2. **从 GTF 注释文件提取** — 可精确匹配你使用的参考基因组版本
+3. **从 BioMart 下载** — 灵活但需要网络连接
+
+基因位置文件格式：gene_symbol \t chr \t start \t end（无表头）
+:::
+
+#### Option A: 使用 inferCNV 内置基因位置文件
+
+```{r}
+#| label: gene-order-builtin
+#| eval: false
+
+# inferCNV 内置了 hg19/hg38/mm10 的基因位置文件
+# 查看可用的内置文件
+system.file("extdata", package = "infercnv") |> list.files()
+
+# 人类 hg38
+gene_order_path <- system.file("extdata", "gencode_v21_gen_pos.complete.txt",
+                                package = "infercnv")
+
+# 如果用小鼠数据：
+# gene_order_path <- system.file("extdata", "mouse_gencode_gene_pos.txt",
+#                                 package = "infercnv")
+
+# 检查基因匹配率
+gene_pos <- read.delim(gene_order_path, header = FALSE,
+                        col.names = c("gene", "chr", "start", "end"))
+counts_genes <- rownames(GetAssayData(seurat_obj, slot = "counts"))
+overlap <- sum(counts_genes %in% gene_pos$gene)
+cat("Genes in counts:", length(counts_genes), "\n")
+cat("Genes in gene order file:", nrow(gene_pos), "\n")
+cat("Overlap:", overlap, "(", round(overlap / length(counts_genes) * 100, 1), "%)\n")
+```
+
+
+#### Option B: 从 GTF 文件生成
+
+```{r}
+#| label: gene-order-gtf
+#| eval: false
+
+# 从 GENCODE GTF 提取基因位置（适合精确匹配你的参考基因组版本）
+gtf_file <- "reference/gencode.v45.basic.annotation.gtf.gz"
+
+gene_order_tbl <- read_tsv(
+  gtf_file,
+  comment = "#",
+  col_names = c("chromosome", "source", "feature",
+                "start", "end", "score", "strand", "frame", "attribute"),
+  progress = FALSE
+) %>%
+  filter(feature == "gene") %>%
+  transmute(
+    gene = str_match(attribute, 'gene_name "([^"]+)"')[, 2],
+    chromosome = chromosome,
+    start = start,
+    end = end
+  ) %>%
+  # 只保留标准染色体（排除 scaffold、patch 等）
+  filter(str_detect(chromosome, "^chr[0-9XY]+$")) %>%
+  distinct(gene, .keep_all = TRUE) %>%
+  arrange(chromosome, start)
+
+# 与 counts matrix 对齐
+counts_genes <- rownames(GetAssayData(seurat_obj, slot = "counts"))
+gene_order_tbl <- gene_order_tbl %>% filter(gene %in% counts_genes)
+
+gene_order_path <- file.path(output_base, "gene_order.tsv")
+write_tsv(gene_order_tbl, gene_order_path, col_names = FALSE)
+
+cat("Gene order file written:", nrow(gene_order_tbl), "genes\n")
+```
+
+
+### Extract Counts Matrix
+
+```{r}
+#| label: counts-matrix
+#| eval: false
+
+# 提取 raw counts 矩阵（基因 x 细胞）
+# inferCNV 需要原始计数，不能用 normalized 或 scaled 数据
+counts_matrix <- GetAssayData(seurat_obj, slot = "counts")
+
+# 可选：过滤低表达基因（加速计算，但 inferCNV 内部也会做过滤）
+# 一般不需要额外过滤，除非数据量非常大
+# min_cells <- ncol(counts_matrix) * 0.01
+# counts_matrix <- counts_matrix[rowSums(counts_matrix > 0) >= min_cells, ]
+
+cat("Counts matrix dimensions:", dim(counts_matrix), "\n")
+cat("Sparsity:", round(1 - sum(counts_matrix > 0) / prod(dim(counts_matrix)), 3) * 100, "%\n")
+```
+
+
+## Part II: Run inferCNV {#part-ii}
+
+::: {.callout-warning}
+## 计算资源与时间
+
+inferCNV 是计算密集型工具，运行时间取决于：
+
+- **细胞数量**：>10,000 细胞建议先下采样或增加线程
+- **HMM 模式**：`HMM = TRUE` 显著增加运行时间（2-5x），但结果更精确
+- **内存需求**：大数据集（>20K 细胞）建议 ≥32GB RAM
+
+**建议**：首次运行可用 `HMM = FALSE` 快速预览，确认参数合理后再开启 HMM。
+:::
+
+### Create inferCNV Object
+
+```{r}
+#| label: create-infercnv
+#| eval: false
+
+# 可以直接传入矩阵对象，避免写中间文件
+infercnv_obj <- CreateInfercnvObject(
+  raw_counts_matrix = counts_matrix,
+  annotations_file  = annotation_path,
+  delim             = "\t",
+  gene_order_file   = gene_order_path,
+  ref_group_names   = reference_groups
+)
+
+infercnv_obj
+```
+
+
+### Optional: Downsample for Large Datasets
+
+```{r}
+#| label: downsample
+#| eval: false
+
+# 如果细胞数量 >20,000，建议先下采样加速初步分析
+max_cells_per_group <- 2000
+
+# 按细胞类型分层下采样
+set.seed(42)
+cells_keep <- metadata_tbl %>%
+  group_by(group) %>%
+  slice_sample(n = min(n(), max_cells_per_group)) %>%
+  pull(cell_id)
+
+counts_sub <- counts_matrix[, cells_keep]
+annotation_sub_path <- file.path(output_base, "annotations_sub.tsv")
+metadata_tbl %>%
+  filter(cell_id %in% cells_keep) %>%
+  write_tsv(annotation_sub_path, col_names = FALSE)
+
+cat("Downsampled:", ncol(counts_matrix), "->", ncol(counts_sub), "cells\n")
+
+# 用下采样数据重新创建 inferCNV 对象
+infercnv_obj <- CreateInfercnvObject(
+  raw_counts_matrix = counts_sub,
+  annotations_file  = annotation_sub_path,
+  delim             = "\t",
+  gene_order_file   = gene_order_path,
+  ref_group_names   = reference_groups
+)
+```
+
+
+### Run inferCNV Pipeline
+
+```{r}
+#| label: run-infercnv
+#| eval: false
+
+output_dir <- file.path(output_base, "results")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+ptm <- Sys.time()
+
+infercnv_obj <- infercnv::run(
+  infercnv_obj,
+  cutoff              = 0.1,      # 0.1 for 10x Genomics, 1 for Smart-seq2
+  out_dir             = output_dir,
+  cluster_by_groups   = TRUE,     # TRUE: 按注释分组聚类；FALSE: 所有细胞一起聚类
+  denoise             = TRUE,     # 去噪（推荐开启）
+  HMM                 = TRUE,     # HMM 分段检测（更精确，但更慢）
+  analysis_mode       = "subclusters",  # "subclusters" 检测亚克隆
+  tumor_subcluster_partition_method = "leiden",  # leiden 通常比 random_trees 更好
+  num_threads         = max(1, future::nbrOfWorkers()),
+  output_format       = "pdf",    # "pdf", "png", or "NA" (no plot)
+  no_prelim_plot      = FALSE,
+  no_plot             = FALSE
+)
+
+cat("Elapsed:", round(difftime(Sys.time(), ptm, units = "mins"), 1), "min\n")
+```
+
+
+### Save inferCNV Object
+
+```{r}
+#| label: save-infercnv
+#| eval: false
+
+qs2::qs_save(infercnv_obj, file.path(output_base, "infercnv_obj.qs2"))
+# infercnv_obj <- qs2::qs_read(file.path(output_base, "infercnv_obj.qs2"))
+```
+
+
+## Part III: Post-Processing & Visualization {#part-iii}
+
+### Load Results
+
+```{r}
+#| label: load-results
+#| eval: false
+
+# inferCNV 输出的核心文件
+# observations: tumor/未知细胞的 CNV 矩阵（基因 x 细胞，值以1为中心）
+# references: 参考细胞的 CNV 矩阵
+cnv_obs <- readRDS(file.path(output_dir, "run.final.infercnv_obj"))
+
+# 直接从 infercnv_obj 提取也可以
+# 如果上一步已运行，infercnv_obj 已在内存中
+
+cat("Output files:\n")
+list.files(output_dir, pattern = "\\.(rds|pdf|png)$")
+```
+
+
+### Compute CNV Score per Cell
+
+::: {.callout-tip}
+## CNV Score 的定义
+
+常用的 CNV score 计算方式：
+
+- **Mean squared deviation** — 每个细胞所有基因的 (CNV_value - 1)^2 的均值，值越大 CNV 信号越强
+- **Per-chromosome CNV** — 按染色体计算 CNV 信号，可识别特定染色体臂的变异
+- **HMM state-based** — 基于 HMM 输出的 state（1=loss, 3=neutral, 5=gain）计算
+
+CNV score 高的细胞更可能是恶性细胞。
+:::
+
+```{r}
+#| label: cnv-score
+#| eval: false
+
+# 从 inferCNV 对象提取表达矩阵（已处理，值以 1 为中心）
+# >1: 潜在 gain, <1: 潜在 loss, =1: neutral
+expr_data <- infercnv_obj@expr.data
+
+# 方法1：Mean squared deviation（最常用）
+cnv_score <- colMeans((expr_data - 1)^2)
+
+# 方法2：绝对偏离度
+# cnv_score <- colMeans(abs(expr_data - 1))
+
+# 将 CNV score 添加到 Seurat 对象
+# 注意：如果做了下采样，只有部分细胞有 score
+cells_with_score <- intersect(names(cnv_score), colnames(seurat_obj))
+seurat_obj$cnv_score <- NA_real_
+seurat_obj$cnv_score[cells_with_score] <- cnv_score[cells_with_score]
+
+cat("CNV score range:", round(range(cnv_score), 4), "\n")
+cat("Cells with CNV score:", length(cells_with_score), "/", ncol(seurat_obj), "\n")
+```
+
+
+### CNV Score Visualization
+
+```{r}
+#| label: plot-cnv-score-umap
+#| eval: false
+#| fig-width: 12
+#| fig-height: 5
+
+# UMAP 上展示 CNV score
+p1 <- FeaturePlot(seurat_obj, features = "cnv_score",
+                   reduction = "umap", pt.size = 0.3) +
+  scale_color_viridis_c(option = "inferno") +
+  labs(title = "CNV Score (mean squared deviation)")
+
+p2 <- DimPlot(seurat_obj, group.by = "cell_type",
+               reduction = "umap", pt.size = 0.3, label = TRUE) +
+  NoLegend() +
+  labs(title = "Cell Type")
+
+p1 + p2
+```
+
+
+```{r}
+#| label: plot-cnv-score-violin
+#| eval: false
+#| fig-width: 10
+#| fig-height: 5
+
+# 按细胞类型展示 CNV score 分布
+VlnPlot(seurat_obj, features = "cnv_score", group.by = "cell_type",
+         pt.size = 0) +
+  geom_hline(yintercept = median(cnv_score, na.rm = TRUE),
+             linetype = "dashed", color = "red") +
+  labs(title = "CNV Score by Cell Type",
+       subtitle = "Dashed line = median across all cells") +
+  NoLegend()
+```
+
+
+```{r}
+#| label: plot-cnv-score-boxplot
+#| eval: false
+#| fig-width: 10
+#| fig-height: 5
+
+# 按细胞类型的 CNV score 箱线图（更清晰地看中位数和 outlier）
+cnv_df <- seurat_obj@meta.data %>%
+  filter(!is.na(cnv_score)) %>%
+  mutate(is_reference = cell_type %in% reference_groups)
+
+ggplot(cnv_df, aes(x = reorder(cell_type, cnv_score, FUN = median),
+                    y = cnv_score, fill = is_reference)) +
+  geom_boxplot(outlier.size = 0.3) +
+  scale_fill_manual(values = c("TRUE" = "#4393C3", "FALSE" = "#D6604D"),
+                    labels = c("Observation", "Reference"),
+                    name = "Group") +
+  coord_flip() +
+  labs(x = NULL, y = "CNV Score", title = "CNV Score Distribution by Cell Type") +
+  theme_bw(base_size = 12)
+```
+
+
+### Classify Malignant vs Non-Malignant
+
+::: {.callout-note}
+## 恶性细胞分类策略
+
+**方法 A：固定阈值** — 用参考细胞的 CNV score 分布设定阈值（如 mean + 2*SD）
+**方法 B：混合模型** — 用 GMM 或 k-means 自动分成两群
+**方法 C：结合已知标记** — CNV score 高 + 表达已知 tumor marker → 恶性
+
+建议使用方法 A 或 B 初筛，再用方法 C 验证。
+:::
+
+```{r}
+#| label: classify-malignant
+#| eval: false
+
+# 方法A：基于参考细胞分布设定阈值
+ref_scores <- cnv_score[names(cnv_score) %in%
+  colnames(seurat_obj)[seurat_obj$cell_type %in% reference_groups]]
+
+threshold <- mean(ref_scores) + 2 * sd(ref_scores)
+cat("Reference CNV score: mean =", round(mean(ref_scores), 4),
+    ", sd =", round(sd(ref_scores), 4), "\n")
+cat("Threshold (mean + 2*SD):", round(threshold, 4), "\n")
+
+# 分类
+seurat_obj$cnv_class <- dplyr::case_when(
+  is.na(seurat_obj$cnv_score) ~ "No score",
+  seurat_obj$cnv_score > threshold ~ "High CNV (likely malignant)",
+  TRUE ~ "Low CNV (likely non-malignant)"
+)
+
+table(seurat_obj$cnv_class, seurat_obj$cell_type)
+```
+
+
+```{r}
+#| label: plot-cnv-class
+#| eval: false
+#| fig-width: 12
+#| fig-height: 5
+
+# 分类结果在 UMAP 上的展示
+p1 <- DimPlot(seurat_obj, group.by = "cnv_class",
+               reduction = "umap", pt.size = 0.3,
+               cols = c("High CNV (likely malignant)" = "#D6604D",
+                        "Low CNV (likely non-malignant)" = "#4393C3",
+                        "No score" = "grey80")) +
+  labs(title = "CNV Classification")
+
+p2 <- DimPlot(seurat_obj, group.by = "cell_type",
+               reduction = "umap", pt.size = 0.3, label = TRUE) +
+  NoLegend() +
+  labs(title = "Cell Type")
+
+p1 + p2
+```
+
+
+### Per-Chromosome CNV Profile
+
+```{r}
+#| label: per-chr-cnv
+#| eval: false
+
+# 从 gene order file 获取每个基因的染色体信息
+gene_pos <- read.delim(gene_order_path, header = FALSE,
+                        col.names = c("gene", "chr", "start", "end"))
+
+# 只保留 inferCNV 结果中的基因
+genes_in_result <- rownames(expr_data)
+gene_pos_sub <- gene_pos %>% filter(gene %in% genes_in_result)
+
+# 按染色体计算每个细胞的平均 CNV 偏移
+chr_cnv <- list()
+for (chr in unique(gene_pos_sub$chr)) {
+  genes_chr <- gene_pos_sub$gene[gene_pos_sub$chr == chr]
+  genes_chr <- genes_chr[genes_chr %in% rownames(expr_data)]
+  if (length(genes_chr) < 10) next
+
+  chr_cnv[[chr]] <- colMeans((expr_data[genes_chr, ] - 1)^2)
+}
+
+chr_cnv_df <- as.data.frame(chr_cnv) %>%
+  tibble::rownames_to_column("cell_id")
+
+# 添加细胞类型信息
+chr_cnv_df$cell_type <- seurat_obj$cell_type[chr_cnv_df$cell_id]
+```
+
+
+```{r}
+#| label: plot-chr-cnv-heatmap
+#| eval: false
+#| fig-width: 14
+#| fig-height: 8
+
+# 按细胞类型汇总每条染色体的 CNV 信号
+chr_cnv_long <- chr_cnv_df %>%
+  tidyr::pivot_longer(cols = -c(cell_id, cell_type),
+                       names_to = "chr", values_to = "cnv_signal") %>%
+  group_by(cell_type, chr) %>%
+  summarise(mean_cnv = mean(cnv_signal), .groups = "drop")
+
+# 染色体排序
+chr_order <- paste0("chr", c(1:22, "X", "Y"))
+chr_cnv_long <- chr_cnv_long %>%
+  filter(chr %in% chr_order) %>%
+  mutate(chr = factor(chr, levels = chr_order))
+
+# 热图
+chr_cnv_wide <- chr_cnv_long %>%
+  tidyr::pivot_wider(names_from = chr, values_from = mean_cnv) %>%
+  tibble::column_to_rownames("cell_type") %>%
+  as.matrix()
+
+Heatmap(chr_cnv_wide,
+        name = "CNV signal",
+        col = colorRamp2(c(0, max(chr_cnv_wide) / 2, max(chr_cnv_wide)),
+                          c("white", "orange", "firebrick")),
+        cluster_columns = FALSE,
+        column_title = "Per-chromosome CNV signal by cell type",
+        row_names_gp = gpar(fontsize = 10),
+        column_names_gp = gpar(fontsize = 9),
+        column_names_rot = 45)
+```
+
+
+```{r}
+#| label: plot-chr-cnv-specific
+#| eval: false
+#| fig-width: 10
+#| fig-height: 5
+
+# 对特定染色体做更细致的展示（如发现某染色体信号异常强）
+chr_of_interest <- "chr8"  # 替换为感兴趣的染色体
+
+chr_cnv_df %>%
+  ggplot(aes(x = reorder(cell_type, .data[[chr_of_interest]], FUN = median),
+             y = .data[[chr_of_interest]], fill = cell_type %in% reference_groups)) +
+  geom_boxplot(outlier.size = 0.3) +
+  scale_fill_manual(values = c("TRUE" = "#4393C3", "FALSE" = "#D6604D"),
+                    labels = c("Observation", "Reference"), name = "Group") +
+  coord_flip() +
+  labs(x = NULL, y = "CNV signal",
+       title = paste("CNV signal on", chr_of_interest, "by cell type")) +
+  theme_bw(base_size = 12)
+```
+
+
+## Part IV: Subclone Identification {#part-iv}
+
+::: {.callout-tip}
+## 亚克隆分析的意义
+
+**同一肿瘤内不同 CNV profile 的细胞群代表不同的进化分支（亚克隆）。**
+亚克隆分析可以：
+
+- 揭示肿瘤内异质性
+- 识别可能的耐药亚群
+- 追踪肿瘤进化历程
+- 为精准治疗提供依据
+
+inferCNV 的 `analysis_mode = "subclusters"` 会自动检测亚克隆，
+结果保存在 HMM 输出文件中。
+:::
+
+
+### Extract Subclone Information
+
+```{r}
+#| label: extract-subclusters
+#| eval: false
+
+# 如果运行了 analysis_mode = "subclusters"，inferCNV 会在输出目录中
+# 生成亚克隆聚类的 HMM 预测文件
+
+# 检查可用的 HMM 输出
+hmm_files <- list.files(output_dir, pattern = "HMM", full.names = TRUE)
+cat("HMM output files:\n")
+print(basename(hmm_files))
+
+# 读取 HMM 预测结果（如果存在）
+hmm_pred_file <- file.path(output_dir, "infercnv.17_HMM_predHMMi6.leiden.hmm_mode-subclusters.Pnorm_0.5.repr_intensities.observations.txt")
+
+if (file.exists(hmm_pred_file)) {
+  hmm_pred <- read.delim(hmm_pred_file, row.names = 1, check.names = FALSE)
+  cat("HMM predictions loaded:", dim(hmm_pred), "\n")
+} else {
+  cat("HMM prediction file not found. Check output directory for available files.\n")
+  cat("Available files:\n")
+  list.files(output_dir, pattern = "observations")
+}
+```
+
+
+### Cluster Cells by CNV Profile
+
+```{r}
+#| label: cnv-clustering
+#| eval: false
+
+# 基于 CNV profile 对 tumor 细胞做层次聚类，识别亚克隆
+# 提取 tumor 细胞的 CNV 矩阵
+tumor_cells <- colnames(seurat_obj)[!seurat_obj$cell_type %in% reference_groups]
+tumor_cells <- intersect(tumor_cells, colnames(expr_data))
+
+cnv_tumor <- expr_data[, tumor_cells]
+
+# 使用相关性距离做层次聚类
+# 对大数据集，先降维再聚类
+if (ncol(cnv_tumor) > 5000) {
+  # PCA 降维
+  pca_cnv <- prcomp(t(cnv_tumor), center = TRUE, scale. = FALSE, rank. = 30)
+  cnv_for_clust <- pca_cnv$x
+} else {
+  cnv_for_clust <- t(cnv_tumor)
+}
+
+# 层次聚类
+dist_mat <- dist(cnv_for_clust, method = "euclidean")
+hc <- hclust(dist_mat, method = "ward.D2")
+
+# 动态切割（可用 dynamicTreeCut 包，或固定 k）
+n_subclusters <- 3  # 根据实际情况调整
+subclone_labels <- cutree(hc, k = n_subclusters)
+names(subclone_labels) <- tumor_cells
+
+# 添加到 Seurat
+seurat_obj$cnv_subclone <- NA_character_
+seurat_obj$cnv_subclone[tumor_cells] <- paste0("Subclone_", subclone_labels)
+
+table(seurat_obj$cnv_subclone)
+```
+
+
+```{r}
+#| label: plot-subclones
+#| eval: false
+#| fig-width: 14
+#| fig-height: 5
+
+# UMAP 展示亚克隆
+p1 <- DimPlot(seurat_obj, group.by = "cnv_subclone",
+               reduction = "umap", pt.size = 0.3, na.value = "grey90") +
+  labs(title = "CNV-based Subclones")
+
+p2 <- DimPlot(seurat_obj, group.by = "cell_type",
+               reduction = "umap", pt.size = 0.3, label = TRUE) +
+  NoLegend() +
+  labs(title = "Cell Type")
+
+p3 <- FeaturePlot(seurat_obj, features = "cnv_score",
+                   reduction = "umap", pt.size = 0.3) +
+  scale_color_viridis_c(option = "inferno") +
+  labs(title = "CNV Score")
+
+p1 + p2 + p3
+```
+
+
+### Subclone CNV Profile Comparison
+
+```{r}
+#| label: subclone-cnv-profile
+#| eval: false
+#| fig-width: 14
+#| fig-height: 6
+
+# 每个亚克隆的染色体 CNV profile
+subclone_chr <- chr_cnv_df %>%
+  filter(cell_id %in% tumor_cells) %>%
+  mutate(subclone = seurat_obj$cnv_subclone[cell_id]) %>%
+  tidyr::pivot_longer(cols = starts_with("chr"),
+                       names_to = "chr", values_to = "cnv_signal") %>%
+  filter(chr %in% chr_order) %>%
+  mutate(chr = factor(chr, levels = chr_order)) %>%
+  group_by(subclone, chr) %>%
+  summarise(mean_cnv = mean(cnv_signal), .groups = "drop")
+
+ggplot(subclone_chr, aes(x = chr, y = mean_cnv, fill = subclone)) +
+  geom_col(position = "dodge") +
+  labs(x = "Chromosome", y = "Mean CNV signal",
+       title = "Per-chromosome CNV signal by subclone") +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+### Subclone Differential Expression
+
+```{r}
+#| label: subclone-de
+#| eval: false
+
+# 亚克隆间的差异表达分析，识别亚克隆特异性基因
+Idents(seurat_obj) <- "cnv_subclone"
+subclone_markers <- FindAllMarkers(seurat_obj,
+                                    only.pos = TRUE,
+                                    min.pct = 0.25,
+                                    logfc.threshold = 0.5)
+
+top_markers <- subclone_markers %>%
+  group_by(cluster) %>%
+  slice_max(avg_log2FC, n = 10)
+
+cat("Top markers per subclone:\n")
+print(top_markers %>% select(cluster, gene, avg_log2FC, p_val_adj))
+
+# 重置 Idents
+Idents(seurat_obj) <- "cell_type"
+```
+
+
+```{r}
+#| label: plot-subclone-markers
+#| eval: false
+#| fig-width: 12
+#| fig-height: 8
+
+# 亚克隆 marker 基因的热图
+top_genes <- top_markers %>%
+  group_by(cluster) %>%
+  slice_max(avg_log2FC, n = 5) %>%
+  pull(gene) %>%
+  unique()
+
+# 只展示 tumor 细胞
+tumor_subset <- subset(seurat_obj, cells = tumor_cells)
+DoHeatmap(tumor_subset, features = top_genes, group.by = "cnv_subclone",
+          size = 3) +
+  labs(title = "Top Marker Genes per CNV Subclone")
+```
+
+
+## Part V: Multi-Sample CNV Comparison {#part-v}
+
+::: {.callout-note}
+## 何时使用多样本比较？
+
+**适用场景：**
+
+- 比较不同患者/条件间的 CNV 模式差异
+- 评估治疗前后 CNV landscape 的变化
+- 跨样本识别共享 vs 样本特异的 CNV 事件
+
+**方法：** 对每个样本/条件分别运行 inferCNV，提取 CNV score，再统一比较。
+:::
+
+```{r}
+#| label: multi-sample-cnv
+#| eval: false
+
+# 按条件/样本比较 CNV score 分布
+cnv_by_condition <- seurat_obj@meta.data %>%
+  filter(!is.na(cnv_score)) %>%
+  select(cell_type, group, cnv_score)
+
+# 各条件下 tumor 细胞的 CNV score
+tumor_cnv <- cnv_by_condition %>%
+  filter(!cell_type %in% reference_groups)
+
+ggplot(tumor_cnv, aes(x = group, y = cnv_score, fill = group)) +
+  geom_boxplot(outlier.size = 0.3) +
+  geom_jitter(width = 0.2, size = 0.1, alpha = 0.1) +
+  facet_wrap(~cell_type, scales = "free_y") +
+  labs(x = NULL, y = "CNV Score",
+       title = "CNV Score by Condition (observation cells only)") +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+```
+
+
+```{r}
+#| label: multi-sample-cnv-stat
+#| eval: false
+
+# 统计检验：各条件间 CNV score 是否有显著差异
+stat_cnv <- tumor_cnv %>%
+  group_by(cell_type) %>%
+  summarise(
+    n_cells = n(),
+    mean_cnv = mean(cnv_score),
+    p_value = tryCatch(
+      kruskal.test(cnv_score ~ group)$p.value,
+      error = function(e) NA_real_
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH")) %>%
+  arrange(p_adj)
+
+cat("CNV score comparison across conditions:\n")
+print(stat_cnv)
+
+write.csv(stat_cnv, file.path(output_base, "cnv_score_by_condition.csv"),
+          row.names = FALSE)
+```
+
+
+## Part VI: Integration with Seurat {#part-vi}
+
+### Save CNV Results to Seurat Object
+
+```{r}
+#| label: save-to-seurat
+#| eval: false
+
+# 将 inferCNV 结果整合到 Seurat 对象的 misc slot
+seurat_obj@misc$infercnv <- list(
+  cnv_score     = seurat_obj$cnv_score,
+  cnv_class     = seurat_obj$cnv_class,
+  cnv_subclone  = seurat_obj$cnv_subclone,
+  params = list(
+    reference_groups = reference_groups,
+    cutoff           = 0.1,
+    threshold        = threshold,
+    analysis_mode    = "subclusters"
+  )
+)
+```
+
+
+### CNV Score vs Other Features
+
+```{r}
+#| label: cnv-correlation
+#| eval: false
+#| fig-width: 12
+#| fig-height: 5
+
+# CNV score 与其他细胞特征的关联
+meta <- seurat_obj@meta.data %>%
+  filter(!is.na(cnv_score))
+
+# CNV score vs nCount_RNA
+p1 <- ggplot(meta, aes(x = nCount_RNA, y = cnv_score, color = cell_type)) +
+  geom_point(size = 0.3, alpha = 0.3) +
+  scale_x_log10() +
+  labs(title = "CNV Score vs Total UMI") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+# CNV score vs nFeature_RNA
+p2 <- ggplot(meta, aes(x = nFeature_RNA, y = cnv_score, color = cell_type)) +
+  geom_point(size = 0.3, alpha = 0.3) +
+  labs(title = "CNV Score vs Gene Count") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+# CNV score vs percent.mt（如果有）
+if ("percent.mt" %in% colnames(meta)) {
+  p3 <- ggplot(meta, aes(x = percent.mt, y = cnv_score, color = cell_type)) +
+    geom_point(size = 0.3, alpha = 0.3) +
+    labs(title = "CNV Score vs % Mito") +
+    theme_bw()
+  p1 + p2 + p3
+} else {
+  p1 + p2
+}
+```
+
+
+### Export Summary Table
+
+```{r}
+#| label: export-summary
+#| eval: false
+
+# 导出细胞级 CNV 结果表
+cnv_summary <- seurat_obj@meta.data %>%
+  tibble::rownames_to_column("cell_id") %>%
+  filter(!is.na(cnv_score)) %>%
+  select(cell_id, cell_type, group, cnv_score, cnv_class, cnv_subclone)
+
+write.csv(cnv_summary, file.path(output_base, "cnv_cell_summary.csv"),
+          row.names = FALSE)
+
+# 按细胞类型汇总
+type_summary <- cnv_summary %>%
+  group_by(cell_type) %>%
+  summarise(
+    n_cells = n(),
+    mean_cnv_score = mean(cnv_score),
+    median_cnv_score = median(cnv_score),
+    pct_high_cnv = mean(cnv_class == "High CNV (likely malignant)") * 100,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_cnv_score))
+
+cat("Cell type CNV summary:\n")
+print(type_summary)
+
+write.csv(type_summary, file.path(output_base, "cnv_celltype_summary.csv"),
+          row.names = FALSE)
+```
+
+
+## Save Results
+
+```{r}
+#| label: save-all
+#| eval: false
+
+# 保存带 CNV 注释的 Seurat 对象
+qs2::qs_save(seurat_obj, file.path(output_base, "seurat_with_cnv.qs2"))
+
+# 保存 inferCNV 对象
+qs2::qs_save(infercnv_obj, file.path(output_base, "infercnv_obj.qs2"))
+```
+
+
+## Notes
+
+- inferCNV 结果是**统计推断**，不是真正的 WGS/WES 级别 CNV calling。对关键结论应当用正交方法（如 bulk DNA-seq、FISH）验证。
+- **参考细胞的选择**对结果影响极大。如果参考细胞本身含有 CNV（如 CAF），会扭曲所有推断。
+- HMM 模式 (`HMM = TRUE`) 的结果更适合做定量分析（如 gain/loss 分类），denoise-only 结果更适合定性观察。
+- 如果需要更精确的 CNV calling，可考虑 **CopyKAT** 或 **numbat**（整合 allele frequency 信息）作为补充。
+- 大数据集建议先下采样运行，确认参数合理后再全量运行。
+
+
+## Session Info
+
+```{r}
+#| label: session-info
+
+sessionInfo()
+```

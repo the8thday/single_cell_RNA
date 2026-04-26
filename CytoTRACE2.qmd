@@ -1,0 +1,1785 @@
+---
+title: "CytoTRACE 2 Cellular Potency & Developmental Potential Analysis"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+---
+
+
+## Introduction
+
+CytoTRACE 2 是一个基于可解释深度学习的框架，用于从 scRNA-seq 数据预测**绝对发育潜能（absolute developmental potential）**。与 CytoTRACE 1 仅基于基因计数提供数据集内相对排序不同，CytoTRACE 2 通过在 34 个人类和小鼠数据集（覆盖 24 种组织类型）上训练的 GSBN（Gene Set Binary Network）模型，能够**跨数据集、跨平台**地预测细胞的绝对潜能等级。
+
+**核心概念：**
+
+- **GSBN (Gene Set Binary Network)** — 使用二值权重（0 或 1）选择判别性基因集，保持模型的可解释性。每个潜能类别由特定的正/负相关基因集定义
+- **绝对潜能分数 (Absolute Potency Score)** — 0（终末分化）到 1（全能）的连续分数，可跨数据集比较
+- **六级潜能分类** — Totipotent → Pluripotent → Multipotent → Oligopotent → Unipotent → Differentiated
+- **Markov diffusion smoothing** — 基于 KNN 图的扩散平滑，利用邻域信息稳定单细胞预测
+- **双重表达表示** — 同时使用 log2 CPM/TPM 和排序空间，内在地抑制批次效应
+
+**与 CytoTRACE 1 的关键区别：**
+
+| 特征 | CytoTRACE 1 | CytoTRACE 2 |
+|---|---|---|
+| 方法 | 基因计数（gene counts）作为分化代理 | 监督学习（GSBN 深度学习） |
+| 输出 | 数据集内相对排序 | 绝对潜能分数 + 六级分类 |
+| 跨数据集比较 | 不支持 | 支持 |
+| 可解释性 | 有限 | 可提取驱动预测的基因集 |
+| 训练数据 | 无（无监督） | 34 数据集、406,058 细胞 |
+| 性能 | 基线 | 重建发育排序相关性提高 >60% |
+
+**发表信息：** Kang et al., *Nature Methods* (2025). "Improved reconstruction of single-cell developmental potential with CytoTRACE 2."
+
+
+## 常见使用场景
+
+### 1. 发育生物学：谱系分化层级重建
+
+最直接的应用。在胚胎发育、器官发生或体外分化数据中，CytoTRACE 2 可重建从干细胞到终末分化细胞的连续潜能梯度，无需预先定义分化轨迹。
+
+> 典型数据：胚胎发育时间序列、类器官分化、iPSC 诱导分化。CytoTRACE 2 在 62 个小鼠发育时间点上验证了对潜能递减的准确重建。
+
+### 2. 肿瘤干性评估与癌症分级
+
+CytoTRACE 2 的潜能分数与已知的肿瘤干细胞（CSC）特征高度一致。可用于：
+
+- 识别肿瘤内具有干细胞特性的亚群（高潜能分数）
+- 评估肿瘤的去分化程度（整体潜能分布右移提示去分化）
+- 与已知 CSC 标志物（如 CD44, ALDH, CD133）的表达进行对比验证
+
+> 在急性髓系白血病（AML）中，CytoTRACE 2 的潜能预测与已知白血病干细胞签名一致；在少突胶质瘤中准确识别了多谱系潜能。
+
+### 3. 多条件比较：疾病/治疗对分化状态的影响
+
+比较不同条件（疾病 vs 正常、治疗前 vs 治疗后、不同时间点）下细胞的潜能分布变化，揭示：
+
+- 疾病是否导致某些细胞类型去分化（潜能上升）
+- 治疗是否促进肿瘤细胞分化（潜能下降）
+- 特定干预对干性维持的影响
+
+### 4. 与拟时序/轨迹分析的整合
+
+CytoTRACE 2 的绝对潜能分数可作为 Monocle3/Slingshot/RNA velocity 分析的**独立验证**：
+
+- 潜能分数应沿拟时序方向单调递减（若不是，需检查轨迹方向性）
+- 可用于确定轨迹分析中的 root cell（最高潜能）
+- 识别轨迹上的分化瓶颈（潜能梯度突变区域）
+
+### 5. 潜能相关基因程序挖掘
+
+CytoTRACE 2 的可解释架构允许提取驱动潜能预测的基因集。论文中发现：
+
+- **胆固醇代谢通路** 是多能性（multipotency）的核心关联通路
+- **不饱和脂肪酸合成基因**（Fads1, Fads2, Scd2）是顶级多能性标志物
+- 通过 CRISPR 筛选验证，top 100 正向多能性标志物中敲除后促进分化的基因显著富集
+
+### 6. 跨数据集/跨物种的分化状态比较
+
+CytoTRACE 2 的绝对分数使跨数据集比较成为可能：
+
+- 比较不同实验室/平台产生的同类样本的分化状态
+- 人类-小鼠同源组织的分化层级对比
+- 不同疾病队列间的肿瘤干性比较
+
+
+## CytoTRACE 2 能回答的核心问题
+
+**CytoTRACE 2 不是用来做聚类或差异表达的，而是回答"每个细胞处于发育层级的什么位置、哪些细胞更原始/更分化、不同条件如何改变分化格局"。** 它通常在标准流程（降维 → 聚类 → 注释）之后使用，为细胞注释增加潜能维度。
+
+**潜能评估（"这个细胞有多原始？"）**
+
+| 问题 | 对应分析 |
+|---|---|
+| 每个细胞的绝对发育潜能是什么？ | `cytotrace2()` → CytoTRACE2_Score |
+| 细胞属于哪个潜能等级？ | `cytotrace2()` → CytoTRACE2_Potency |
+| 哪些细胞类型最原始/最分化？ | Potency boxplot by cell type |
+| 同一细胞类型内的潜能异质性有多大？ | Potency score 分布 + 方差 |
+
+**跨条件比较（"疾病/治疗改变了分化状态吗？"）**
+
+| 问题 | 对应分析 |
+|---|---|
+| 疾病组的某细胞类型是否更"去分化"？ | 分组 Wilcoxon 检验 + violin plot |
+| 治疗是否促进了肿瘤细胞分化？ | 治疗前后 potency score 分布比较 |
+| 不同条件下潜能分类比例的变化？ | 堆积条形图 + Fisher 检验 |
+
+**轨迹验证（"分化方向对不对？"）**
+
+| 问题 | 对应分析 |
+|---|---|
+| Monocle3 推断的轨迹方向是否正确？ | Potency score vs pseudotime 相关性 |
+| 分化起点（root cell）在哪？ | 最高 CytoTRACE2_Score 的细胞 |
+| 分化过程中是否有潜能瓶颈？ | Potency score 沿轨迹的梯度分析 |
+
+**机制挖掘（"什么驱动了潜能状态？"）**
+
+| 问题 | 对应分析 |
+|---|---|
+| 哪些基因与高潜能最相关？ | Potency score 与基因表达的相关性分析 |
+| 哪些通路驱动干性维持？ | 高/低潜能组差异表达 → 富集分析 |
+| 潜能相关的转录调控网络是什么？ | 结合 SCENIC / hdWGCNA 模块 |
+
+
+## Setup
+
+### Installation
+
+```{r}
+#| label: install-cytotrace2
+#| eval: false
+
+# CytoTRACE 2 通过 GitHub 安装
+# install.packages("devtools")
+devtools::install_github("digitalcytometry/cytotrace2", subdir = "cytotrace2_r")
+```
+
+### Load Packages
+
+```{r}
+#| label: load-packages
+#| include: false
+
+library(Seurat)
+library(CytoTRACE2)
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(patchwork)
+library(qs2)
+
+# ---- 解决函数名 mask（plyr/Hmisc/MASS 等遮挡 dplyr 的问题）----
+# 只改变"裸函数名"的解析，其他包的内部 pkg::func() 调用不受影响
+library(conflicted)
+conflict_prefer("summarise", "dplyr", quiet = TRUE)
+conflict_prefer("summarize", "dplyr", quiet = TRUE)
+conflict_prefer("filter",    "dplyr", quiet = TRUE)
+conflict_prefer("rename",    "dplyr", quiet = TRUE)
+conflict_prefer("count",     "dplyr", quiet = TRUE)
+conflict_prefer("mutate",    "dplyr", quiet = TRUE)
+conflict_prefer("select",    "dplyr", quiet = TRUE)
+conflict_prefer("arrange",   "dplyr", quiet = TRUE)
+conflict_prefer("n",         "dplyr", quiet = TRUE)
+
+set.seed(42)
+```
+
+
+## Load Data
+
+```{r}
+#| label: load-data
+#| eval: false
+
+seurat_obj <- qs2::qs_read("datasets/harmonized_seurat.qs2")
+
+seurat_obj
+colnames(seurat_obj@meta.data)
+
+table(seurat_obj$cell_type)
+table(seurat_obj$group)
+table(seurat_obj$orig.ident)
+```
+
+
+## Pre-flight QC
+
+CytoTRACE 2 对输入数据有特定要求，运行前需检查。
+
+::: {.callout-important}
+## 输入要求
+
+- **必须是 raw counts 或 CPM/TPM 归一化的数据**，不能是 log-transformed
+- 不能有重复的基因名或细胞 ID
+- 基因名必须与指定物种（human/mouse）一致
+- **不需要批次校正**——CytoTRACE 2 通过双重表达表示（log2 CPM + rank space）和训练集多样性内在地抑制批次效应
+:::
+
+```{r}
+#| label: preflight-qc
+#| eval: false
+
+# 检查 RNA assay 的可用 layer/slot
+DefaultAssay(seurat_obj) <- "RNA"
+
+# !! Seurat v5 必做 !! 将 split 的 counts.sample1/counts.sample2/... 合并为单一 counts layer
+# 不合并的话 CytoTRACE2 读取 counts 时会出错，且 fork 并行会让内存成倍膨胀
+seurat_obj <- JoinLayers(seurat_obj)
+
+# 可选瘦身：剔除不需要的 assay/reduction，显著降低 fork 时的内存峰值
+# 大数据集（>100k 细胞 + SCT/integrated assay）强烈建议做
+# seurat_obj <- DietSeurat(seurat_obj, assays = "RNA", dimreducs = c("umap"), graphs = NULL)
+# gc(full = TRUE)
+
+# 确认 counts layer 存在且包含非 log 数据
+counts_mat <- GetAssayData(seurat_obj, layer = "counts")
+cat("Counts matrix dimensions:", dim(counts_mat), "\n")
+cat("Max value in counts:", max(counts_mat[1:100, 1:100]), "\n")
+cat("Are values integers (raw counts)?", all(counts_mat[1:100, 1:100] == floor(counts_mat[1:100, 1:100])), "\n")
+
+# 检查基因名格式（判断物种）
+head(rownames(seurat_obj), 20)
+# 人类基因：全大写（TP53, GAPDH）
+# 小鼠基因：首字母大写（Tp53, Gapdh）
+
+# 检查是否有重复基因名
+dup_genes <- rownames(seurat_obj)[duplicated(rownames(seurat_obj))]
+if (length(dup_genes) > 0) {
+  warning("Found ", length(dup_genes), " duplicated gene names!")
+  print(head(dup_genes))
+}
+
+# 检查细胞数量（CytoTRACE 2 对低 RNA 含量的细胞预测可能不准）
+cat("Total cells:", ncol(seurat_obj), "\n")
+cat("Median genes per cell:", median(seurat_obj$nFeature_RNA), "\n")
+cat("Cells with < 500 genes:", sum(seurat_obj$nFeature_RNA < 500), "\n")
+```
+
+
+## Run CytoTRACE 2
+
+### Option A: Seurat Object Input (Recommended)
+
+直接传入 Seurat 对象，结果自动写入 metadata。
+
+```{r}
+#| label: run-cytotrace2-seurat
+#| eval: false
+
+# !! 修改 species 为实际物种 !!
+# species: "human" 或 "mouse"
+# slot_type: "counts"（raw counts）或 "data"（CPM/TPM normalized, 非 log）
+# batch_size: 数据集 >10k 细胞时建议 10000
+# ncores: 默认为可用核心数的一半；内存 <16GB 时建议 1-2
+
+cytotrace2_result <- cytotrace2(
+  seurat_obj,
+  is_seurat = TRUE,
+  slot_type = "counts",
+  species = "mouse",         # "human" or "mouse"
+  batch_size = 10000,         # 大数据集分批处理
+  smooth_batch_size = 1000,   # 扩散平滑的子采样大小
+  parallelize_models = TRUE,
+  parallelize_smoothing = TRUE,
+  ncores = 4,                 # 根据可用资源调整
+  seed = 14
+)
+```
+
+
+::: {.callout-note}
+## 关于运行时间
+
+- 10,000 细胞：约 5-10 分钟
+- 50,000 细胞：约 20-40 分钟
+- 100,000+ 细胞：可能需要 1 小时以上
+
+运行时间受 `ncores`、`batch_size` 影响。如果内存不足导致崩溃，减小 `batch_size` 和 `ncores`。
+:::
+
+### Option B: Expression Matrix Input
+
+如果输入不是 Seurat 对象，直接提供表达矩阵。
+
+```{r}
+#| label: run-cytotrace2-matrix
+#| eval: false
+
+# 提取 raw counts 矩阵（genes × cells）
+expression_data <- as.matrix(GetAssayData(seurat_obj, layer = "counts"))
+
+# 运行 CytoTRACE 2
+cytotrace2_result <- cytotrace2(
+  expression_data,
+  species = "mouse",
+  batch_size = 10000,
+  smooth_batch_size = 1000,
+  ncores = 4,
+  seed = 14
+)
+
+# 将结果合并到 Seurat 对象
+seurat_obj <- AddMetaData(seurat_obj, cytotrace2_result)
+```
+
+
+### Save Results
+
+```{r}
+#| label: save-results
+#| eval: false
+
+# 如果使用 Option A，cytotrace2_result 本身就是 Seurat 对象
+# 将预测结果提取并保存
+if (inherits(cytotrace2_result, "Seurat")) {
+  seurat_obj <- cytotrace2_result
+}
+
+# 确认 CytoTRACE 2 metadata 已添加
+ct2_cols <- grep("CytoTRACE2|preKNN", colnames(seurat_obj@meta.data), value = TRUE)
+cat("CytoTRACE 2 metadata columns:\n")
+print(ct2_cols)
+
+head(seurat_obj@meta.data[, ct2_cols])
+
+# 保存
+qs2::qs_save(seurat_obj, "datasets/seurat_cytotrace2.qs2")
+# seurat_obj <- qs2::qs_read("datasets/seurat_cytotrace2.qs2")
+```
+
+
+## Understanding the Output
+
+CytoTRACE 2 为每个细胞生成 5 个预测值：
+
+| 列名 | 含义 | 范围 |
+|---|---|---|
+| `CytoTRACE2_Score` | 绝对潜能分数（扩散平滑后） | 0（分化）→ 1（全能） |
+| `CytoTRACE2_Potency` | 离散潜能分类 | Differentiated / Unipotent / Oligopotent / Multipotent / Pluripotent / Totipotent |
+| `CytoTRACE2_Relative` | 数据集内相对排序（归一化） | 0 → 1 |
+| `preKNN_CytoTRACE2_Score` | 平滑前的原始分数 | 0 → 1 |
+| `preKNN_CytoTRACE2_Potency` | 平滑前的原始分类 | 同上 |
+
+**分数到分类的映射：**
+
+| 分数范围 | 潜能分类 | 生物学含义 |
+|---|---|---|
+| 5/6 – 1 | Totipotent | 可生成整个生物体（受精卵） |
+| 4/6 – 5/6 | Pluripotent | 可分化为所有成体细胞类型（ESC/iPSC） |
+| 3/6 – 4/6 | Multipotent | 限于多个谱系（HSC、MSC） |
+| 2/6 – 3/6 | Oligopotent | 限于少数谱系（CMP、CLP） |
+| 1/6 – 2/6 | Unipotent | 仅产生一种成熟细胞类型（红系祖细胞） |
+| 0 – 1/6 | Differentiated | 功能成熟，无自我更新（成熟红细胞、神经元） |
+
+```{r}
+#| label: output-summary
+#| eval: false
+
+# 潜能分类分布
+table(seurat_obj$CytoTRACE2_Potency)
+
+# 分数分布统计
+summary(seurat_obj$CytoTRACE2_Score)
+
+# 每个细胞类型的平均潜能分数
+seurat_obj@meta.data %>%
+  group_by(cell_type) %>%
+  summarise(
+    n_cells = n(),
+    mean_score = mean(CytoTRACE2_Score, na.rm = TRUE),
+    median_score = median(CytoTRACE2_Score, na.rm = TRUE),
+    sd_score = sd(CytoTRACE2_Score, na.rm = TRUE)
+  ) %>%
+  arrange(desc(mean_score))
+```
+
+
+## Built-in Visualization
+
+CytoTRACE 2 自带的 `plotData()` 函数可生成标准化的可视化结果。
+
+```{r}
+#| label: builtin-plots
+#| eval: false
+
+# 准备 annotation（用于 boxplot 分组）
+annotation <- data.frame(
+  phenotype = seurat_obj$cell_type,
+  row.names = colnames(seurat_obj)
+)
+
+# 生成所有内置图
+plots <- plotData(
+  cytotrace2_result = seurat_obj,
+  annotation = annotation,
+  is_seurat = TRUE
+)
+
+# 可用图的名称
+names(plots)
+
+# 逐个查看
+plots$CytoTRACE2_UMAP              # 潜能分类 UMAP
+plots$CytoTRACE2_Potency_UMAP      # 连续分数 UMAP
+plots$CytoTRACE2_Relative_UMAP     # 相对排序 UMAP
+plots$Phenotype_UMAP                # 细胞类型 UMAP
+plots$CytoTRACE2_Boxplot_byPheno   # 按细胞类型的分数 boxplot
+```
+
+
+## Custom Visualization
+
+内置可视化功能有限，以下是更灵活的自定义可视化方案。
+
+### Potency Score UMAP
+
+```{r}
+#| label: custom-umap-score
+#| eval: false
+
+# 连续潜能分数 UMAP
+FeaturePlot(seurat_obj, features = "CytoTRACE2_Score",
+            order = TRUE, pt.size = 0.3) +
+  scale_color_viridis_c(option = "inferno", direction = -1,
+                        name = "Potency\nScore") +
+  ggtitle("CytoTRACE 2 Absolute Potency Score") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+### Potency Category UMAP
+
+```{r}
+#| label: custom-umap-category
+#| eval: false
+
+# 定义潜能分类的有序颜色
+potency_levels <- c("Differentiated", "Unipotent", "Oligopotent",
+                     "Multipotent", "Pluripotent", "Totipotent")
+potency_colors <- c("#440154", "#443A83", "#31688E",
+                     "#21908C", "#6DCD59", "#FDE725")
+
+seurat_obj$CytoTRACE2_Potency <- factor(
+  seurat_obj$CytoTRACE2_Potency,
+  levels = potency_levels
+)
+
+DimPlot(seurat_obj, group.by = "CytoTRACE2_Potency",
+        cols = setNames(potency_colors, potency_levels),
+        pt.size = 0.3) +
+  ggtitle("CytoTRACE 2 Potency Categories") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+### Per Cell Type Potency Distribution
+
+```{r}
+#| label: violin-per-celltype
+#| eval: false
+
+# 按潜能分数中位数排序
+ct_order <- seurat_obj@meta.data %>%
+  group_by(cell_type) %>%
+  summarise(median_score = median(CytoTRACE2_Score, na.rm = TRUE)) %>%
+  arrange(median_score) %>%
+  pull(cell_type)
+
+seurat_obj$cell_type_ordered <- factor(seurat_obj$cell_type, levels = ct_order)
+
+ggplot(seurat_obj@meta.data,
+       aes(x = cell_type_ordered, y = CytoTRACE2_Score, fill = cell_type_ordered)) +
+  geom_violin(scale = "width", trim = TRUE) +
+  geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.3) +
+  scale_fill_manual(values = scales::hue_pal()(length(ct_order))) +
+  labs(x = NULL, y = "CytoTRACE 2 Potency Score",
+       title = "Potency Distribution by Cell Type") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  geom_hline(yintercept = c(1/6, 2/6, 3/6, 4/6, 5/6),
+             linetype = "dashed", alpha = 0.3, color = "grey50")
+```
+
+
+### Potency Category Stacked Bar Plot
+
+```{r}
+#| label: stacked-bar-celltype
+#| eval: false
+
+# 每个细胞类型内各潜能等级的比例
+potency_prop <- seurat_obj@meta.data %>%
+  count(cell_type, CytoTRACE2_Potency) %>%
+  group_by(cell_type) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+# 按 Differentiated 比例降序排列
+ct_order_diff <- potency_prop %>%
+  filter(CytoTRACE2_Potency == "Differentiated") %>%
+  arrange(desc(prop)) %>%
+  pull(cell_type)
+
+potency_prop$cell_type <- factor(potency_prop$cell_type, levels = ct_order_diff)
+
+ggplot(potency_prop,
+       aes(x = cell_type, y = prop, fill = CytoTRACE2_Potency)) +
+  geom_col(position = "stack") +
+  scale_fill_manual(values = setNames(potency_colors, potency_levels),
+                    name = "Potency") +
+  labs(x = NULL, y = "Proportion",
+       title = "Potency Category Composition by Cell Type") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5))
+```
+
+
+### Smoothing Effect Comparison
+
+比较平滑前后的分数变化，检查扩散平滑是否合理。
+
+::: {.callout-note}
+## 这一步的目的：诊断 KNN 平滑是否合理（方法学 sanity check）
+
+CytoTRACE2 输出两列同源分数：
+- `preKNN_CytoTRACE2_Score`：模型对**每个细胞独立**预测的原始分数
+- `CytoTRACE2_Score`：经过 Markov diffusion + KNN 邻域平滑后的最终分数（默认使用）
+
+平滑的作用是用邻居细胞的平均潜能修正单细胞预测噪声。这个 section 不是主结果图，而是验证平滑是否可信的 QC。
+:::
+
+::: {.callout-tip}
+## 如何解读散点图和一致率
+
+**散点图：按 cell_type 上色，对角线是参考**
+
+- 散点**紧贴对角线** → 平滑几乎没改变结果，邻域本来就一致 ✓
+- 散点**大幅偏离对角线**，但不同 cell_type 各自成簇 → 平滑在修正噪声（正常）
+- 某一 cell_type **系统性偏离**（整群被拉高/拉低）→ KNN 图可能有问题（批次效应、分群粒度不够），或该群本身是过渡态（BLM 数据里的 Krt8⁺ transitional 就是典型——邻居混杂是生物学信号）
+
+**Potency 分类一致率（confusion matrix）**
+
+- >90% → 平滑前后定性结论稳定，放心用 post-KNN 结果
+- 80–90% → 可接受，建议主图用 post-KNN，补充材料报告 preKNN 作敏感性分析
+- <80% → 有大量细胞被重新归类，要先回去查分群/批次/注释粒度问题
+
+**如果发现异常怎么办**
+
+```r
+# 方案 A：对该 cell_type subset 后重跑 CytoTRACE2（邻居限定在同群内）
+# 方案 B：下游分析同时报告 pre/post-KNN 两版结果，观察结论稳健性
+```
+:::
+
+```{r}
+#| label: smoothing-comparison
+#| eval: false
+
+# 平滑前后的分数散点图
+ggplot(seurat_obj@meta.data,
+       aes(x = preKNN_CytoTRACE2_Score, y = CytoTRACE2_Score)) +
+  geom_point(aes(color = cell_type), size = 0.3, alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(x = "Pre-KNN Score (Raw)", y = "Post-KNN Score (Smoothed)",
+       title = "Effect of Markov Diffusion Smoothing") +
+  theme_minimal() +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5))
+
+# 平滑前后的分类一致性
+confusion <- table(
+  Pre = seurat_obj$preKNN_CytoTRACE2_Potency,
+  Post = seurat_obj$CytoTRACE2_Potency
+)
+cat("Pre-KNN vs Post-KNN potency agreement:\n")
+cat("Overall agreement:", round(sum(diag(confusion)) / sum(confusion) * 100, 1), "%\n")
+```
+
+
+## Cross-Condition Comparison
+
+```{r}
+#| label: group-factor-order
+#| eval: false
+
+# !! 关键：锁定三组展示顺序 Normal → Model → QR056251 !!
+# 所有后续画图/统计都依赖这个 factor level（x 轴、facet、配色都按这个顺序）
+seurat_obj$group <- factor(
+  seurat_obj$group,
+  levels = c("Normal", "Model", "QR056251")
+)
+
+# 统一配色，方便所有图一致
+group_cols <- c(Normal = "#4DAF4A", Model = "#E41A1C", QR056251 = "#377EB8")
+```
+
+### Potency Distribution by Condition
+
+```{r}
+#| label: condition-violin
+#| eval: false
+
+# 全局比较：不同条件的总体潜能分布
+ggplot(seurat_obj@meta.data,
+       aes(x = group, y = CytoTRACE2_Score, fill = group)) +
+  geom_violin(scale = "width") +
+  geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.3) +
+  labs(x = NULL, y = "Potency Score",
+       title = "Overall Potency Distribution by Condition") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5))
+```
+
+
+### Per Cell Type × Condition Comparison
+
+```{r}
+#| label: celltype-condition-comparison
+#| eval: false
+
+# 每个细胞类型在不同条件间的潜能比较
+ggplot(seurat_obj@meta.data,
+       aes(x = group, y = CytoTRACE2_Score, fill = group)) +
+  geom_violin(scale = "width", trim = TRUE) +
+  geom_boxplot(width = 0.15, fill = "white", outlier.size = 0.2) +
+  facet_wrap(~ cell_type, scales = "free_y", ncol = 4) +
+  labs(x = NULL, y = "Potency Score",
+       title = "Potency Score by Cell Type and Condition") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    strip.text = element_text(size = 9, face = "bold"),
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5)
+  )
+```
+
+
+### Statistical Testing
+
+::: {.callout-warning}
+## 统计检验注意事项
+
+单细胞层面的统计检验（如 Wilcoxon）由于极大的样本量，即使极小的差异也会给出显著的 p 值。**应关注效应量（effect size）而非仅看 p 值。** 理想做法是在样本（replicate）水平汇总后再做统计检验。
+:::
+
+```{r}
+#| label: statistical-testing
+#| eval: false
+
+# ========================================
+# 方案1: 细胞水平 Wilcoxon 检验（参考用，注意伪重复问题）
+# ========================================
+conditions <- unique(seurat_obj$group)
+cell_types <- unique(seurat_obj$cell_type)
+
+# 两两条件比较
+comparisons <- combn(conditions, 2, simplify = FALSE)
+
+cell_level_results <- list()
+for (ct in cell_types) {
+  for (comp in comparisons) {
+    cells_a <- seurat_obj@meta.data %>%
+      filter(cell_type == ct, group == comp[1]) %>%
+      pull(CytoTRACE2_Score)
+    cells_b <- seurat_obj@meta.data %>%
+      filter(cell_type == ct, group == comp[2]) %>%
+      pull(CytoTRACE2_Score)
+
+    if (length(cells_a) >= 10 && length(cells_b) >= 10) {
+      wt <- wilcox.test(cells_a, cells_b)
+      # Cohen's d (effect size)
+      cohens_d <- (mean(cells_b) - mean(cells_a)) /
+        sqrt((var(cells_a) + var(cells_b)) / 2)
+
+      cell_level_results[[paste(ct, comp[1], "vs", comp[2])]] <- tibble(
+        cell_type = ct,
+        condition_1 = comp[1],
+        condition_2 = comp[2],
+        n_1 = length(cells_a),
+        n_2 = length(cells_b),
+        mean_1 = mean(cells_a),
+        mean_2 = mean(cells_b),
+        delta_mean = mean(cells_b) - mean(cells_a),
+        cohens_d = cohens_d,
+        p_value = wt$p.value
+      )
+    }
+  }
+}
+
+cell_level_df <- bind_rows(cell_level_results)
+cell_level_df$p_adj <- p.adjust(cell_level_df$p_value, method = "BH")
+
+cell_level_df %>%
+  arrange(p_adj) %>%
+  print(n = 30)
+
+
+# ========================================
+# 方案2: 样本水平汇总后检验（更可靠，但需要足够的生物学重复）
+# ========================================
+sample_level <- seurat_obj@meta.data %>%
+  group_by(cell_type, group, orig.ident) %>%
+  summarise(
+    mean_score = mean(CytoTRACE2_Score, na.rm = TRUE),
+    median_score = median(CytoTRACE2_Score, na.rm = TRUE),
+    n_cells = n(),
+    .groups = "drop"
+  )
+
+# 查看每个 cell_type × group 有多少个样本
+sample_level %>%
+  count(cell_type, group, name = "n_samples")
+
+# 样本水平 Wilcoxon（每个细胞类型 × 条件对）
+# 注意：如果每组只有 2-3 个样本，统计功效很低
+sample_results <- list()
+for (ct in cell_types) {
+  for (comp in comparisons) {
+    vals_a <- sample_level %>%
+      filter(cell_type == ct, group == comp[1]) %>%
+      pull(mean_score)
+    vals_b <- sample_level %>%
+      filter(cell_type == ct, group == comp[2]) %>%
+      pull(mean_score)
+
+    if (length(vals_a) >= 2 && length(vals_b) >= 2) {
+      wt <- wilcox.test(vals_a, vals_b, exact = FALSE)
+      sample_results[[paste(ct, comp[1], "vs", comp[2])]] <- tibble(
+        cell_type = ct,
+        condition_1 = comp[1],
+        condition_2 = comp[2],
+        n_samples_1 = length(vals_a),
+        n_samples_2 = length(vals_b),
+        mean_1 = mean(vals_a),
+        mean_2 = mean(vals_b),
+        delta_mean = mean(vals_b) - mean(vals_a),
+        p_value = wt$p.value
+      )
+    }
+  }
+}
+
+sample_level_df <- bind_rows(sample_results)
+sample_level_df$p_adj <- p.adjust(sample_level_df$p_value, method = "BH")
+
+sample_level_df %>%
+  arrange(p_adj)
+```
+
+::: {.callout-important}
+## 三组设计的检验策略（BLM 实际场景）
+
+上面 `combn(conditions, 2)` 会跑所有 3 对两两比较，但对 BLM 药效研究来说只有 2 对是主要假设：
+
+| 对比 | 生物学问题 | 地位 |
+|---|---|---|
+| **Model vs Normal** | 疾病有无扰动？ | 主检验（disease effect） |
+| **QR056251 vs Model** | 药物是否挽救？ | 主检验（drug effect） |
+| Normal vs QR056251 | 药效是否回到正常？ | 辅助（residual effect） |
+
+**推荐分两步走：**
+
+1. **先做 Kruskal-Wallis 三组总检验**过滤出"疾病真正扰动过"的 cell_type
+2. **只对那些 cell_type 做两个方向性 contrast**，而不是一股脑跑所有 pairwise——既符合假设也更省 multiple testing penalty
+:::
+
+```{r}
+#| label: directional-contrasts
+#| eval: false
+
+# ========================================
+# 方案3（推荐）：Kruskal-Wallis 过滤 + 方向性 pairwise
+# ========================================
+# 这里只做两个有生物学意义的对比，方向固定：
+#   Model_vs_Normal: delta = mean(Model) - mean(Normal) —— 疾病方向
+#   QR_vs_Model:     delta = mean(QR056251) - mean(Model) —— 药物方向
+# 理想 rescue：disease_delta 显著≠0，drug_delta 方向相反
+
+# ---- Step 1: 每个 cell_type 做 Kruskal-Wallis 三组总检验（细胞水平）----
+kw_results <- seurat_obj@meta.data %>%
+  dplyr::group_by(cell_type) %>%
+  dplyr::summarise(
+    n = dplyr::n(),
+    kw_p = tryCatch(
+      kruskal.test(CytoTRACE2_Score ~ group)$p.value,
+      error = function(e) NA_real_
+    ),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(kw_p_adj = p.adjust(kw_p, method = "BH")) %>%
+  dplyr::arrange(kw_p_adj)
+
+print(kw_results)
+
+# ---- Step 2: 仅对 KW 显著的 cell_type 做两个方向性 contrast ----
+sig_types <- kw_results %>%
+  dplyr::filter(kw_p_adj < 0.05) %>%
+  dplyr::pull(cell_type)
+
+directional_contrast <- function(df, ct, g1, g2) {
+  # delta = g1 - g2，正值表示 g1 比 g2 更高
+  x <- df$CytoTRACE2_Score[df$cell_type == ct & df$group == g1]
+  y <- df$CytoTRACE2_Score[df$cell_type == ct & df$group == g2]
+  if (length(x) < 10 || length(y) < 10) return(NULL)
+  w <- wilcox.test(x, y)
+  d <- (mean(x) - mean(y)) / sqrt((var(x) + var(y)) / 2)
+  tibble::tibble(
+    cell_type  = ct,
+    contrast   = paste0(g1, "_vs_", g2),
+    n_g1 = length(x), n_g2 = length(y),
+    mean_g1 = mean(x), mean_g2 = mean(y),
+    delta   = mean(x) - mean(y),
+    cohens_d = d,
+    p_value  = w$p.value
+  )
+}
+
+md <- seurat_obj@meta.data
+directional_df <- dplyr::bind_rows(
+  lapply(sig_types, function(ct) {
+    dplyr::bind_rows(
+      directional_contrast(md, ct, "Model",    "Normal"),    # disease effect
+      directional_contrast(md, ct, "QR056251", "Model")      # drug effect
+    )
+  })
+) %>%
+  dplyr::mutate(p_adj = p.adjust(p_value, method = "BH"))
+
+# ---- Step 3: 宽表呈现，方便判断 rescue 模式 ----
+rescue_summary <- directional_df %>%
+  dplyr::select(cell_type, contrast, delta, cohens_d, p_adj) %>%
+  tidyr::pivot_wider(
+    id_cols = cell_type,
+    names_from = contrast,
+    values_from = c(delta, cohens_d, p_adj)
+  ) %>%
+  dplyr::mutate(
+    pattern = dplyr::case_when(
+      delta_Model_vs_Normal > 0 & delta_QR056251_vs_Model < 0 ~ "Good rescue (A)",
+      delta_Model_vs_Normal < 0 & delta_QR056251_vs_Model > 0 ~ "Good rescue (reverse)",
+      delta_Model_vs_Normal > 0 & delta_QR056251_vs_Model > 0 ~ "Drug amplifies",
+      delta_Model_vs_Normal < 0 & delta_QR056251_vs_Model < 0 ~ "Drug worsens",
+      TRUE ~ "Unclear"
+    )
+  ) %>%
+  dplyr::arrange(pattern, dplyr::desc(abs(delta_Model_vs_Normal)))
+
+print(rescue_summary)
+write.csv(rescue_summary, "Results/CytoTRACE2_rescue_summary.csv", row.names = FALSE)
+
+# ========================================
+# 方案3b: 样本水平（pseudobulk）的方向性 contrast
+# 9 个样本 × 3 组（每组 3 个重复），可以做严格的 3v3 t-test
+# ========================================
+sample_directional <- function(df, ct, g1, g2) {
+  x <- df$mean_score[df$cell_type == ct & df$group == g1]
+  y <- df$mean_score[df$cell_type == ct & df$group == g2]
+  if (length(x) < 2 || length(y) < 2) return(NULL)
+  t_res <- t.test(x, y)
+  tibble::tibble(
+    cell_type = ct,
+    contrast  = paste0(g1, "_vs_", g2),
+    n_g1 = length(x), n_g2 = length(y),
+    mean_g1 = mean(x), mean_g2 = mean(y),
+    delta   = mean(x) - mean(y),
+    p_value = t_res$p.value
+  )
+}
+
+sample_directional_df <- dplyr::bind_rows(
+  lapply(sig_types, function(ct) {
+    dplyr::bind_rows(
+      sample_directional(sample_level, ct, "Model",    "Normal"),
+      sample_directional(sample_level, ct, "QR056251", "Model")
+    )
+  })
+) %>%
+  dplyr::mutate(p_adj = p.adjust(p_value, method = "BH"))
+
+print(sample_directional_df)
+```
+
+::: {.callout-tip}
+## 写 paper 时用哪个结果？
+
+- **细胞水平（方案 1 / 方案 3）**：样本量大 → p 值极易显著，要汇报时一定加 **Cohen's d** 控制效应量解读
+- **样本水平（方案 2 / 方案 3b）**：3v3 统计功效低 → 只能发现**效应量大**的真信号，更严谨
+- **建议**：主图用样本水平结果（pseudobulk 3v3 t-test），补充材料给细胞水平（Wilcoxon + Cohen's d）作为细粒度支撑
+:::
+
+
+### Potency Category Shift
+
+```{r}
+#| label: potency-shift
+#| eval: false
+
+# 各条件下潜能分类的比例变化
+potency_by_condition <- seurat_obj@meta.data %>%
+  count(group, cell_type, CytoTRACE2_Potency) %>%
+  group_by(group, cell_type) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+# 对特定感兴趣的细胞类型绘图
+target_ct <- c("Fibroblast", "Macrophage", "T cell")  # !! 替换为实际细胞类型 !!
+target_ct <- intersect(target_ct, unique(seurat_obj$cell_type))
+
+ggplot(potency_by_condition %>% filter(cell_type %in% target_ct),
+       aes(x = group, y = prop, fill = CytoTRACE2_Potency)) +
+  geom_col(position = "stack") +
+  facet_wrap(~ cell_type, ncol = 4) +
+  scale_fill_manual(values = setNames(potency_colors, potency_levels),
+                    name = "Potency") +
+  labs(x = NULL, y = "Proportion",
+       title = "Potency Category Distribution Shift Across Conditions") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5))
+```
+
+
+## Case Study: BLM 肺纤维化三组药效分析
+
+以 BLM（博来霉素）诱导小鼠肺纤维化模型为例，三组设计：`Normal` / `Model` / `QR056251`（药物）。
+核心问题：**QR056251 是否将 BLM 扰动的细胞潜能分布"拉回"Normal 状态？**
+
+::: {.callout-tip}
+## BLM 系统中 CytoTRACE2 的生物学读数
+
+- **AT2 progenitor 耗竭**：Normal 组 AT2 是 Unipotent（AT2→AT1 祖细胞），Model 组潜能是否下降？
+- **Krt8⁺ transitional / ADI / DATP 状态**：BLM 特异出现的"卡住的中间态"，是纤维化标志
+- **Myofibroblast 活化**：纤维化 fibroblast 潜能通常降低（终末活化态）
+- **Profibrotic macrophage (SPP1⁺)** 相比稳态肺泡 Mφ 的潜能变化
+:::
+
+::: {.callout-note}
+## 与前面通用章节的关系
+
+本 section **只放 BLM 专属的新增分析**，以下步骤已在前面通用章节给出，这里不重复：
+
+- `group` factor level 锁定 → `Cross-Condition Comparison` 的 `group-factor-order` chunk
+- 全局/分 cell_type 的 violin 图 → `Potency Distribution by Condition` / `Per Cell Type × Condition Comparison`
+- Wilcoxon + Cohen's d、Kruskal-Wallis 过滤、方向性 contrast → `Statistical Testing` 方案 3
+- 每个 cell_type 的 Potency 等级组成堆叠图 → `Potency Category Shift`
+
+**运行前置条件**：先跑过 `group-factor-order` 和 `Statistical Testing` 方案 3，拿到 `sig_types` / `rescue_summary`。
+
+**BLM 专属 `focus_types` / `exclude_types`（供前面 section 使用）：**
+
+```r
+focus_types <- c(
+  "AT1/2",                       # 上皮损伤/再生轴（含潜在 Krt8+ transitional）
+  "AF2",                         # alveolar/activated fibroblast，纤维化 stromal 核心
+  "Alveolar Macrophages",        # 稳态肺泡 Mφ，基线参照
+  "Pro-fibrotic Macrophages",    # SPP1+/Trem2+ 致纤维化 Mφ（核心 read-out）
+  "Interstitial Macrophages",
+  "Recruited Macrophages",       # 单核源 Mφ，纤维化中扩增
+  "Injured Myeloid",             # BLM 特异损伤髓系
+  "Capillary cell 2"             # aCap/gCap 血管重塑
+)
+exclude_types <- c("Multiplets", "unknown", "Erythrocyte")
+```
+:::
+
+### Rescue score —— 药效可视化核心图
+
+对每个 cell_type 计算：
+
+- `disease_effect = mean(Model) - mean(Normal)`：疾病扰动方向
+- `drug_effect = mean(QR056251) - mean(Model)`：药物扰动方向
+- `rescue_ratio = -drug_effect / disease_effect`
+
+解读：
+
+- 接近 1 → 完全挽救
+- 0 附近 → 药物无效
+- 负值 → 药物加重表型
+
+```{r}
+#| label: blm-rescue
+#| eval: false
+
+rescue_tbl <- md %>%
+  dplyr::group_by(cell_type, group) %>%
+  dplyr::summarise(mean_score = mean(CytoTRACE2_Score, na.rm = TRUE),
+                   n = dplyr::n(), .groups = "drop") %>%
+  tidyr::pivot_wider(id_cols = cell_type,
+                     names_from = group,
+                     values_from = c(mean_score, n)) %>%
+  dplyr::mutate(
+    disease_effect = mean_score_Model - mean_score_Normal,
+    drug_effect    = mean_score_QR056251 - mean_score_Model,
+    rescue_ratio   = dplyr::case_when(
+      abs(disease_effect) < 0.01 ~ NA_real_,
+      TRUE ~ -drug_effect / disease_effect
+    )
+  ) %>%
+  dplyr::filter(n_Normal >= 30, n_Model >= 30, n_QR056251 >= 30) %>%
+  dplyr::arrange(dplyr::desc(abs(disease_effect)))
+
+write.csv(rescue_tbl, "Results/CytoTRACE2_rescue_scores.csv", row.names = FALSE)
+
+# ---- 4a. Δscore heatmap（疾病效应 vs 药物效应）----
+heat_df <- rescue_tbl %>%
+  dplyr::select(cell_type, disease_effect, drug_effect) %>%
+  tidyr::pivot_longer(-cell_type, names_to = "contrast", values_to = "delta") %>%
+  dplyr::mutate(
+    contrast = factor(contrast,
+                      levels = c("disease_effect", "drug_effect"),
+                      labels = c("Model − Normal", "QR056251 − Model")),
+    cell_type = factor(cell_type, levels = rescue_tbl$cell_type)
+  )
+
+p_heat <- ggplot(heat_df, aes(x = contrast, y = cell_type, fill = delta)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.3f", delta)), size = 3) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       midpoint = 0, name = "ΔScore") +
+  labs(x = NULL, y = NULL,
+       title = "Disease vs Drug effect on CytoTRACE2 score") +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+ggsave("Results/CytoTRACE2_rescue_heatmap.pdf", p_heat,
+       width = 5, height = max(4, 0.3 * nrow(rescue_tbl) + 1))
+
+# ---- 4b. Rescue ratio 条形图 ----
+p_rescue <- rescue_tbl %>%
+  dplyr::filter(!is.na(rescue_ratio)) %>%
+  dplyr::mutate(cell_type = forcats::fct_reorder(cell_type, rescue_ratio)) %>%
+  ggplot(aes(x = rescue_ratio, y = cell_type, fill = rescue_ratio > 0)) +
+  geom_col() +
+  geom_vline(xintercept = c(0, 1), linetype = "dashed", color = "grey40") +
+  scale_fill_manual(values = c(`TRUE` = "#377EB8", `FALSE` = "#999999"),
+                    guide = "none") +
+  labs(x = "Rescue ratio  (1 = full rescue, 0 = no effect, <0 = worsened)",
+       y = NULL,
+       title = "QR056251 rescue effect per cell type") +
+  theme_bw(base_size = 12)
+
+ggsave("Results/CytoTRACE2_rescue_barplot.pdf", p_rescue,
+       width = 6, height = max(4, 0.3 * nrow(rescue_tbl) + 1))
+
+# 保存结果
+qs2::qs_save(list(stat_tbl = stat_tbl, rescue_tbl = rescue_tbl),
+             "Results/CytoTRACE2_group_comparison.qs2")
+```
+
+::: {.callout-note}
+## 结果解读要点
+
+- **stat_tbl**：AT2 的 `Model_vs_Normal` 若显著下降 + `QR056251_vs_Model` 若显著回升 → 药物保护肺泡再生能力
+- **rescue heatmap**：一张图看完所有 cell_type 的疾病→药物效应，两列颜色相反才是"挽救"
+- **rescue_ratio bar**：直接锁定药物挽救最强的细胞类型，写 paper 时候选主图
+- **Krt8⁺ transitional 细胞**：如还未注释，可用 `CytoTRACE2_Score` 中等（0.1–0.3）+ Krt8/Cldn4/Sfn 标记基因联合识别——Model 组扩增、药物组减少是标志性发现
+:::
+
+### AT1/2 精细分析：识别 Krt8⁺ transitional 细胞
+
+::: {.callout-important}
+## 为什么这一步对 BLM paper 最有价值
+
+当前数据里 `AT1/2` 被合并注释为一个群体（n=1515），但 BLM 纤维化的标志性分子事件就发生在这个轴上：
+**AT2 progenitor → Krt8⁺ transitional (ADI/DATP) → AT1 (成熟肺泡I型)**。
+
+Krt8⁺ transitional 是 BLM 特异出现的"卡住的中间态"，也是 Nature/Nat Med 级别论文的经典发现（Kobayashi 2020、Strunz 2020、Choi 2020）。
+**CytoTRACE2_Score 的连续分布 + Marker 基因**联合，是识别这个群体最稳的方法。
+:::
+
+```{r}
+#| label: at12-subset-recluster
+#| eval: false
+
+# ---- Subset AT1/2 并重新分群 ----
+at12_obj <- subset(seurat_obj, subset = cell_type == "AT1/2")
+
+DefaultAssay(at12_obj) <- "RNA"
+at12_obj <- JoinLayers(at12_obj)  # v5 必做
+
+at12_obj <- NormalizeData(at12_obj) %>%
+  FindVariableFeatures(nfeatures = 2000) %>%
+  ScaleData() %>%
+  RunPCA(npcs = 30, verbose = FALSE) %>%
+  RunUMAP(dims = 1:20, verbose = FALSE) %>%
+  FindNeighbors(dims = 1:20) %>%
+  FindClusters(resolution = 0.3)
+
+# ---- AT2 / AT1 / Krt8+ transitional marker ----
+at12_markers <- list(
+  AT2          = c("Sftpc", "Sftpb", "Sftpa1", "Abca3", "Lamp3", "Napsa"),
+  AT1          = c("Ager", "Hopx", "Aqp5", "Pdpn", "Rtkn2", "Cav1"),
+  Transitional = c("Krt8", "Krt18", "Cldn4", "Sfn", "Cdkn1a", "Hbegf", "Areg"),
+  Cycling      = c("Mki67", "Top2a")
+)
+
+DotPlot(at12_obj,
+        features = unique(unlist(at12_markers)),
+        group.by = "seurat_clusters") +
+  RotatedAxis() +
+  scale_color_gradient2(low = "#2166AC", mid = "white", high = "#B2182B")
+
+ggsave("Results/AT12_subset_marker_dotplot.pdf", width = 10, height = 4)
+
+# ---- UMAP: 同时看潜能分数 + marker ----
+p_umap_score <- FeaturePlot(at12_obj, features = "CytoTRACE2_Score",
+                            order = TRUE, pt.size = 0.5) +
+  scale_color_viridis_c(option = "plasma")
+
+p_umap_krt8 <- FeaturePlot(at12_obj, features = "Krt8",
+                           order = TRUE, pt.size = 0.5) +
+  scale_color_gradient(low = "grey90", high = "#B2182B")
+
+p_umap_sftpc <- FeaturePlot(at12_obj, features = "Sftpc",
+                            order = TRUE, pt.size = 0.5) +
+  scale_color_gradient(low = "grey90", high = "#1F77B4")
+
+p_umap_ager <- FeaturePlot(at12_obj, features = "Ager",
+                           order = TRUE, pt.size = 0.5) +
+  scale_color_gradient(low = "grey90", high = "#2CA02C")
+
+library(patchwork)
+(p_umap_score | p_umap_sftpc) / (p_umap_krt8 | p_umap_ager)
+ggsave("Results/AT12_subset_umap_score_vs_markers.pdf", width = 10, height = 8)
+```
+
+```{r}
+#| label: at12-assign-subtype
+#| eval: false
+
+# ---- 基于 cluster marker + CytoTRACE2 score 手动注释 ----
+# 策略：
+#   - 高 Sftpc + 高 score                 → AT2
+#   - 高 Ager/Hopx + 低 score             → AT1
+#   - 高 Krt8/Cldn4 + 中等 score (0.1-0.3) → Transitional (Krt8+)
+#   - 高 Mki67                             → Cycling AT2
+#
+# 下面是占位映射，运行 DotPlot 后根据实际结果填写
+cluster_to_subtype <- c(
+  "0" = "AT2",
+  "1" = "AT1",
+  "2" = "Krt8+ Transitional",
+  "3" = "AT2",
+  "4" = "Cycling AT2"
+)
+
+at12_obj$at12_subtype <- cluster_to_subtype[as.character(at12_obj$seurat_clusters)]
+
+# 连续分数谱：按 subtype 看分布
+ggplot(at12_obj@meta.data,
+       aes(x = reorder(at12_subtype, CytoTRACE2_Score, median),
+           y = CytoTRACE2_Score, fill = at12_subtype)) +
+  geom_violin(scale = "width", alpha = 0.8) +
+  geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.3) +
+  labs(x = NULL, y = "CytoTRACE2 score",
+       title = "AT1/2 fine subtypes: potency spectrum") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 30, hjust = 1))
+
+ggsave("Results/AT12_subtype_potency_violin.pdf", width = 6, height = 4.5)
+
+qs2::qs_save(at12_obj, "datasets/at12_subset_cytotrace2.qs2")
+```
+
+```{r}
+#| label: at12-group-comparison
+#| eval: false
+
+# ---- 关键图：三组间 AT2 / Transitional / AT1 比例 + 分数变化 ----
+# 预期：
+#   - Model 组 AT2 减少、Transitional 扩增、AT1 相对稳定或下降
+#   - QR056251 组 AT2 回升、Transitional 减少 → 药物促进肺泡再生
+
+at12_md <- at12_obj@meta.data
+
+# ---- 5a. 亚型组成三组对比 ----
+p_compose <- at12_md %>%
+  dplyr::count(group, at12_subtype) %>%
+  dplyr::group_by(group) %>%
+  dplyr::mutate(prop = n / sum(n)) %>%
+  dplyr::ungroup() %>%
+  ggplot(aes(x = group, y = prop, fill = at12_subtype)) +
+  geom_col(width = 0.7) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(x = NULL, y = "Proportion",
+       title = "AT1/2 subtype composition across groups") +
+  theme_bw(base_size = 12)
+
+ggsave("Results/AT12_subtype_composition_by_group.pdf", p_compose,
+       width = 5, height = 4)
+
+# ---- 5b. Krt8+ transitional 细胞绝对数量 / 比例（核心药效指标）----
+transitional_stat <- at12_md %>%
+  dplyr::group_by(group, orig.ident) %>%
+  dplyr::summarise(
+    total = dplyr::n(),
+    n_transitional = sum(at12_subtype == "Krt8+ Transitional"),
+    pct_transitional = n_transitional / total * 100,
+    .groups = "drop"
+  )
+
+# 样本级 3v3 检验（更严格）
+t_mod_vs_norm <- t.test(
+  pct_transitional ~ group,
+  data = transitional_stat %>% dplyr::filter(group %in% c("Model", "Normal"))
+)
+t_drug_vs_mod <- t.test(
+  pct_transitional ~ group,
+  data = transitional_stat %>% dplyr::filter(group %in% c("Model", "QR056251"))
+)
+
+ggplot(transitional_stat,
+       aes(x = group, y = pct_transitional, fill = group)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA) +
+  geom_jitter(width = 0.15, size = 2) +
+  scale_fill_manual(values = group_cols) +
+  annotate("text", x = 1.5, y = max(transitional_stat$pct_transitional) * 1.05,
+           label = sprintf("Model vs Normal: p=%.3g", t_mod_vs_norm$p.value)) +
+  annotate("text", x = 2.5, y = max(transitional_stat$pct_transitional) * 1.15,
+           label = sprintf("QR vs Model: p=%.3g", t_drug_vs_mod$p.value)) +
+  labs(x = NULL, y = "Krt8+ Transitional (% of AT1/2)",
+       title = "Key readout: Krt8+ transitional abundance") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "none")
+
+ggsave("Results/AT12_Krt8_transitional_pct_boxplot.pdf",
+       width = 5, height = 4)
+
+# ---- 5c. AT2 和 AT1 分数三组变化 ----
+at12_md %>%
+  dplyr::filter(at12_subtype %in% c("AT2", "AT1", "Krt8+ Transitional")) %>%
+  ggplot(aes(x = group, y = CytoTRACE2_Score, fill = group)) +
+  geom_violin(scale = "width", alpha = 0.7) +
+  geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.3) +
+  scale_fill_manual(values = group_cols) +
+  facet_wrap(~ at12_subtype, scales = "free_y") +
+  labs(x = NULL, y = "CytoTRACE2 score") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "none")
+
+ggsave("Results/AT12_subtype_score_by_group.pdf", width = 9, height = 4)
+```
+
+::: {.callout-tip}
+## AT1/2 精细分析的药效学解读
+
+纤维化标志 → 药效终点：
+
+1. **Krt8⁺ transitional 比例**：Model 显著升高，QR056251 回落 → 药物阻断上皮异常中间态
+2. **AT2 潜能分数**：Model 下降（祖细胞功能受损），QR056251 回升 → 药物保护肺泡再生能力
+3. **AT2 / Transitional / AT1 三者比例轴**：药物使轴向"正常化"
+
+如果这三个都朝 rescue 方向，基本可以作为论文 Fig. 的 hero figure。
+:::
+
+
+## Potency-Associated Gene Analysis
+
+### Correlation with Gene Expression
+
+识别与潜能分数高度相关的基因，揭示驱动干性/分化的分子程序。
+
+```{r}
+#| label: potency-gene-correlation
+#| eval: false
+
+# 对特定细胞类型计算基因与潜能分数的相关性
+# !! 替换为感兴趣的细胞类型 !!
+target_ct_name <- "Fibroblast"
+
+cells_of_interest <- WhichCells(seurat_obj, expression = cell_type == target_ct_name)
+sub_obj <- subset(seurat_obj, cells = cells_of_interest)
+
+# 使用 normalized data（非 counts）计算相关性
+DefaultAssay(sub_obj) <- "RNA"
+expr_mat <- GetAssayData(sub_obj, layer = "data")
+
+# 仅保留在 >10% 细胞中表达的基因（减少噪声）
+gene_pct <- rowMeans(expr_mat > 0)
+genes_use <- names(gene_pct[gene_pct > 0.1])
+expr_mat <- expr_mat[genes_use, ]
+
+# Spearman 相关性
+potency_scores <- sub_obj$CytoTRACE2_Score
+cor_results <- apply(expr_mat, 1, function(x) {
+  ct <- cor.test(x, potency_scores, method = "spearman")
+  c(rho = ct$estimate, p = ct$p.value)
+})
+cor_df <- as.data.frame(t(cor_results))
+cor_df$gene <- rownames(cor_df)
+cor_df$p_adj <- p.adjust(cor_df$p, method = "BH")
+
+# Top 正/负相关基因
+cat("=== Top genes positively correlated with potency (stemness markers) ===\n")
+cor_df %>% arrange(desc(rho.rho)) %>% head(20)
+
+cat("\n=== Top genes negatively correlated with potency (differentiation markers) ===\n")
+cor_df %>% arrange(rho.rho) %>% head(20)
+```
+
+
+### Enrichment Analysis of Potency-Associated Genes
+
+::: {.callout-note}
+## 分析范围与解读
+
+这一步承接上面的 Spearman 相关分析，**作用域限定在单一 cell_type 内部**（由 `target_ct_name` 指定）：
+
+1. **输入基因列表**来自上一 chunk 的 `cor_df` —— 该 cell_type 内与 `CytoTRACE2_Score` 显著相关的基因
+2. **Stemness genes** (`rho > 0.2`)：同一亚群内高潜能细胞富集的基因 → 干性/祖细胞 program
+3. **Differentiation genes** (`rho < -0.2`)：同一亚群内低潜能细胞富集的基因 → 终末分化 program
+4. 两份 list 分别做 **GO BP + Reactome** 富集
+
+**为什么必须限定在单个 cell_type 内？**
+不同 cell_type 的 score 均值天然差异大（AT2 > AT1、progenitor > 终末分化），跨 cell_type 混跑得到的是"cell_type marker 富集"而非"潜能驱动通路"。
+
+**BLM 数据中最值得跑的 cell_type：**
+
+- `AT1/2`：预期 stemness 端富集 Wnt/Notch、AT2 祖细胞 program；differentiation 端富集 AT1 成熟相关
+- `Pro-fibrotic Macrophages`：揭示 SPP1⁺ Mφ 的起源 program
+- `AF2`：fibroblast 活化谱的 stemness vs myofibroblast 终末分化
+
+**扩展做法**：把同一 cell_type 拆到 Normal / Model / QR056251 三组分别做相关分析，对比三组的 stemness program 是否一致——Model 组多出的异常基因被 QR056251 压下 = 强药效机制证据。
+:::
+
+```{r}
+#| label: potency-enrichment
+#| eval: false
+
+library(clusterProfiler)
+library(org.Mm.eg.db)   # 小鼠；人类用 org.Hs.eg.db
+library(ReactomePA)
+
+# 正向相关基因（高潜能关联 = stemness program）
+stemness_genes <- cor_df %>%
+  filter(rho.rho > 0.2, p_adj < 0.05) %>%
+  pull(gene)
+
+# 负向相关基因（低潜能关联 = differentiation program）
+diff_genes <- cor_df %>%
+  filter(rho.rho < -0.2, p_adj < 0.05) %>%
+  pull(gene)
+
+cat("Stemness-associated genes:", length(stemness_genes), "\n")
+cat("Differentiation-associated genes:", length(diff_genes), "\n")
+
+# GO 富集
+stem_go <- enrichGO(
+  gene = stemness_genes,
+  OrgDb = org.Mm.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05
+)
+
+diff_go <- enrichGO(
+  gene = diff_genes,
+  OrgDb = org.Mm.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05
+)
+
+# Reactome 富集
+stem_entrez <- bitr(stemness_genes, fromType = "SYMBOL",
+                     toType = "ENTREZID", OrgDb = org.Mm.eg.db)$ENTREZID
+diff_entrez <- bitr(diff_genes, fromType = "SYMBOL",
+                     toType = "ENTREZID", OrgDb = org.Mm.eg.db)$ENTREZID
+
+stem_reactome <- enrichPathway(
+  gene = stem_entrez,
+  organism = "mouse",
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05
+)
+
+diff_reactome <- enrichPathway(
+  gene = diff_entrez,
+  organism = "mouse",
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05
+)
+
+# 可视化
+if (nrow(as.data.frame(stem_go)) > 0) {
+  dotplot(stem_go, showCategory = 15, title = "Stemness-associated GO BP")
+}
+if (nrow(as.data.frame(diff_go)) > 0) {
+  dotplot(diff_go, showCategory = 15, title = "Differentiation-associated GO BP")
+}
+if (nrow(as.data.frame(stem_reactome)) > 0) {
+  dotplot(stem_reactome, showCategory = 15, title = "Stemness-associated Reactome")
+}
+if (nrow(as.data.frame(diff_reactome)) > 0) {
+  dotplot(diff_reactome, showCategory = 15, title = "Differentiation-associated Reactome")
+}
+```
+
+
+### Differential Expression: High vs Low Potency
+
+在同一细胞类型内，根据潜能分数分组做差异表达分析，更直接地识别干性/分化相关基因。
+
+```{r}
+#| label: de-high-low-potency
+#| eval: false
+
+# 对特定细胞类型，按潜能分数三分位数分为 High / Low 组
+sub_obj$potency_group <- case_when(
+  sub_obj$CytoTRACE2_Score >= quantile(sub_obj$CytoTRACE2_Score, 0.75) ~ "High_Potency",
+  sub_obj$CytoTRACE2_Score <= quantile(sub_obj$CytoTRACE2_Score, 0.25) ~ "Low_Potency",
+  TRUE ~ "Mid"
+)
+
+table(sub_obj$potency_group)
+
+# 仅比较 High vs Low
+Idents(sub_obj) <- "potency_group"
+de_results <- FindMarkers(
+  sub_obj,
+  ident.1 = "High_Potency",
+  ident.2 = "Low_Potency",
+  test.use = "wilcox",
+  min.pct = 0.1,
+  logfc.threshold = 0.25
+)
+
+de_results$gene <- rownames(de_results)
+
+# High_Potency 上调 = stemness genes
+cat("=== Genes upregulated in High Potency cells (stemness) ===\n")
+de_results %>%
+  filter(avg_log2FC > 0, p_val_adj < 0.05) %>%
+  arrange(desc(avg_log2FC)) %>%
+  head(20)
+
+# Low_Potency 上调 = differentiation genes
+cat("\n=== Genes upregulated in Low Potency cells (differentiation) ===\n")
+de_results %>%
+  filter(avg_log2FC < 0, p_val_adj < 0.05) %>%
+  arrange(avg_log2FC) %>%
+  head(20)
+```
+
+
+## Integration with Pseudotime
+
+### CytoTRACE 2 Score vs Pseudotime Correlation
+
+如果已有 Monocle3 或其他拟时序分析结果，可以验证潜能分数与拟时序的一致性。
+
+```{r}
+#| label: pseudotime-correlation
+#| eval: false
+
+# 假设 pseudotime 已存储在 metadata 中（来自 monocle3 等）
+# seurat_obj$pseudotime <- ...（从 monocle3 结果获取）
+
+# 如果 pseudotime 已在 metadata 中：
+if ("pseudotime" %in% colnames(seurat_obj@meta.data)) {
+  # 去除 pseudotime 为 NA/Inf 的细胞（未分配到轨迹的细胞）
+  valid_cells <- !is.na(seurat_obj$pseudotime) & is.finite(seurat_obj$pseudotime)
+
+  cor_test <- cor.test(
+    seurat_obj$CytoTRACE2_Score[valid_cells],
+    seurat_obj$pseudotime[valid_cells],
+    method = "spearman"
+  )
+
+  cat("Spearman correlation (Potency vs Pseudotime):\n")
+  cat("  rho =", round(cor_test$estimate, 3), "\n")
+  cat("  p =", format.pval(cor_test$p.value), "\n")
+  # 预期：负相关（高潜能 = 低 pseudotime = 分化起点）
+
+  ggplot(seurat_obj@meta.data[valid_cells, ],
+         aes(x = pseudotime, y = CytoTRACE2_Score, color = cell_type)) +
+    geom_point(size = 0.3, alpha = 0.5) +
+    geom_smooth(method = "loess", color = "black", se = TRUE) +
+    labs(x = "Pseudotime", y = "CytoTRACE 2 Potency Score",
+         title = paste0("Potency vs Pseudotime (ρ = ",
+                        round(cor_test$estimate, 3), ")")) +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+}
+```
+
+
+### Identify Root Cells for Trajectory Analysis
+
+```{r}
+#| label: root-cells
+#| eval: false
+
+# 使用 CytoTRACE 2 分数识别最高潜能细胞作为轨迹分析的起点
+# 可以传递给 Monocle3 的 order_cells()
+
+# 每个细胞类型中潜能最高的 top 1% 细胞
+top_potency_cells <- seurat_obj@meta.data %>%
+  group_by(cell_type) %>%
+  slice_max(order_by = CytoTRACE2_Score, prop = 0.01) %>%
+  ungroup()
+
+cat("Top 1% potency cells per cell type:\n")
+table(top_potency_cells$cell_type)
+
+# 全局最高潜能细胞（潜在 root cells）
+global_top <- seurat_obj@meta.data %>%
+  slice_max(order_by = CytoTRACE2_Score, n = 50)
+
+cat("\nGlobal top 50 potency cells:\n")
+table(global_top$cell_type)
+cat("Mean potency score:", mean(global_top$CytoTRACE2_Score), "\n")
+```
+
+
+## Integration with hdWGCNA Modules
+
+如果已完成 hdWGCNA 分析，可以将模块 eigengene 与潜能分数关联，识别哪些共表达模块驱动干性/分化。
+
+```{r}
+#| label: hdwgcna-integration
+#| eval: false
+
+# 假设 hdWGCNA 结果已在 seurat 对象中（运行过 hdWGCNA.qmd）
+# hMEs <- GetMEs(seurat_obj)
+
+# 如果 hMEs 作为独立变量存在，合并到 metadata
+# seurat_obj <- AddMetaData(seurat_obj, hMEs)
+
+# 模块列名通常为 "M1", "M2", ... 或 "hME_M1", "hME_M2", ...
+module_cols <- grep("^(h?ME_)?M\\d+$", colnames(seurat_obj@meta.data), value = TRUE)
+
+if (length(module_cols) > 0) {
+  # 计算每个模块与潜能分数的相关性
+  module_cor <- sapply(module_cols, function(mc) {
+    ct <- cor.test(seurat_obj@meta.data[[mc]], seurat_obj$CytoTRACE2_Score,
+                   method = "spearman")
+    c(rho = ct$estimate, p = ct$p.value)
+  })
+
+  module_cor_df <- as.data.frame(t(module_cor))
+  module_cor_df$module <- rownames(module_cor_df)
+  module_cor_df$p_adj <- p.adjust(module_cor_df$p, method = "BH")
+
+  module_cor_df %>% arrange(desc(abs(rho.rho)))
+
+  # 可视化：模块-潜能相关性
+  ggplot(module_cor_df, aes(x = reorder(module, rho.rho), y = rho.rho,
+                             fill = rho.rho > 0)) +
+    geom_col() +
+    scale_fill_manual(values = c("TRUE" = "#E74C3C", "FALSE" = "#3498DB"),
+                      labels = c("Differentiation", "Stemness"),
+                      name = "Association") +
+    coord_flip() +
+    labs(x = "hdWGCNA Module", y = "Spearman ρ with Potency Score",
+         title = "Module-Potency Correlation") +
+    theme_minimal()
+}
+```
+
+
+## Cancer Stemness Analysis (Optional)
+
+如果数据包含肿瘤细胞，CytoTRACE 2 可用于评估肿瘤干性。
+
+```{r}
+#| label: cancer-stemness
+#| eval: false
+
+# !! 替换为实际肿瘤细胞类型名 !!
+tumor_cells <- subset(seurat_obj, cell_type == "Tumor_cells")
+
+# 基本统计
+cat("Tumor cell potency distribution:\n")
+summary(tumor_cells$CytoTRACE2_Score)
+table(tumor_cells$CytoTRACE2_Potency)
+
+# 按条件比较肿瘤细胞干性
+ggplot(tumor_cells@meta.data,
+       aes(x = group, y = CytoTRACE2_Score, fill = group)) +
+  geom_violin(scale = "width") +
+  geom_boxplot(width = 0.1, fill = "white") +
+  labs(x = NULL, y = "Potency Score",
+       title = "Tumor Cell Stemness Across Conditions") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# 与已知 CSC 标志物的表达关联
+csc_markers <- c("CD44", "ALDH1A1", "PROM1", "SOX2", "NANOG", "POU5F1")
+# 小鼠基因名：Cd44, Aldh1a1, Prom1, Sox2, Nanog, Pou5f1
+csc_markers_available <- intersect(csc_markers, rownames(tumor_cells))
+
+if (length(csc_markers_available) > 0) {
+  cat("Available CSC markers:", paste(csc_markers_available, collapse = ", "), "\n")
+
+  for (marker in csc_markers_available) {
+    expr <- GetAssayData(tumor_cells, layer = "data")[marker, ]
+    ct <- cor.test(expr, tumor_cells$CytoTRACE2_Score, method = "spearman")
+    cat(marker, ": rho =", round(ct$estimate, 3),
+        ", p =", format.pval(ct$p.value), "\n")
+  }
+}
+```
+
+
+## Potency Heterogeneity Analysis
+
+分析同一细胞类型内的潜能异质性——高异质性可能反映活跃的分化过程或去分化事件。
+
+```{r}
+#| label: heterogeneity
+#| eval: false
+
+# 每个 cell_type × group 的潜能异质性指标
+heterogeneity <- seurat_obj@meta.data %>%
+  group_by(cell_type, group) %>%
+  summarise(
+    n_cells = n(),
+    mean_score = mean(CytoTRACE2_Score),
+    sd_score = sd(CytoTRACE2_Score),
+    cv_score = sd(CytoTRACE2_Score) / mean(CytoTRACE2_Score),  # 变异系数
+    iqr_score = IQR(CytoTRACE2_Score),
+    n_potency_levels = n_distinct(CytoTRACE2_Potency),  # 涵盖几个潜能等级
+    .groups = "drop"
+  ) %>%
+  filter(n_cells >= 20)
+
+# 按变异系数排序（高 CV = 高异质性）
+heterogeneity %>%
+  arrange(desc(cv_score)) %>%
+  print(n = 30)
+
+# 条件间异质性差异
+ggplot(heterogeneity, aes(x = cell_type, y = cv_score, fill = group)) +
+  geom_col(position = "dodge") +
+  labs(x = NULL, y = "Coefficient of Variation (Potency Score)",
+       title = "Potency Heterogeneity by Cell Type and Condition") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette = "Set2")
+```
+
+
+## Multi-Dataset Comparison
+
+CytoTRACE 2 的绝对分数使跨数据集比较成为可能。分别对每个数据集运行 CytoTRACE 2，然后直接比较分数。
+
+::: {.callout-tip}
+## 跨数据集比较的前提
+
+- 使用相同的 species 参数
+- 不要对输入数据做 log 转换
+- 不需要做批次校正——CytoTRACE 2 内在处理平台差异
+- 建议对每个数据集**单独**运行 CytoTRACE 2，而非合并后运行
+:::
+
+```{r}
+#| label: multi-dataset
+#| eval: false
+
+# 示例：对多个独立数据集分别运行后合并比较
+# dataset_1 <- qs2::qs_read("datasets/dataset1_cytotrace2.qs2")
+# dataset_2 <- qs2::qs_read("datasets/dataset2_cytotrace2.qs2")
+
+# 合并比较时仅需 metadata
+# combined_meta <- bind_rows(
+#   dataset_1@meta.data %>% mutate(dataset = "Dataset_1"),
+#   dataset_2@meta.data %>% mutate(dataset = "Dataset_2")
+# )
+#
+# ggplot(combined_meta,
+#        aes(x = cell_type, y = CytoTRACE2_Score, fill = dataset)) +
+#   geom_violin(scale = "width", position = position_dodge(0.8)) +
+#   labs(title = "Cross-Dataset Potency Comparison") +
+#   theme_minimal() +
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+## Export Results
+
+```{r}
+#| label: export-results
+#| eval: false
+
+dir.create("Results", showWarnings = FALSE)
+
+# 导出所有细胞的 CytoTRACE 2 结果
+ct2_results <- seurat_obj@meta.data %>%
+  select(cell_type, group, orig.ident,
+         CytoTRACE2_Score, CytoTRACE2_Potency,
+         CytoTRACE2_Relative,
+         preKNN_CytoTRACE2_Score, preKNN_CytoTRACE2_Potency)
+
+write.csv(ct2_results, "Results/cytotrace2_all_cells.csv")
+
+# 导出按细胞类型汇总的结果
+ct2_summary <- seurat_obj@meta.data %>%
+  group_by(cell_type, group) %>%
+  summarise(
+    n_cells = n(),
+    mean_score = round(mean(CytoTRACE2_Score), 4),
+    median_score = round(median(CytoTRACE2_Score), 4),
+    sd_score = round(sd(CytoTRACE2_Score), 4),
+    pct_differentiated = round(mean(CytoTRACE2_Potency == "Differentiated") * 100, 1),
+    pct_unipotent = round(mean(CytoTRACE2_Potency == "Unipotent") * 100, 1),
+    pct_oligopotent = round(mean(CytoTRACE2_Potency == "Oligopotent") * 100, 1),
+    pct_multipotent = round(mean(CytoTRACE2_Potency == "Multipotent") * 100, 1),
+    pct_pluripotent = round(mean(CytoTRACE2_Potency == "Pluripotent") * 100, 1),
+    pct_totipotent = round(mean(CytoTRACE2_Potency == "Totipotent") * 100, 1),
+    .groups = "drop"
+  )
+
+write.csv(ct2_summary, "Results/cytotrace2_summary_by_celltype_group.csv",
+          row.names = FALSE)
+
+cat("Results exported to Results/ directory.\n")
+```
+
+
+## Best Practices & Troubleshooting
+
+::: {.callout-tip}
+## Best Practices
+
+1. **输入数据**：使用 raw counts（首选）或 CPM/TPM。绝不使用 log-normalized 数据
+2. **不需要批次校正**：CytoTRACE 2 通过训练集多样性和双重表示内在抑制批次效应
+3. **多数据集**：分别对每个数据集运行，然后比较绝对分数
+4. **物种参数**：务必正确设置 `species`，基因名必须与物种匹配
+5. **大数据集**：使用 `batch_size = 10000` 和 `smooth_batch_size = 1000`
+6. **统计检验**：注意伪重复问题，优先在样本水平汇总后检验
+7. **效应量**：关注 Cohen's d 或中位数差异，而非仅看 p 值
+8. **平滑后结果**：默认使用 `CytoTRACE2_Score`（平滑后），`preKNN_` 版本用于诊断
+9. **可重复性**：设置 `seed` 参数；大数据集使用 `batch_size = 100000, smooth_batch_size = 10000`
+:::
+
+::: {.callout-warning}
+## 已知局限性
+
+- **低 RNA 含量细胞**：基因表达数极低的细胞预测可能不准确
+- **训练数据偏差**：模型在人类/小鼠正常组织上训练，对病理状态（如肿瘤）的预测需谨慎解释
+- **扩散平滑**：可能平滑掉稀有细胞状态的特征（但设计上已尽量保留）
+- **非人/鼠物种**：需要通过同源基因映射，准确性取决于物种间基因保守性
+- **去分化 vs 原始状态**：CytoTRACE 2 预测的是"潜能"，不区分正常干性和病理性去分化——需结合其他信息（如 CNV、突变）判断
+:::
+
+::: {.callout-note}
+## 常见问题
+
+**Q: CytoTRACE 2 和 CytoTRACE 1 应该选哪个？**
+A: 几乎所有场景都推荐 CytoTRACE 2。唯一例外是非人/鼠物种且缺乏可靠的同源基因映射时。
+
+**Q: 能否对 integrated/SCTransform 的数据运行？**
+A: 不可以。必须使用 RNA assay 的 raw counts 或 CPM/TPM normalized data。
+
+**Q: 运行内存不够怎么办？**
+A: 减小 `batch_size`（如 5000）、`smooth_batch_size`（如 500）、`ncores`（如 1-2）。
+
+**Q: 不同条件的数据应该合并运行还是分开运行？**
+A: 官方建议分开运行。但如果目的是在同一 UMAP 上展示（利用已有的 integration embedding），合并运行也可以——CytoTRACE 2 不使用降维结果，只使用表达矩阵。
+
+**Q: 潜能分数可以跨数据集直接比较吗？**
+A: 可以，这是 CytoTRACE 2 相对于 v1 的核心优势。绝对分数经过训练集统计量标准化，不依赖数据集特异值。
+:::
+
+
+## Session Info
+
+```{r}
+#| label: session-info
+
+sessionInfo()
+```

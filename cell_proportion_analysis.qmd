@@ -1,0 +1,898 @@
+---
+title: "Cell Composition Analysis"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+---
+
+
+## Introduction
+
+在单细胞分析中，完成细胞注释后，分析不同组别（如 disease vs. normal、treatment vs. control）之间的细胞组成差异是揭示疾病机制或药物响应的关键一步。这一过程通常称为 **差异丰度分析（Differential Abundance Analysis）** 或 **细胞组成分析（Compositional Analysis）**。
+
+细胞比例是 **成分数据（Compositional Data）**——同一样本内各亚群比例之和恒为 1。这种约束决定了：某个亚群比例上升，必然伴随其他亚群比例相对下降，因此需要特殊的统计处理。
+
+::: {.callout-warning}
+## 关于伪重复（Pseudoreplication）
+
+**不要**将单个细胞视为独立的生物学重复。用卡方检验或 Fisher 精确检验直接比较两组中所有细胞的数量是错误的——它忽略了同一样本内细胞的非独立性，会严重夸大样本量，导致几乎所有比较"显著"。
+
+统计检验的单位必须是 **生物学样本（sample）**。每组至少 3–5 个生物学重复（推荐 5–10+），否则检验效力不足。
+:::
+
+本文件采用三种正确处理样本层级的方法：
+
+- **Method 1 · Wilcoxon on per-sample proportions** — 简单直观、易于解释，样本较多时首选
+- **Method 2 · scCODA（pertpy）** — 贝叶斯成分数据模型，显式处理 sum-to-one 约束，推荐用于严格统计推断
+- **Method 3 · miloR** — 基于 KNN 邻域（neighborhood）的差异丰度分析，不依赖离散的 cluster 标签，可在连续的细胞状态空间中定位变化区域
+
+
+## Setup
+
+```{r}
+#| label: load-packages
+#| include: false
+
+library(Seurat)
+library(tidyverse)
+library(rstatix)
+library(statsExpressions)
+library(patchwork)
+library(anndataR)
+library(qs2)
+library(reticulate)
+
+options(future.globals.maxSize = 40 * 1024^3)
+set.seed(42)
+```
+
+
+## Load Data
+
+```{r}
+#| label: load-data
+#| eval: false
+
+seurat_obj <- qs2::qs_read("datasets/harmonized_seurat.qs2")
+
+# 按需筛选分组（保持 baseline vs comparison 方向：Control 为参照，IPF 为比较组）
+seurat_obj <- subset(seurat_obj, subset = disease %in% c("Control", "IPF"))
+
+# 统一 condition 列，便于下游 formula 书写
+seurat_obj$condition <- seurat_obj$group
+
+# Seurat v5：counts 分散在多个 layer 中，scCODA 转换前需先合并
+if (inherits(seurat_obj[["RNA"]], "Assay5")) {
+  seurat_obj <- JoinLayers(seurat_obj, assay = "RNA")
+}
+
+seurat_obj
+table(seurat_obj$cell_type)
+table(seurat_obj$sample)
+table(seurat_obj$group)
+```
+
+
+## Method 1: Wilcoxon on Per-Sample Proportions
+
+### Compute Per-Sample Proportions
+
+分析单元是 **样本**，不是细胞。先算每个样本内各亚群的占比。
+
+```{r}
+#| label: compute-proportions
+#| eval: false
+
+cell_proportions <- seurat_obj@meta.data %>%
+  dplyr::count(sample, group, cell_type, name = "n_cells") %>%
+  group_by(sample) %>%
+  mutate(total = sum(n_cells),
+         proportion = n_cells / total) %>%
+  ungroup() %>%
+  dplyr::filter(n_cells > 1)
+
+head(cell_proportions)
+```
+
+
+### Wilcoxon Test (Two Groups)
+
+```{r}
+#| label: wilcox-test
+#| eval: false
+
+stat_results <- cell_proportions %>%
+  group_by(cell_type, group) %>%
+  filter(n() >= 2) %>%                 # 每组至少 2 个样本
+  ungroup() %>%
+  group_by(cell_type) %>%
+  filter(n_distinct(group) == 2) %>%   # 确保两组都有数据
+  wilcox_test(proportion ~ group) %>%
+  adjust_pvalue(method = "BH") %>%
+  add_significance()
+
+print(stat_results, n = Inf)
+```
+
+
+### Wilcoxon Test with `statsExpressions`
+
+`statsExpressions::two_sample_test()` 相比 `rstatix` 的优点：
+
+- 同时返回 **effect size**（非参检验为 rank-biserial correlation *r*）及其置信区间
+- 自动生成可直接嵌入 ggplot 的 **expression 字符串**（带统计量、p 值、n、效应量的 LaTeX 样式表达）
+- 一行切换 `type = "parametric" / "nonparametric" / "robust" / "bayes"`
+
+```{r}
+#| label: wilcox-statsexpressions
+#| eval: false
+
+stat_results_se <- cell_proportions %>%
+  group_by(cell_type) %>%
+  filter(n_distinct(group) == 2, n() >= 4) %>%
+  group_modify(~ two_sample_test(
+    data = .x,
+    x    = group,
+    y    = proportion,
+    type = "nonparametric"          # Wilcoxon rank-sum
+  )) %>%
+  ungroup() %>%
+  mutate(p.adj = p.adjust(p.value, method = "BH"))
+
+stat_results_se %>%
+  select(cell_type, statistic, p.value, p.adj,
+         effectsize, estimate, conf.low, conf.high, method) %>%
+  arrange(p.adj) %>%
+  print(n = Inf)
+```
+
+
+### Visualization
+
+#### Stacked Bar: Per-Sample Composition
+
+```{r}
+#| label: plot-stacked-bar
+#| eval: false
+
+ggplot(cell_proportions, aes(x = sample, y = proportion, fill = cell_type)) +
+  geom_bar(stat = "identity", position = "stack") +
+  facet_wrap(~ group, scales = "free_x") +
+  labs(x = "Sample", y = "Proportion of Cells", fill = "Cell Type") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+#### Boxplot Faceted by Cell Type
+
+```{r}
+#| label: plot-boxplot-facet
+#| eval: false
+
+human_colors_list <- c("forestgreen", "darkorange2", "darkorchid3",
+                       "dodgerblue", "orchid", "orange", "gold", "gray")
+
+ggplot(cell_proportions, aes(x = group, y = proportion)) +
+  geom_boxplot(aes(fill = group), width = 0.6, show.legend = FALSE) +
+  geom_jitter(aes(color = group), width = 0.15, size = 2, alpha = 0.7) +
+  facet_wrap(~ cell_type, scales = "free_y", ncol = 4) +
+  scale_fill_manual(values = human_colors_list) +
+  scale_color_manual(values = human_colors_list) +
+  labs(y = "Cell Proportion", x = "") +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.background = element_blank(),
+    panel.spacing = unit(1, "lines")
+  )
+```
+
+
+#### Single Cell Type Focus
+
+```{r}
+#| label: plot-single-celltype
+#| eval: false
+
+cell_type_to_compare <- "AT1/2"         # 替换为感兴趣的亚群
+
+# 从 stat_results 中取对应的 BH 校正 p 值
+p_lab <- stat_results %>%
+  filter(cell_type == cell_type_to_compare) %>%
+  pull(p.adj) %>% signif(3)
+
+sub_df <- cell_proportions %>%
+  filter(cell_type == cell_type_to_compare)
+
+ggplot(sub_df, aes(x = group, y = proportion, fill = group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.1, size = 2) +
+  annotate("text",
+           x = 1.5,
+           y = max(sub_df$proportion) * 1.08,
+           label = paste0("p.adj = ", p_lab)) +
+  labs(title = paste("Proportion of", cell_type_to_compare),
+       x = "Group", y = "Proportion") +
+  theme_classic()
+```
+
+
+#### Single Cell Type with `statsExpressions` Subtitle
+
+利用 `two_sample_test()` 返回的 `expression` 直接作为 ggplot 副标题，统计量、p 值、效应量一次性呈现。
+
+```{r}
+#| label: plot-single-celltype-se
+#| eval: false
+
+cell_type_to_compare <- "AT1/2"
+
+sub_df <- cell_proportions %>%
+  filter(cell_type == cell_type_to_compare)
+
+stats_expr <- two_sample_test(
+  data = sub_df,
+  x    = group,
+  y    = proportion,
+  type = "nonparametric"
+)
+
+ggplot(sub_df, aes(x = group, y = proportion, fill = group)) +
+  geom_boxplot(outlier.shape = NA, width = 0.5) +
+  geom_jitter(width = 0.1, size = 2, alpha = 0.8) +
+  labs(title    = paste("Proportion of", cell_type_to_compare),
+       subtitle = stats_expr$expression[[1]],
+       x = "Group", y = "Proportion") +
+  theme_classic(base_size = 12)
+```
+
+
+## Method 2: scCODA (Bayesian Compositional Analysis)
+
+scCODA（Büttner *et al.*, 2021）用 Dirichlet-Multinomial 建模显式处理成分数据的 sum-to-one 约束，通过 MCMC（NUTS）估计每个细胞类型的 log-fold-change，并用 spike-and-slab 先验给出"credible effects"，本质上等价于 Bayesian 版本的 FDR 控制。
+
+本节通过 `pertpy` 调用 scCODA（原始 scCODA Python 包已整合进 pertpy）。
+
+### Convert Seurat → AnnData
+
+使用 `anndataR` 转换（比 SeuratDisk 更稳定、不依赖磁盘中间文件）。
+
+```{r}
+#| label: seurat-to-anndata
+#| eval: false
+
+adata <- as_AnnData(
+  seurat_obj,
+  assay_name   = "RNA",
+  x_mapping    = "counts",                               # scCODA 需要 raw counts
+  obs_mapping  = c(sample    = "sample",
+                   group     = "group",
+                   cell_type = "cell_type"),
+  var_mapping  = FALSE,
+  obsm_mapping = FALSE,
+  obsp_mapping = FALSE
+)
+
+adata$write_h5ad("datasets/seurat_for_sccoda.h5ad")
+```
+
+
+### Load in Python
+
+```{python}
+#| label: py-load
+#| eval: false
+
+import scanpy as sc
+import pertpy as pt
+import matplotlib.pyplot as plt
+
+print(f"pertpy version: {pt.__version__}")
+
+adata = sc.read_h5ad("datasets/seurat_for_sccoda.h5ad")
+adata
+```
+
+
+### Build scCODA Data
+
+`type="cell_level"` + `generate_sample_level=True` 会自动按 `sample_identifier` 聚合细胞计数矩阵。
+
+```{python}
+#| label: sccoda-load
+#| eval: false
+
+sccoda_model = pt.tl.Sccoda()
+
+sccoda_data = sccoda_model.load(
+    adata,
+    type="cell_level",
+    generate_sample_level=True,
+    cell_type_identifier="cell_type",
+    sample_identifier="sample",
+    covariate_obs=["group"],
+)
+sccoda_data
+```
+
+
+### Optional: Subset to Two Conditions
+
+只比较两组时可取子集（Control 为参照，IPF 为比较组，保持变量命名与后续 formula 的比较方向一致）。
+
+```{python}
+#| label: sccoda-subset
+#| eval: false
+
+sccoda_data.mod["coda_ipf_vs_ctrl"] = sccoda_data["coda"][
+    sccoda_data["coda"].obs["group"].isin(["Control", "IPF"])
+].copy()
+print(sccoda_data["coda_ipf_vs_ctrl"])
+```
+
+
+### Exploratory Boxplots
+
+```{python}
+#| label: sccoda-boxplot
+#| eval: false
+
+sccoda_model.plot_boxplots(
+    sccoda_data,
+    modality_key="coda",
+    feature_name="group",
+    add_dots=True,
+)
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+```
+
+
+### Prepare Model
+
+::: {.callout-note}
+`reference_cell_type` 用于指定一个在各分组间"稳定不变"的细胞类型作为参考——成分分析必须相对于某个参考进行。`"automatic"` 会自动挑选变化最小的类型；若有明确的生物学知识，也可手动指定（例如某个已知不受扰动的 housekeeping 细胞群）。
+:::
+
+```{python}
+#| label: sccoda-prepare
+#| eval: false
+
+sccoda_data = sccoda_model.prepare(
+    sccoda_data,
+    modality_key="coda",
+    formula="group",
+    reference_cell_type="automatic",
+    # reference_cell_type="VE_Venous",   # 手动指定参考细胞类型
+)
+```
+
+
+### Run MCMC (NUTS Sampler)
+
+```{python}
+#| label: sccoda-nuts
+#| eval: false
+
+sccoda_model.run_nuts(sccoda_data, modality_key="coda")
+sccoda_data["coda"]
+```
+
+
+### Results: Summary & Credible Effects
+
+默认 FDR 阈值 0.05（对应 MCMC inclusion probability ≥ 0.95）。样本少或效应弱时可放宽。
+
+```{python}
+#| label: sccoda-summary
+#| eval: false
+
+# 可选：放宽 FDR
+# sccoda_model.set_fdr(sccoda_data, modality_key="coda", est_fdr=0.2)
+
+sccoda_model.summary(sccoda_data, modality_key="coda")
+sccoda_model.credible_effects(sccoda_data, modality_key="coda")
+```
+
+
+### Plot Effects
+
+条形图展示每个细胞类型的 `Final Parameter`（log-fold-change），只有 credible effects 会显示非零值。
+
+```{python}
+#| label: sccoda-effects-plot
+#| eval: false
+
+sccoda_model.plot_effects_barplot(
+    sccoda_data, modality_key="coda", parameter="Final Parameter"
+)
+plt.tight_layout()
+plt.show()
+```
+
+
+### Extract Effect / Intercept Tables
+
+```{python}
+#| label: sccoda-effect-df
+#| eval: false
+
+effect_df    = sccoda_model.get_effect_df(sccoda_data,    modality_key="coda")
+intercept_df = sccoda_model.get_intercept_df(sccoda_data, modality_key="coda")
+
+# 这个版本的 pertpy 不自带 "Is credible" 列：scCODA 会把不可信的细胞类型的
+# Final Parameter 强制置 0，以此作为 credibility 的指示
+effect_df = effect_df.copy()
+effect_df["Is credible"] = effect_df["Final Parameter"] != 0
+
+effect_df
+```
+
+
+### Save Results
+
+```{python}
+#| label: sccoda-save
+#| eval: false
+
+# 1. 完整 MuData（含 MCMC traces，可完全复现 effect_df / intercept_df）
+sccoda_data.write("datasets/sccoda_data.h5mu")
+
+# 2. 下游易用的表（给合作者、论文补充材料、跨语言读取用）
+effect_df.to_csv("datasets/sccoda_effect_df.csv")
+intercept_df.to_csv("datasets/sccoda_intercept_df.csv")
+
+# import mudata
+# sccoda_data = mudata.read("datasets/sccoda_data.h5mu")
+```
+
+
+## Method 3: miloR (Neighborhood-Based DA)
+
+miloR（Dann *et al.*, Nat Biotechnol 2022）不依赖离散的 cluster 标签，而是在 KNN 图上采样一组代表性 **邻域（neighborhood）**，对每个邻域用 **negative binomial GLM** 建模细胞计数，实现"连续细胞状态空间"上的差异丰度检验。适合捕捉亚群内部的亚状态变化（例如连续的分化轨迹上的丰度偏移）。
+
+::: {.callout-note}
+miloR 也在 sample 层级建模（`design.df` 指定每个样本的分组），但其分析单元是 **邻域**，而不是预定义的细胞类型。最终可通过 `annotateNhoods()` 把显著邻域映射回细胞类型标签。
+:::
+
+### Setup
+
+```{r}
+#| label: milo-packages
+#| eval: false
+
+library(miloR)
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+```
+
+
+### Build Milo Object
+
+```{r}
+#| label: milo-build
+#| eval: false
+
+sce <- as.SingleCellExperiment(seurat_obj)
+milo_obj <- Milo(sce)
+```
+
+
+### Build KNN Graph & Define Neighborhoods
+
+如果数据做过 batch 校正（Harmony / scVI / fastMNN 等），**应在校正后的降维空间里建 KNN 图**，否则 batch 效应会混入邻域结构。miloR 支持任意 `reducedDim`，但三个函数的参数名风格不一致，务必注意：
+
+- `buildGraph()`、`calcNhoodDistance()` 用 `reduced.dim`（点号单数）
+- `makeNhoods()` 用 `reduced_dims`（下划线**复数**）
+
+传错参数名不会报错，会默默 fallback 到 `"PCA"`——所以记得用 `reducedDimNames()` 先确认降维名字，然后严格按上面的拼写写。
+
+```{r}
+#| label: milo-graph
+#| eval: false
+
+# 先确认 reducedDim 的名字（大小写敏感）
+reducedDimNames(milo_obj)
+# e.g. c("PCA", "UMAP", "HARMONY")
+
+# 选择建图用的降维：默认 "PCA"，有 Harmony 则推荐 "HARMONY"
+rd_use <- if ("HARMONY" %in% reducedDimNames(milo_obj)) "HARMONY" else "PCA"
+
+# k = KNN 邻居数；d = 使用的维度数
+milo_obj <- buildGraph(milo_obj, k = 30, d = 30, reduced.dim = rd_use)
+
+# prop 控制采样为邻域中心的细胞比例；大数据集可降至 0.05
+milo_obj <- makeNhoods(milo_obj, prop = 0.1, k = 30, d = 30,
+                       refined = TRUE, reduced_dims = rd_use)
+
+# 检查邻域大小分布（理想均值 ≥ 5 × N_samples）
+plotNhoodSizeHist(milo_obj)
+```
+
+
+### Count Cells in Neighborhoods
+
+```{r}
+#| label: milo-count
+#| eval: false
+
+sample_col <- "sample"    # 修改为实际 sample 列名
+
+stopifnot(sample_col %in% colnames(colData(milo_obj)))
+
+milo_obj <- countCells(milo_obj,
+                       meta.data = data.frame(colData(milo_obj)),
+                       samples   = sample_col)
+```
+
+
+### Build Design Matrix
+
+```{r}
+#| label: milo-design
+#| eval: false
+
+traj_design <- data.frame(colData(milo_obj))[, c("sample", "condition")]
+traj_design <- distinct(traj_design)
+rownames(traj_design) <- traj_design$sample
+
+# 顺序必须与 nhoodCounts(milo_obj) 的列顺序一致
+traj_design <- traj_design[colnames(nhoodCounts(milo_obj)), , drop = FALSE]
+traj_design
+```
+
+
+### DA Testing
+
+```{r}
+#| label: milo-test
+#| eval: false
+
+# 计算邻域间距离（用于 Spatial FDR 校正）
+# 注意：reduced.dim 必须与前面 buildGraph/makeNhoods 保持一致
+milo_obj <- calcNhoodDistance(milo_obj, d = 30, reduced.dim = rd_use)
+
+# GLM 检验：logFC 为 condition 的效应（Control 为参照，IPF 为比较组）
+# 注意：miloR 默认取 design 公式 **末项** 作为 contrast 变量。
+# 若加协变量（如 batch），condition 必须放在最后：~ batch + condition
+da_results <- testNhoods(milo_obj,
+                         design    = ~ condition,
+                         design.df = traj_design)
+
+da_results %>% arrange(SpatialFDR) %>% head()
+```
+
+
+### Diagnostic: Identify Floor-Effect Neighborhoods
+
+`checkSeparation()` 用于识别"在一组样本里 counts 全为 0"的 nhoods——这类 nhood 在 NB-GLM 下会得到边界的 logFC 估计（常见 ±7 附近），看似极端显著，其实是模型对 zero-count 的规则化结果。**在小样本量（n ≤ 3/组）时尤其常见**，建议单独标注这些 nhood，避免下游解读时把"地板效应"误读为"强生物学效应"。
+
+```{r}
+#| label: milo-check-separation
+#| eval: false
+
+sep_flag <- miloR::checkSeparation(milo_obj,
+                                   design.df     = traj_design,
+                                   condition_col = "condition")
+
+# 合并到 da_results 里
+da_results$has_separation <- sep_flag
+
+cat("Neighborhoods with complete separation:\n")
+print(table(sep_flag))
+cat("\nLogFC distribution of separated vs non-separated nhoods:\n")
+print(tapply(da_results$logFC, da_results$has_separation, summary))
+```
+
+
+### Visualization
+
+#### Neighborhood Graph on UMAP
+
+```{r}
+#| label: milo-nhood-graph
+#| eval: false
+
+milo_obj <- buildNhoodGraph(milo_obj)
+
+plotUMAP(milo_obj) +
+  plotNhoodGraphDA(milo_obj, da_results, alpha = 0.05) +
+  plot_layout(guides = "collect")
+```
+
+
+#### Volcano & logFC Distribution
+
+```{r}
+#| label: milo-volcano
+#| eval: false
+
+p_vol <- ggplot(da_results, aes(x = logFC, y = -log10(SpatialFDR))) +
+  geom_point(aes(color = SpatialFDR < 0.1), alpha = 0.6) +
+  scale_color_manual(values = c(`FALSE` = "grey70", `TRUE` = "#d7301f"),
+                     na.value = "grey90") +
+  geom_hline(yintercept = -log10(0.1), linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(x = "Log2 Fold Change (IPF vs Control)",
+       y = "-log10(Spatial FDR)",
+       title = "Milo DA volcano") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+p_hist <- ggplot(da_results, aes(x = logFC)) +
+  geom_histogram(bins = 50, alpha = 0.7, fill = "steelblue") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(x = "Log2 Fold Change (IPF vs Control)", y = "Count",
+       title = "Distribution of logFC") +
+  theme_minimal()
+
+# MA plot：mean abundance (logCPM) vs logFC
+# 检查是否存在 mean-abundance bias：低丰度 nhood 的 logFC 是否不稳定
+# testNhoods() 输出里自带 logCPM 列，直接画即可
+p_ma <- ggplot(da_results, aes(x = logCPM, y = logFC)) +
+  geom_point(aes(color = SpatialFDR < 0.1), alpha = 0.6, size = 0.8) +
+  scale_color_manual(values = c(`FALSE` = "grey70", `TRUE` = "#d7301f"),
+                     na.value = "grey90") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(x = "logCPM", y = "logFC", title = "Milo DA MA plot") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+p_vol + p_hist + p_ma + patchwork::plot_layout(ncol = 2)
+```
+
+
+### Annotate Neighborhoods with Cell Types
+
+把邻域映射回已有的细胞类型标签，便于解读哪个群体在驱动差异。
+
+```{r}
+#| label: milo-annotate
+#| eval: false
+
+cell_type_col <- "cell_type"
+
+da_results <- annotateNhoods(milo_obj, da_results, coldata_col = cell_type_col)
+
+# 按细胞类型汇总：每个细胞类型下 nhood 的数目、显著 nhood 的数目、平均 logFC
+da_summary <- da_results %>%
+  group_by(.data[[cell_type_col]]) %>%
+  summarise(
+    n_neighborhoods = n(),
+    n_sig_FDR_0.1   = sum(SpatialFDR < 0.1,  na.rm = TRUE),
+    n_sig_FDR_0.2   = sum(SpatialFDR < 0.2,  na.rm = TRUE),
+    n_sig_P_0.05    = sum(PValue < 0.05,     na.rm = TRUE),
+    median_logFC    = median(logFC,          na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(median_logFC)
+
+da_summary
+```
+
+
+### Top Neighborhoods Table
+
+展示 PValue 排名前 20 的 nhood。在样本量较小（n=3/组）时 SpatialFDR 往往不显著，改看 raw PValue 排序 + 覆盖的细胞类型可以看出信号集中在哪里。
+
+```{r}
+#| label: milo-top-nhoods
+#| eval: false
+
+da_results %>%
+  arrange(PValue) %>%
+  head(20) %>%
+  select(Nhood, cell_type, cell_type_fraction, logFC, PValue, SpatialFDR) %>%
+  mutate(across(c(logFC, PValue, SpatialFDR, cell_type_fraction), ~round(.x, 3))) %>%
+  knitr::kable(caption = "Top 20 neighborhoods by nominal PValue")
+```
+
+
+### Beeswarm of Focused Cell Types
+
+基于 scCODA 给出的 credible 细胞类型 + miloR summary 里 median logFC 较大的细胞类型，挑选几个关键群体画 beeswarm。每个点是一个 nhood，红色表示 raw PValue < 0.05。黑色竖线为中位数。**即使单个 nhood 不过 SpatialFDR 阈值，整体分布的偏向性依然是有力的方向证据。**
+
+```{r}
+#| label: milo-beeswarm-focused
+#| eval: false
+
+# 挑关注的细胞类型：scCODA credible + miloR effect 大的
+target_types <- c(
+  "Pro-fibrotic Macrophages",
+  "Recruited Macrophages",
+  "Neutrophils",
+  "Arterial cell",
+  "Alveolar Macrophages"
+)
+
+plot_df <- da_results %>%
+  filter(.data[[cell_type_col]] %in% target_types) %>%
+  mutate(!!cell_type_col := forcats::fct_reorder(.data[[cell_type_col]], logFC, median))
+
+ggplot(plot_df, aes(x = logFC, y = .data[[cell_type_col]])) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  ggbeeswarm::geom_quasirandom(
+    aes(color = PValue < 0.05),
+    size = 1, alpha = 0.6, groupOnX = FALSE
+  ) +
+  scale_color_manual(
+    values = c(`TRUE` = "#d7301f", `FALSE` = "grey70"),
+    name   = "PValue < 0.05"
+  ) +
+  stat_summary(fun = median, geom = "point",
+               shape = 124, size = 8, color = "black") +
+  labs(x = "logFC (Drug vs Model)", y = NULL,
+       title    = "miloR neighborhood-level DA (per cell type)",
+       subtitle = "Each point is a neighborhood; red = nominally significant (PValue < 0.05)") +
+  theme_bw(base_size = 12)
+```
+
+
+### Nhood Graph (Lenient Threshold for Small-Sample Settings)
+
+前面的 `milo-nhood-graph` 使用 `SpatialFDR < 0.05` 的严格阈值。在 n=3/组等小样本情境下该阈值通常过不了，可改用 **raw PValue** 做宽松展示，查看 DA 信号在流形上的空间分布趋势——结论应作为**探索性**，最终显著性仍以 scCODA 为准。
+
+```{r}
+#| label: milo-nhood-umap-lenient
+#| eval: false
+
+# 临时把 SpatialFDR 替换为 PValue，用 plotNhoodGraphDA 的 alpha 参数做宽松筛选
+da_for_plot <- da_results %>% mutate(SpatialFDR = PValue)
+
+p_umap  <- plotUMAP(milo_obj)
+p_nhood <- plotNhoodGraphDA(milo_obj, da_for_plot, alpha = 0.1) +
+  labs(subtitle = "Neighborhoods with nominal PValue < 0.1")
+
+p_umap + p_nhood + plot_layout(guides = "collect")
+```
+
+
+### Advanced: Neighborhood Groups & Marker Discovery
+
+这一节是 miloR 最有用、但最常被忽视的功能：**把相似的 nhood 合并为 group，再对 group 做 marker gene 分析**。回答的是"DA 显著的区域到底由哪些基因定义？"——比 `annotateNhoods` 给出的"xx cell type"标签信息量大得多。在小样本下还顺带缓解 FDR 多重检验的压力。
+
+#### Group Overlapping Neighborhoods
+
+```{r}
+#| label: milo-group-nhoods
+#| eval: false
+
+# 把方向一致、空间相邻、logFC 接近的 nhood 合并成 group
+# - da.fdr: 把哪些 nhood 作为候选（这里用宽松的 0.2）
+# - max.lfc.delta: 同一 group 内 logFC 波动上限
+# - overlap: 两个 nhood 之间共享细胞数的下限
+da_results <- miloR::groupNhoods(milo_obj, da_results,
+                                  da.fdr        = 0.2,
+                                  max.lfc.delta = 2,
+                                  overlap       = 5)
+
+# 看有多少 group
+table(da_results$NhoodGroup, useNA = "ifany")
+
+# 在 UMAP 上可视化 nhood groups
+miloR::plotNhoodGroups(milo_obj, da_results, layout = "UMAP")
+```
+
+#### Find Marker Genes per Nhood Group
+
+```{r}
+#| label: milo-group-markers
+#| eval: false
+
+# 限制在 HVG 上加速；aggregate.samples=TRUE 在 sample 层聚合，避免 pseudoreplication
+nhood_markers <- miloR::findNhoodGroupMarkers(
+  milo_obj,
+  da_results,
+  subset.row        = Seurat::VariableFeatures(seurat_obj),
+  aggregate.samples = TRUE,
+  sample_col        = "sample"
+)
+
+# 看每个 group 的 top marker（列名带 _N 是第 N 个 group）
+head(nhood_markers)
+
+qs2::qs_save(nhood_markers, "datasets/milo_nhood_group_markers.qs2")
+```
+
+#### Gene Expression Along the DA Gradient
+
+`plotNhoodExpressionDA()` 把 nhood 按 logFC 排序，热图展示感兴趣基因在"DA 梯度"上的变化——可以直接看到"越偏向 Drug ↓ 的 nhood，哪些基因越高表达"。
+
+```{r}
+#| label: milo-expr-da
+#| eval: false
+
+# 感兴趣的基因（示例）：纤维化 / 巨噬极化相关
+genes_of_interest <- c("Col1a1", "Spp1", "Trem2", "Cxcl2", "Mmp9", "Il1b")
+
+miloR::plotNhoodExpressionDA(
+  milo_obj, da_results,
+  features       = intersect(genes_of_interest, rownames(milo_obj)),
+  subset.nhoods  = da_results$SpatialFDR < 0.2,
+  assay          = "logcounts",
+  scale_to_1     = TRUE
+)
+```
+
+
+### Save Results
+
+```{r}
+#| label: milo-save
+#| eval: false
+
+qs2::qs_save(milo_obj,   "datasets/milo_obj.qs2")
+qs2::qs_save(da_results, "datasets/milo_da_results.qs2")
+```
+
+
+## Cross-Method Concordance
+
+同时使用三种方法做细胞组成分析时，**结论的可信度来自方法间的一致性**，而不是单一方法的 p 值。miloR 在 neighborhood 粒度、scCODA 在 cell-type 粒度，两个不同粒度、不同统计范式（frequentist NB-GLM vs Bayesian Dirichlet-Multinomial）的方法如果在同一批细胞类型上方向一致，说明信号稳健。
+
+下图比较 scCODA 的 `log2-fold change`（cell-type 级）与 miloR 的 **median logFC**（把每个细胞类型下所有 nhood 的 logFC 取中位数）。scCODA credible 的细胞类型用红色高亮——期待它们集中分布在对角象限（左下 / 右上），即两种方法给出的方向一致。
+
+```{r}
+#| label: concordance-scatter
+#| eval: false
+
+# miloR: 按 cell type 汇总 median logFC
+milo_by_celltype <- da_results %>%
+  group_by(cell_type) %>%
+  summarise(milo_median_logFC = median(logFC), .groups = "drop")
+
+# scCODA: 读回 effect_df（含 Is credible 列）
+sccoda_eff <- read.csv("datasets/sccoda_effect_df.csv") %>%
+  rename_with(~ gsub("\\.+", ".", .x))  # 统一列名里的 "." 重复
+
+# 兼容不同 pandas 导出版本的列名
+ct_col     <- grep("Cell.?Type",        colnames(sccoda_eff), value = TRUE)[1]
+lfc_col    <- grep("log2.?fold.?change", colnames(sccoda_eff), value = TRUE)[1]
+cred_col   <- grep("Is.?credible",      colnames(sccoda_eff), value = TRUE)[1]
+
+combined <- milo_by_celltype %>%
+  inner_join(
+    sccoda_eff %>% select(all_of(c(ct_col, lfc_col, cred_col))) %>%
+      rename(cell_type = all_of(ct_col),
+             sccoda_log2FC = all_of(lfc_col),
+             Is_credible   = all_of(cred_col)),
+    by = "cell_type"
+  )
+
+ggplot(combined, aes(milo_median_logFC, sccoda_log2FC)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  # 非 credible: 小灰点，不加标签
+  geom_point(
+    data = combined %>% filter(!Is_credible),
+    color = "grey70", size = 1.8, alpha = 0.6
+  ) +
+  # credible: 大红点 + 标签
+  geom_point(
+    data = combined %>% filter(Is_credible),
+    color = "#d7301f", size = 4
+  ) +
+  ggrepel::geom_text_repel(
+    data = combined %>% filter(Is_credible),
+    aes(label = cell_type),
+    size = 4, fontface = "bold",
+    box.padding = 0.6, point.padding = 0.3, max.overlaps = Inf
+  ) +
+  labs(
+    x        = "miloR median logFC (neighborhood-level)",
+    y        = "scCODA log2FC (cell-type-level)",
+    title    = "Concordance: miloR vs scCODA (Drug vs Model)",
+    subtitle = "scCODA-credible cell types (red) should sit in the diagonal quadrants"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+::: {.callout-note}
+scCODA 的模型会把非 credible 细胞类型的 `Final Parameter` 强制设为 0，因此这些点的 log2FC 都贴在 y=0 附近。这不是数据问题，是模型可识别性约束的结果——关注红色 credible 点在 x-y 平面上的位置即可。
+:::
+

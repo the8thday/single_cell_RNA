@@ -1,0 +1,872 @@
+---
+title: "scRNA-seq NMF — 非负矩阵分解基因程序挖掘"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+---
+
+
+## Introduction
+
+非负矩阵分解（Non-negative Matrix Factorization, NMF）将基因表达矩阵分解为两个非负矩阵：
+
+$$X_{g \times c} \approx W_{g \times k} \cdot H_{k \times c}$$
+
+- **W（基因因子矩阵）**：每列代表一个"基因程序"（gene program / metagene），数值为各基因对该程序的贡献权重
+- **H（细胞激活矩阵）**：每行代表一个基因程序在每个细胞中的激活强度（usage/score）
+- **k**：因子数（rank），是需要预先指定的超参数
+
+**NMF 相比 PCA 的核心优势：**
+
+| 特性 | NMF | PCA |
+|------|-----|-----|
+| 因子含义 | 部分加和（可解释为基因程序） | 正交线性组合（含负值，难解释） |
+| 稀疏性 | 自然产生稀疏因子 | 无内置稀疏约束 |
+| 适合数据 | 计数/非负数据 | 连续正态分布 |
+| 细胞混合建模 | 一个细胞可同时激活多个程序 | 主成分相互排斥 |
+
+**典型应用场景：**
+
+- **癌症异质性**：识别肿瘤细胞内不同的转录状态程序（增殖、上皮间质转化、代谢等）
+- **免疫细胞亚态**：刻画 T 细胞耗竭程序、激活程序等连续状态
+- **发育轨迹**：沿分化轨迹分解细胞命运相关基因程序
+- **跨样本比较**：比较不同条件/患者下各基因程序的使用差异
+
+**与 hdWGCNA 的互补关系：** hdWGCNA 捕捉基因间的**共表达相关性**（模块），NMF 捕捉细胞间可共享的**潜在表达程序**。NMF 更适合刻画同一细胞类型内的连续异质性。
+
+本流程使用 `RcppML`（DeBruine et al. 2021），基于 Rcpp 实现，是目前 R 生态中最快的 NMF 实现，支持稀疏矩阵输入和交叉验证自动选 rank。
+
+
+## Setup
+
+```{r}
+#| label: load-packages
+#| include: false
+
+library(RcppML)          # 核心 NMF 引擎（install: install.packages("RcppML")）
+library(Seurat)
+library(tidyverse)
+library(qs2)
+library(Matrix)
+library(ComplexHeatmap)
+library(circlize)
+library(patchwork)
+library(viridis)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ReactomePA)      # Reactome 富集分析
+library(msigdbr)
+library(ggrepel)
+library(RColorBrewer)
+
+options(future.globals.maxSize = 40 * 1024^3)
+set.seed(42)
+```
+
+
+## Load Data
+
+```{r}
+#| label: load-data
+#| eval: false
+
+seurat_obj <- qs2::qs_read("datasets/harmonized_seurat.qs")
+
+dim(seurat_obj)
+table(seurat_obj$cell_type)
+table(seurat_obj$group)
+```
+
+
+## Part I: 数据准备
+
+NMF 要求输入矩阵为**非负数**。推荐使用 log-normalized 的 `data` layer，不能使用含负值的 scaled data。
+
+```{r}
+#| label: prepare-matrix
+#| eval: false
+
+# 提取 log-normalized 表达矩阵（genes × cells）
+mat <- GetAssayData(seurat_obj, assay = "RNA", layer = "data")
+
+# 只使用高变基因：减少噪声、加快计算
+hvg <- VariableFeatures(seurat_obj)
+if (length(hvg) == 0) {
+  seurat_obj <- FindVariableFeatures(seurat_obj, nfeatures = 3000)
+  hvg <- VariableFeatures(seurat_obj)
+}
+
+mat_hvg <- mat[hvg, ]
+
+cat("全基因矩阵维度:", dim(mat), "\n")
+cat("HVG 矩阵维度:", dim(mat_hvg), "\n")
+cat("矩阵稀疏度:", round(nnzero(mat_hvg) / prod(dim(mat_hvg)) * 100, 2), "%\n")
+```
+
+::: {.callout-note}
+## 输入矩阵的选择
+
+- **推荐：log-normalized counts**（`NormalizeData()` 后的 `data` layer）
+- **不推荐：scaled data**（含负值，破坏 NMF 非负约束）
+- **不推荐：原始 counts**（文库大小差异大会主导分解结果）
+- 若数据量 > 10 万细胞，可先随机采样 1~2 万细胞进行 rank 选择，确定最优 k 后再用全量数据运行最终模型
+:::
+
+
+## Part II: Rank 选择（最优因子数 k）
+
+rank 选择是 NMF 中**最关键的步骤**。k 太小会遗漏生物学细节，k 太大会产生冗余或伪影因子。
+
+### 方法 1：交叉验证（推荐）
+
+`RcppML::cv()` 将细胞随机分折，在训练集拟合、测试集计算均方误差（MSE）。MSE 下降趋势趋于平稳的 k 即为推荐选择。
+
+```{r}
+#| label: cv-rank-selection
+#| eval: false
+
+# 采样子集用于交叉验证（1~2 万细胞足够）
+n_cells_cv <- min(ncol(mat_hvg), 15000)
+set.seed(42)
+cells_cv  <- sample(colnames(mat_hvg), n_cells_cv)
+mat_cv    <- mat_hvg[, cells_cv]
+
+# 5 折交叉验证，每个 k 重复 3 次
+cv_results <- cv(
+  mat_cv,
+  k     = 2:20,
+  reps  = 3,
+  tol   = 1e-4,
+  maxit = 200,
+  verbose = TRUE
+)
+
+saveRDS(cv_results, "results/nmf_cv_results.rds")
+```
+
+```{r}
+#| label: plot-cv
+#| eval: false
+
+cv_results <- readRDS("results/nmf_cv_results.rds")
+
+cv_df <- data.frame(
+  k       = 2:20,
+  mean_mse = rowMeans(cv_results),
+  sd_mse   = apply(cv_results, 1, sd)
+)
+
+# 用肘部法则标注推荐 k（手动调整 xintercept）
+ggplot(cv_df, aes(x = k, y = mean_mse)) +
+  geom_line(linewidth = 1, color = "steelblue") +
+  geom_point(size = 2.5, color = "steelblue") +
+  geom_errorbar(aes(ymin = mean_mse - sd_mse,
+                    ymax = mean_mse + sd_mse),
+                width = 0.3, alpha = 0.5, color = "steelblue") +
+  geom_vline(xintercept = 10, linetype = "dashed",   # !! 根据曲线手动修改 !!
+             color = "red", alpha = 0.8) +
+  scale_x_continuous(breaks = 2:20) +
+  labs(
+    title = "NMF Cross-Validation: Rank Selection",
+    x     = "Number of Factors (k)",
+    y     = "Mean Squared Error (MSE)"
+  ) +
+  theme_bw(base_size = 13)
+```
+
+### 方法 2：Cophenetic 相关系数（稳定性指标）
+
+多次运行 NMF，Cophenetic 系数衡量聚类结果的一致性。系数开始下降前的最高点即为推荐 k。
+
+```{r}
+#| label: cophenetic-selection
+#| eval: false
+
+rank_range <- 2:15
+n_runs     <- 20
+
+cophenetic_results <- map_dbl(rank_range, function(k) {
+  cat("Testing k =", k, "\n")
+
+  h_matrices <- map(seq_len(n_runs), function(seed) {
+    model <- nmf(mat_hvg, k = k, seed = seed, tol = 1e-3, maxit = 200, verbose = FALSE)
+    model@h
+  })
+
+  n_cells   <- ncol(mat_hvg)
+  consensus <- matrix(0, n_cells, n_cells)
+
+  for (h in h_matrices) {
+    cell_assign <- apply(h, 2, which.max)
+    for (i in seq_len(n_cells)) {
+      same_cluster <- which(cell_assign == cell_assign[i])
+      consensus[i, same_cluster] <- consensus[i, same_cluster] + 1
+    }
+  }
+  consensus <- consensus / n_runs
+
+  dist_consensus <- as.dist(1 - consensus)
+  hc <- hclust(dist_consensus, method = "average")
+  cor(dist_consensus, cophenetic(hc))
+})
+
+plot(rank_range, cophenetic_results, type = "b", pch = 19,
+     xlab = "k", ylab = "Cophenetic Correlation",
+     main = "NMF Stability: Cophenetic Correlation")
+```
+
+### 设定最终 k 值
+
+```{r}
+#| label: set-k
+#| eval: false
+
+# !! 综合交叉验证和 Cophenetic 结果手动设定 !!
+# 经验：k 通常在细胞类型数 × 1.5 ~ 2 附近
+k_selected <- 10
+
+cat("选定因子数 k =", k_selected, "\n")
+```
+
+
+## Part III: 运行最终 NMF 模型
+
+选定 k 后，用多个随机种子运行，取重构误差（MSE）最低的模型作为最终结果。
+
+```{r}
+#| label: run-nmf
+#| eval: false
+
+n_seeds   <- 10
+best_mse  <- Inf
+best_model <- NULL
+
+for (seed in seq_len(n_seeds)) {
+  cat("Running NMF with seed =", seed, "\n")
+
+  model <- nmf(
+    mat_hvg,
+    k     = k_selected,
+    seed  = seed,
+    tol   = 1e-5,          # 收敛阈值（越小越精确，越慢）
+    maxit = 500,
+    L1    = c(0.01, 0.01), # L1 正则化，促进稀疏（[W正则, H正则]）
+    verbose = FALSE
+  )
+
+  mse_val <- mse(model, mat_hvg)
+  cat("  MSE =", round(mse_val, 4), "\n")
+
+  if (mse_val < best_mse) {
+    best_mse   <- mse_val
+    best_model <- model
+  }
+}
+
+cat("\n最优模型 MSE:", round(best_mse, 4), "\n")
+saveRDS(best_model, paste0("results/nmf_model_k", k_selected, ".rds"))
+```
+
+```{r}
+#| label: load-nmf-model
+#| eval: false
+
+k_selected <- 10  # 与上面保持一致
+nmf_model  <- readRDS(paste0("results/nmf_model_k", k_selected, ".rds"))
+
+# 提取 W（基因因子矩阵）和 H（细胞激活矩阵）
+W <- nmf_model@w  # genes × k
+H <- nmf_model@h  # k × cells
+
+rownames(W) <- rownames(mat_hvg)
+colnames(W) <- paste0("NMF_", seq_len(k_selected))
+rownames(H) <- paste0("NMF_", seq_len(k_selected))
+colnames(H) <- colnames(mat_hvg)
+
+cat("W 矩阵（基因 × 因子）:", dim(W), "\n")
+cat("H 矩阵（因子 × 细胞）:", dim(H), "\n")
+cat("重构 MSE:", round(mse(nmf_model, mat_hvg), 4), "\n")
+```
+
+
+## Part IV: 因子整合与基本统计
+
+```{r}
+#| label: integrate-seurat
+#| eval: false
+
+# 每个细胞的主导因子（激活值最高的因子）
+cell_factor_assign <- paste0("NMF_", apply(H, 2, which.max))
+seurat_obj$nmf_dominant_factor <- cell_factor_assign
+
+# 各因子主导的细胞数
+cat("各因子主导细胞数:\n")
+print(table(cell_factor_assign))
+
+# 细胞类型 × 因子对应关系
+cat("\n细胞类型 vs. 主导因子:\n")
+print(table(seurat_obj$cell_type, seurat_obj$nmf_dominant_factor))
+
+# 将 H 矩阵存入 Seurat
+nmf_embeddings <- t(H)  # cells × k
+seurat_obj[["nmf"]] <- CreateDimReducObject(
+  embeddings = nmf_embeddings,
+  loadings   = W,
+  key        = "NMF_",
+  assay      = "RNA"
+)
+
+# 同时写入 meta.data 便于 FeaturePlot 可视化
+factor_cols <- paste0("NMF_", seq_len(k_selected))
+nmf_df      <- as.data.frame(nmf_embeddings)
+colnames(nmf_df) <- factor_cols
+seurat_obj  <- AddMetaData(seurat_obj, metadata = nmf_df)
+
+qs2::qs_save(seurat_obj, "datasets/harmonized_seurat_nmf.qs")
+```
+
+
+## Part V: 可视化
+
+### UMAP 上的因子激活分布
+
+```{r}
+#| label: umap-factors
+#| eval: false
+#| fig-width: 16
+#| fig-height: 14
+
+plots <- map(factor_cols, function(fct) {
+  # 以 95th 百分位截断，避免极值干扰颜色
+  max_val <- quantile(seurat_obj@meta.data[[fct]], 0.95, na.rm = TRUE)
+
+  FeaturePlot(seurat_obj, features = fct,
+              reduction = "umap", order = TRUE) +
+    scale_color_viridis_c(option = "magma",
+                          limits = c(0, max_val),
+                          oob    = scales::squish) +
+    labs(title = fct) +
+    theme_void() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+          legend.position = "right")
+})
+
+wrap_plots(plots, ncol = 4) +
+  plot_annotation(
+    title = "NMF Factor Activation on UMAP",
+    theme = theme(plot.title = element_text(hjust = 0.5, size = 16))
+  )
+```
+
+### 主导因子 UMAP
+
+```{r}
+#| label: umap-dominant-factor
+#| eval: false
+#| fig-width: 8
+#| fig-height: 6
+
+DimPlot(seurat_obj, group.by = "nmf_dominant_factor",
+        reduction = "umap", label = TRUE, repel = TRUE,
+        label.size = 4) +
+  labs(title = "NMF Dominant Factor per Cell") +
+  theme_bw(base_size = 13)
+```
+
+### 细胞类型 × 因子激活热图
+
+```{r}
+#| label: heatmap-ct-factor
+#| eval: false
+#| fig-width: 10
+#| fig-height: 6
+
+# 各细胞类型的平均激活值（按行归一化为 0-1，突出相对特异性）
+ct_nmf_mean <- seurat_obj@meta.data %>%
+  select(cell_type, all_of(factor_cols)) %>%
+  group_by(cell_type) %>%
+  summarise(across(everything(), mean), .groups = "drop") %>%
+  column_to_rownames("cell_type") %>%
+  as.matrix()
+
+ct_nmf_scaled <- t(apply(ct_nmf_mean, 1, function(x) (x - min(x)) / (max(x) - min(x) + 1e-10)))
+
+col_fun <- colorRamp2(c(0, 0.5, 1), c("#2166AC", "#F7F7F7", "#D6604D"))
+
+Heatmap(
+  ct_nmf_scaled,
+  name              = "Scaled\nActivation",
+  col               = col_fun,
+  cluster_rows      = TRUE,
+  cluster_columns   = TRUE,
+  show_row_names    = TRUE,
+  show_column_names = TRUE,
+  row_names_gp      = gpar(fontsize = 11),
+  column_names_gp   = gpar(fontsize = 11),
+  column_names_rot  = 45,
+  row_title         = "Cell Type",
+  column_title      = "NMF Factor",
+  column_title_side = "bottom"
+)
+```
+
+### 各组别的因子激活分布
+
+```{r}
+#| label: violin-group-factor
+#| eval: false
+#| fig-width: 14
+#| fig-height: 8
+
+nmf_long <- seurat_obj@meta.data %>%
+  select(cell_type, group, all_of(factor_cols)) %>%
+  pivot_longer(cols = all_of(factor_cols),
+               names_to  = "factor",
+               values_to = "activation") %>%
+  mutate(factor = factor(factor, levels = factor_cols))
+
+ggplot(nmf_long, aes(x = group, y = activation, fill = group)) +
+  geom_violin(trim = TRUE, scale = "width", alpha = 0.8) +
+  geom_boxplot(width = 0.1, outlier.shape = NA,
+               fill = "white", alpha = 0.6) +
+  facet_wrap(~factor, scales = "free_y", ncol = 5) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "NMF Factor Activation by Group",
+       x = NULL, y = "Activation Score") +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1),
+    strip.text   = element_text(face = "bold"),
+    legend.position = "top"
+  )
+```
+
+
+## Part VI: 因子特异性基因提取
+
+### Top 基因（权重排名）
+
+```{r}
+#| label: top-genes
+#| eval: false
+
+n_top <- 30
+
+top_genes_list <- map(seq_len(k_selected), function(k) {
+  w_col <- W[, k]
+  names(sort(w_col, decreasing = TRUE))[1:n_top]
+})
+names(top_genes_list) <- factor_cols
+
+# 展示各因子 top10
+iwalk(top_genes_list, function(genes, nm) {
+  cat(nm, ":", paste(head(genes, 10), collapse = ", "), "\n")
+})
+```
+
+### 特异性筛选（双重阈值）
+
+W 矩阵中权重高的基因未必因子特异——可能在多个因子中均有贡献。特异性评分筛选真正因子专属的基因：
+
+```{r}
+#| label: specific-genes
+#| eval: false
+
+# 特异性 = 该因子权重 / 全部因子权重之和
+W_specificity <- W / (rowSums(W) + 1e-10)
+
+specific_genes_list <- map(seq_len(k_selected), function(k) {
+  spec_scores  <- W_specificity[, k]
+  w_scores     <- W[, k]
+  w_threshold  <- quantile(w_scores, 0.70)  # 权重 top 30%
+  spec_threshold <- 0.5                      # 该因子贡献 > 50% 总权重
+
+  genes <- names(which(spec_scores > spec_threshold & w_scores > w_threshold))
+  names(sort(w_scores[genes], decreasing = TRUE))
+})
+names(specific_genes_list) <- factor_cols
+
+cat("各因子特异性基因数量:\n")
+iwalk(specific_genes_list, function(g, nm) cat(nm, ":", length(g), "genes\n"))
+```
+
+### Top 基因热图（按因子排序）
+
+```{r}
+#| label: heatmap-top-genes
+#| eval: false
+#| fig-width: 12
+#| fig-height: 8
+
+top5_per_factor <- map(seq_len(k_selected), function(k) head(top_genes_list[[k]], 5))
+marker_genes    <- unique(unlist(top5_per_factor))
+
+# 细胞按主导因子排序
+cell_order  <- order(cell_factor_assign)
+expr_mat    <- as.matrix(GetAssayData(seurat_obj, layer = "data")[marker_genes, cell_order])
+expr_scaled <- t(apply(expr_mat, 1, scale))
+
+# 列注释：因子 + 细胞类型
+top_annot <- HeatmapAnnotation(
+  Factor   = cell_factor_assign[cell_order],
+  CellType = seurat_obj$cell_type[cell_order],
+  col = list(
+    Factor   = setNames(rainbow(k_selected), factor_cols),
+    CellType = setNames(
+      brewer.pal(min(length(unique(seurat_obj$cell_type)), 9), "Set1"),
+      unique(seurat_obj$cell_type)
+    )
+  )
+)
+
+# 行注释：基因所属因子
+gene_factor_map <- map_chr(marker_genes, function(g) {
+  idx <- which(sapply(top5_per_factor, function(genes) g %in% genes))
+  factor_cols[idx[1]]
+})
+
+left_annot <- rowAnnotation(
+  Factor = gene_factor_map,
+  col = list(Factor = setNames(rainbow(k_selected), factor_cols))
+)
+
+col_fun2 <- colorRamp2(c(-2, 0, 2), c("#2166AC", "white", "#D6604D"))
+
+Heatmap(
+  expr_scaled,
+  name              = "Z-score",
+  col               = col_fun2,
+  top_annotation    = top_annot,
+  left_annotation   = left_annot,
+  cluster_rows      = FALSE,
+  cluster_columns   = FALSE,
+  show_column_names = FALSE,
+  row_names_gp      = gpar(fontsize = 8),
+  column_title      = "Cells (ordered by dominant NMF factor)",
+  row_title         = "Top genes per factor",
+  use_raster        = TRUE
+)
+```
+
+
+## Part VII: 富集分析
+
+对每个因子的特异性基因做 GO、KEGG、Reactome 三库联合富集分析。
+
+```{r}
+#| label: enrichment-function
+#| eval: false
+
+run_factor_enrichment <- function(gene_list, factor_name, organism = "human") {
+  # SYMBOL → Entrez ID
+  gene_df <- bitr(gene_list, fromType = "SYMBOL",
+                  toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+  if (nrow(gene_df) < 5) {
+    message(factor_name, ": 有效基因不足，跳过")
+    return(NULL)
+  }
+
+  entrez_ids <- gene_df$ENTREZID
+
+  # GO BP 富集
+  go_res <- enrichGO(
+    gene          = entrez_ids,
+    OrgDb         = org.Hs.eg.db,
+    ont           = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff  = 0.05,
+    qvalueCutoff  = 0.2,
+    readable      = TRUE
+  )
+
+  # KEGG 富集
+  kegg_res <- enrichKEGG(
+    gene          = entrez_ids,
+    organism      = "hsa",
+    pAdjustMethod = "BH",
+    pvalueCutoff  = 0.05
+  )
+
+  # Reactome 富集（更系统，层次化通路）
+  reactome_res <- enrichPathway(
+    gene          = entrez_ids,
+    organism      = organism,
+    pAdjustMethod = "BH",
+    pvalueCutoff  = 0.05,
+    readable      = TRUE
+  )
+
+  list(factor = factor_name, GO = go_res, KEGG = kegg_res, Reactome = reactome_res)
+}
+```
+
+```{r}
+#| label: run-enrichment
+#| eval: false
+
+enrich_results <- imap(specific_genes_list, function(genes, nm) {
+  cat("Enrichment for", nm, "...\n")
+  run_factor_enrichment(genes, nm)
+})
+
+saveRDS(enrich_results, "results/nmf_enrichment_results.rds")
+```
+
+### 富集结果气泡图
+
+```{r}
+#| label: enrichment-bubble
+#| eval: false
+#| fig-width: 14
+#| fig-height: 10
+
+enrich_results <- readRDS("results/nmf_enrichment_results.rds")
+
+# 汇总各因子的 top Reactome 通路
+reactome_summary <- imap_dfr(enrich_results, function(res, nm) {
+  if (is.null(res$Reactome)) return(NULL)
+  df <- as.data.frame(res$Reactome)
+  if (nrow(df) == 0) return(NULL)
+
+  df %>%
+    slice_min(p.adjust, n = 5) %>%
+    mutate(
+      Factor = nm,
+      GeneRatio_num = map_dbl(GeneRatio, function(gr) {
+        parts <- strsplit(gr, "/")[[1]]
+        as.numeric(parts[1]) / as.numeric(parts[2])
+      }),
+      Description = str_trunc(Description, 55)
+    )
+})
+
+ggplot(reactome_summary, aes(x = Factor, y = Description)) +
+  geom_point(aes(size = Count, color = -log10(p.adjust))) +
+  scale_color_viridis_c(option = "plasma", name = "-log10(padj)") +
+  scale_size_continuous(name = "Gene Count", range = c(2, 8)) +
+  labs(
+    title = "Top Reactome Pathways per NMF Factor",
+    x = NULL, y = NULL
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1, face = "bold"),
+    axis.text.y  = element_text(size = 9),
+    plot.title   = element_text(hjust = 0.5, face = "bold")
+  )
+```
+
+### 因子 top 通路汇总表
+
+```{r}
+#| label: enrichment-table
+#| eval: false
+
+enrichment_table <- imap_dfr(enrich_results, function(res, nm) {
+  if (is.null(res$Reactome)) return(NULL)
+  df <- as.data.frame(res$Reactome)
+  if (nrow(df) == 0) return(NULL)
+
+  df %>%
+    slice_min(p.adjust, n = 3) %>%
+    select(Description, GeneRatio, Count, p.adjust) %>%
+    mutate(Factor = nm, .before = 1)
+})
+
+print(enrichment_table)
+```
+
+
+## Part VIII: 跨组别因子差异分析
+
+比较不同实验条件（如 Tumor vs. Normal）下各因子的激活强度差异。
+
+```{r}
+#| label: group-comparison
+#| eval: false
+#| fig-width: 12
+#| fig-height: 8
+
+# 各细胞类型 × 组别 的平均因子激活
+group_factor_mean <- seurat_obj@meta.data %>%
+  select(group, cell_type, all_of(factor_cols)) %>%
+  pivot_longer(cols = all_of(factor_cols),
+               names_to  = "factor",
+               values_to = "activation") %>%
+  group_by(group, cell_type, factor) %>%
+  summarise(mean_activation = mean(activation), .groups = "drop")
+
+ggplot(group_factor_mean, aes(x = factor, y = mean_activation, fill = group)) +
+  geom_col(position = "dodge", alpha = 0.85) +
+  facet_wrap(~cell_type, scales = "free_y") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Mean NMF Factor Activation by Cell Type and Group",
+    x = "NMF Factor", y = "Mean Activation Score"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1, size = 8),
+    strip.text   = element_text(face = "bold"),
+    legend.position = "top"
+  )
+```
+
+### Wilcoxon 检验 + Volcano 图
+
+```{r}
+#| label: wilcox-test
+#| eval: false
+
+stat_results <- seurat_obj@meta.data %>%
+  select(group, cell_type, all_of(factor_cols)) %>%
+  pivot_longer(cols = all_of(factor_cols),
+               names_to  = "factor",
+               values_to = "activation") %>%
+  group_by(cell_type, factor) %>%
+  summarise(
+    p_value = tryCatch({
+      gdata <- split(activation, group)
+      if (length(gdata) >= 2) wilcox.test(gdata[[1]], gdata[[2]])$p.value
+      else NA_real_
+    }, error = function(e) NA_real_),
+    effect_size = {
+      gdata <- split(activation, group)
+      if (length(gdata) >= 2) mean(gdata[[1]]) - mean(gdata[[2]])
+      else NA_real_
+    },
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_adj       = p.adjust(p_value, method = "BH"),
+    significant = p_adj < 0.05
+  ) %>%
+  arrange(p_adj)
+
+# 显著结果
+stat_results %>% filter(significant) %>% print()
+```
+
+```{r}
+#| label: volcano-plot
+#| eval: false
+#| fig-width: 10
+#| fig-height: 6
+
+stat_plot <- stat_results %>%
+  filter(!is.na(p_adj)) %>%
+  mutate(
+    label       = ifelse(significant, paste0(cell_type, "\n", factor), NA),
+    color_group = case_when(
+      significant & effect_size > 0  ~ "Up in Group1",
+      significant & effect_size < 0  ~ "Up in Group2",
+      TRUE                           ~ "Not significant"
+    )
+  )
+
+ggplot(stat_plot, aes(x = effect_size, y = -log10(p_adj), color = color_group)) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  geom_text_repel(aes(label = label), size = 2.8, max.overlaps = 15) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  scale_color_manual(values = c(
+    "Up in Group1"    = "#E41A1C",
+    "Up in Group2"    = "#377EB8",
+    "Not significant" = "gray70"
+  )) +
+  labs(
+    title = "NMF Factor Activation Difference Between Groups",
+    x     = "Effect Size (Group1 mean − Group2 mean)",
+    y     = "-log10(adjusted p-value)",
+    color = NULL
+  ) +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "top")
+```
+
+
+## Part IX: 因子与 Hallmark 基因集的关联验证（可选）
+
+利用 W 矩阵的基因权重作为排名依据，直接对 MSigDB 基因集做 GSEA——无需预先筛选 marker gene。
+
+```{r}
+#| label: gsea-hallmark
+#| eval: false
+
+hallmark_sets <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  select(gs_name, gene_symbol)
+
+gsea_nmf <- map(seq_len(k_selected), function(k) {
+  # W 列作为排名依据（权重越高越重要）
+  w_ranked <- sort(W[, k], decreasing = TRUE)
+
+  GSEA(
+    geneList     = w_ranked,
+    TERM2GENE    = hallmark_sets,
+    minGSSize    = 10,
+    maxGSSize    = 500,
+    pvalueCutoff = 0.2,
+    verbose      = FALSE
+  )
+})
+names(gsea_nmf) <- factor_cols
+
+# 展示各因子显著 Hallmark 通路
+iwalk(gsea_nmf, function(res, nm) {
+  df <- as.data.frame(res)
+  if (nrow(df) > 0) {
+    cat("\n===", nm, "===\n")
+    print(df[, c("Description", "NES", "pvalue", "p.adjust")])
+  }
+})
+```
+
+
+## Part X: 保存结果
+
+```{r}
+#| label: save-results
+#| eval: false
+
+dir.create("results", showWarnings = FALSE)
+
+# W 矩阵（基因因子矩阵）
+write.csv(W, "results/nmf_W_gene_factor_matrix.csv", quote = FALSE)
+
+# H 矩阵转置（细胞 × 因子，便于下游分析）
+write.csv(t(H), "results/nmf_H_cell_activation_matrix.csv", quote = FALSE)
+
+# 每个因子的特异性基因
+for (fct in names(specific_genes_list)) {
+  write.table(
+    data.frame(gene = specific_genes_list[[fct]]),
+    file      = paste0("results/nmf_specific_genes_", fct, ".txt"),
+    row.names = FALSE, col.names = FALSE, quote = FALSE
+  )
+}
+
+# 含 NMF 信息的 Seurat 对象
+qs2::qs_save(seurat_obj, "datasets/harmonized_seurat_nmf.qs")
+
+cat("所有结果已保存至 results/ 目录\n")
+```
+
+::: {.callout-tip}
+## 下游分析建议
+
+1. **与拟时序结合**：将 H 矩阵中的因子激活值映射到 Monocle3 轨迹，识别驱动分化节点的基因程序
+2. **与 CellChat 结合**：识别与高激活某因子的细胞亚群相关的配体-受体互作
+3. **跨数据集验证**：在独立验证队列中，用 `projectNMF()`（RcppML）投影已有 W 矩阵，计算新数据的因子激活值
+4. **SCENIC 整合**：将 NMF 因子 top 基因与 SCENIC 推断的转录因子调控子进行对比，找到驱动该程序的核心 TF
+:::
+
+
+## 参考文献
+
+- DeBruine, Z.J., et al. (2022). **Fast two-sample testing with analytic representations of probability measure differences.** *eLife*. [RcppML]
+- Kotliar, D., et al. (2019). **Identifying gene expression programs of cell-type identity and cellular activity with single-cell RNA-Seq.** *eLife*, 8, e43803. [cNMF]
+- Gavish, A., et al. (2023). **Hallmarks of transcriptional intratumour heterogeneity across a thousand tumours.** *Nature*, 618, 598–606. [泛癌 NMF 应用]
+- Barkley, D., et al. (2022). **Cancer cell states recur across tumor types and form specific interactions with the tumor microenvironment.** *Nature Genetics*, 54, 1192–1201. [TME NMF]
