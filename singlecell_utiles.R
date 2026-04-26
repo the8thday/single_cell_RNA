@@ -1837,4 +1837,25 @@ LoadVisiumMulti <- function(dirs,
   out
 }
 
+#' Standard QC panel: VlnPlot stacked above SpatialFeaturePlot
+#'
+#' @param obj Seurat object with spatial assay.
+#' @param features Character vector of QC feature names.
+#'   Default c("nCount_Spatial", "nFeature_Spatial", "percent.mt").
+#' @param pt.size.factor Passed to SpatialFeaturePlot.
+#' @return A patchwork object combining the two panels.
+SpatialQCPlot <- function(obj,
+                          features = c("nCount_Spatial", "nFeature_Spatial", "percent.mt"),
+                          pt.size.factor = 1.6) {
+  miss <- setdiff(features, c(colnames(obj@meta.data), rownames(obj)))
+  if (length(miss)) {
+    stop("Features not in object: ", paste(miss, collapse = ", "))
+  }
+  p_vln <- Seurat::VlnPlot(obj, features = features, pt.size = 0, ncol = length(features)) +
+    patchwork::plot_layout(guides = "collect")
+  p_sp <- Seurat::SpatialFeaturePlot(obj, features = features,
+                                     pt.size.factor = pt.size.factor,
+                                     ncol = length(features))
+  p_vln / p_sp
+}
 
