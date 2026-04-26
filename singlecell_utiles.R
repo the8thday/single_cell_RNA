@@ -1807,4 +1807,34 @@ convertHumanMouse <- function(genes,
   }
 }
 
+#' Batch-load multi-sample 10x Visium data
+#'
+#' @param dirs Character vector of spaceranger output directories.
+#' @param sample_names Character vector of sample names (same length as dirs).
+#' @param filename H5 filename inside each dir. Default "filtered_feature_bc_matrix.h5".
+#' @param mt_pattern Regex for mitochondrial genes. Default "^MT-" (human). Use "^mt-" for mouse.
+#' @return A named list of Seurat objects, each with `orig.ident`, `sample`, `percent.mt` set.
+LoadVisiumMulti <- function(dirs,
+                            sample_names,
+                            filename = "filtered_feature_bc_matrix.h5",
+                            mt_pattern = "^MT-") {
+  stopifnot(length(dirs) == length(sample_names))
+  out <- vector("list", length(dirs))
+  names(out) <- sample_names
+  for (i in seq_along(dirs)) {
+    obj <- Seurat::Load10X_Spatial(
+      data.dir = dirs[i],
+      filename = filename,
+      assay = "Spatial",
+      slice = sample_names[i],
+      filter.matrix = TRUE
+    )
+    obj$orig.ident <- sample_names[i]
+    obj$sample <- sample_names[i]
+    obj[["percent.mt"]] <- Seurat::PercentageFeatureSet(obj, pattern = mt_pattern)
+    out[[i]] <- obj
+  }
+  out
+}
+
 
