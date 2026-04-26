@@ -1,0 +1,95 @@
+---
+title: "MERFISH / CosMx 工作流"
+format: html
+---
+
+## 简介
+
+MERFISH（Vizgen）和 CosMx（Nanostring）是另两个亚细胞分辨率成像平台。和 Xenium 类似（每个 cell 一行），但 panel 大小、segmentation 策略、文件格式不同。
+
+Seurat v5：
+- MERFISH → `ReadVizgen()`
+- CosMx → `ReadNanostring()` 或 `LoadNanostring()`
+
+```{r}
+#| include: false
+library(Seurat)
+library(future)
+library(ggplot2)
+library(dplyr)
+source(here::here("singlecell_utiles.R"))
+plan("multisession", workers = 4)
+options(future.globals.maxSize = 8 * 1024^3)
+```
+
+## 数据加载：Vizgen MERFISH
+
+```{r}
+#| eval: false
+mer_dir <- "/path/to/vizgen_output"
+# Vizgen 输出：cell_by_gene.csv、cell_metadata.csv、cell_boundaries/
+mer_data <- ReadVizgen(data.dir = mer_dir, type = "centroids")
+mer <- CreateSeuratObject(counts = mer_data$transcripts, assay = "Vizgen")
+mer[["fov"]] <- CreateFOV(mer_data$centroids, type = "centroids")
+```
+
+## 数据加载：Nanostring CosMx
+
+```{r}
+#| eval: false
+cosmx_dir <- "/path/to/cosmx_output"
+cosmx_data <- ReadNanostring(data.dir = cosmx_dir,
+                             mtx.file = "exprMat_file.csv",
+                             metadata.file = "metadata_file.csv",
+                             molecules.file = "tx_file.csv",
+                             segmentations.file = "polygons.csv",
+                             type = c("centroids", "segmentations"))
+cosmx <- CreateSeuratObject(counts = cosmx_data$matrix, assay = "Nanostring")
+cosmx[["fov"]] <- CreateFOV(cosmx_data$centroids,
+                            segmentations = cosmx_data$segmentations,
+                            type = c("centroids", "segmentations"))
+```
+
+## QC + 标准化（共用）
+
+```{r}
+#| eval: false
+mer[["nCount"]] <- mer$nCount_Vizgen
+SpatialQCPlot(mer, features = c("nCount"))
+mer <- subset(mer, subset = nCount_Vizgen > 20)
+mer <- NormalizeData(mer) |>
+  FindVariableFeatures() |>
+  ScaleData() |>
+  RunPCA(npcs = 30) |>
+  FindNeighbors(dims = 1:20) |>
+  FindClusters(resolution = 0.5) |>
+  RunUMAP(dims = 1:20)
+```
+
+## 可视化
+
+```{r}
+#| eval: false
+ImageDimPlot(mer, fov = "fov", axes = TRUE)
+ImageFeaturePlot(mer, fov = "fov", features = head(VariableFeatures(mer), 4))
+```
+
+## 平台差异速查
+
+| 维度 | MERFISH (Vizgen) | CosMx (Nanostring) | Xenium (10x) |
+|---|---|---|---|
+| 典型 panel | 140–500 | 1000–6000 | 300–5000 |
+| segmentation | DAPI + 膜 staining | DAPI + 膜 staining | DAPI（默认）/ multi-modal |
+| 加载函数 | `ReadVizgen` | `ReadNanostring` | `LoadXenium` |
+| 子细胞 transcript | `transcripts` | `molecules` | `transcripts` |
+
+## 注意事项
+
+- 三平台 segmentation 失败 spot 比例不同；先看 `nCount` 分布
+- Vizgen 早期版本 cell ID 重复跨 FOV，加载后用 `paste0(fov, "_", cell)` 唯一化
+- CosMx 数据量极大，强烈建议 `load_bpcells = TRUE` 或 disk-backed assay
+
+## 下游
+
+- 标签迁移： `spatial_scRNA_integration.qmd`（同样适用于 imaging 平台）
+- 邻域分析： `spatial_niche.qmd`
