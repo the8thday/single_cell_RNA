@@ -1,0 +1,101 @@
+---
+title: "ST × scRNA 整合 / 标签迁移"
+format: html
+---
+
+## 简介
+
+把 scRNA 的细胞类型注释迁移到 spot，是反卷积外的另一条路径：
+- **反卷积**（`spatial_deconvolution.qmd`）：每个 spot 的混合比例
+- **标签迁移**（本文件）：每个 spot 的"主要类型 + 置信度"，更接近单细胞分析的语义
+
+主要工具：Seurat `FindTransferAnchors` + `TransferData` + `MapQuery`。
+
+```{r}
+#| include: false
+library(Seurat)
+library(SeuratData)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+source(here::here("singlecell_utiles.R"))
+```
+
+## 数据加载
+
+```{r}
+brain <- LoadData("stxBrain", type = "anterior1")
+brain <- SCTransform(brain, assay = "Spatial", verbose = FALSE) |>
+  RunPCA(assay = "SCT", verbose = FALSE)
+
+allen <- LoadData("allen_reference") |> UpdateSeuratObject()
+allen <- JoinLayers(allen)  # Seurat v5 必需
+allen <- SCTransform(allen, assay = "RNA", verbose = FALSE) |>
+  RunPCA(assay = "SCT", verbose = FALSE) |>
+  RunUMAP(dims = 1:30, return.model = TRUE)
+```
+
+## 锚点 + 标签迁移
+
+```{r}
+anchors <- FindTransferAnchors(
+  reference = allen,
+  query = brain,
+  normalization.method = "SCT",
+  reduction = "pcaproject"
+)
+predictions <- TransferData(
+  anchorset = anchors,
+  refdata = allen$subclass,
+  weight.reduction = brain[["pca"]],
+  dims = 1:30
+)
+brain <- AddMetaData(brain, metadata = predictions)
+SpatialDimPlot(brain, group.by = "predicted.id", label = TRUE)
+```
+
+## 用 MapQuery 把 spot 投到参考 UMAP
+
+```{r}
+brain <- MapQuery(
+  anchorset = anchors,
+  reference = allen,
+  query = brain,
+  refdata = list(subclass = "subclass"),
+  reference.reduction = "pca",
+  reduction.model = "umap"
+)
+DimPlot(brain, reduction = "ref.umap", group.by = "predicted.subclass", label = TRUE)
+```
+
+## 置信度过滤
+
+每个 spot 一个 `predicted.id.score`（最大类别概率），低置信度 spot 单独标注：
+
+```{r}
+brain$confident_id <- ifelse(brain$predicted.id.score >= 0.5,
+                             brain$predicted.id, "Uncertain")
+SpatialDimPlot(brain, group.by = "confident_id", label = TRUE)
+```
+
+## 与反卷积结果交叉验证
+
+```{r}
+#| eval: false
+# 假设 spatial_deconvolution.qmd 的结果已存
+brain_decon <- qs2::qs_read("Results/brain_with_RCTD.qs")
+# 比较：迁移得到的 predicted.id 与 RCTD argmax 的一致率
+rctd_top <- apply(GetAssayData(brain_decon, assay = "RCTD"), 2, function(x) names(which.max(x)))
+table(brain$predicted.id, rctd_top[colnames(brain)])
+```
+
+## 注意事项
+
+- Seurat v5：参考对象必须 `JoinLayers()` 才能传给 `FindTransferAnchors`
+- `weight.reduction` 用 query 的 `pca` 比 `pcaproject` 更稳
+- 不要在多样本整合后忘记重做 SCTransform，否则 anchor 找不到
+
+## 下游
+
+- 与反卷积结果交叉： `spatial/spatial_deconvolution.qmd`
+- 多切片标签传递：先 Harmony 整合 ST，然后用此流程批量迁移（参考 `spatial_workflow.qmd` 的整合段）
