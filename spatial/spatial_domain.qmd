@@ -1,0 +1,119 @@
+---
+title: "空间 Domain 检测"
+format: html
+---
+
+## 简介
+
+"空间 domain" 是指组织上空间连续、转录组相似的区域。和普通聚类的区别：domain 检测**显式利用空间坐标**，结果更连续、更接近解剖区域。
+
+主流工具：
+- **BayesSpace**（R，可跑）— 在 PC 空间做 Markov 随机场聚类，利用 hex 邻接
+- **SpaGCN**（Python，本文件仅注释，不执行）— 图卷积网络融合表达 + 坐标 + 组织图像
+
+```{r}
+#| include: false
+library(Seurat)
+library(SeuratData)
+library(BayesSpace)
+library(SingleCellExperiment)
+library(ggplot2)
+library(patchwork)
+source(here::here("singlecell_utiles.R"))
+```
+
+## 数据加载
+
+```{r}
+brain <- LoadData("stxBrain", type = "anterior1")
+brain[["percent.mt"]] <- PercentageFeatureSet(brain, pattern = "^mt-")
+brain <- subset(brain, subset = nFeature_Spatial > 200 & percent.mt < 20)
+brain <- SCTransform(brain, assay = "Spatial", verbose = FALSE)
+brain <- RunPCA(brain, assay = "SCT", verbose = FALSE)
+```
+
+## 方法 1：BayesSpace（R，可跑）
+
+转换为 SingleCellExperiment 并加上 spot 坐标：
+
+```{r}
+sce <- as.SingleCellExperiment(brain, assay = "Spatial")
+coords <- GetTissueCoordinates(brain@images[[1]])
+sce$row <- coords$imagerow
+sce$col <- coords$imagecol
+metadata(sce)$BayesSpace.data <- list(platform = "Visium", is.enhanced = FALSE)
+```
+
+预处理 + 选择簇数：
+
+```{r}
+sce <- spatialPreprocess(sce, platform = "Visium",
+                         n.PCs = 15, n.HVGs = 2000, log.normalize = FALSE)
+sce <- qTune(sce, qs = seq(2, 12), platform = "Visium", d = 15)
+qPlot(sce)
+```
+
+跑聚类：
+
+```{r}
+q <- 8  # 选 elbow / 业务知识
+sce <- spatialCluster(sce, q = q, platform = "Visium", d = 15,
+                      init.method = "mclust", model = "t",
+                      gamma = 3, nrep = 1000, burn.in = 100)
+clusterPlot(sce)
+```
+
+将 domain 写回 Seurat：
+
+```{r}
+brain$bayes_domain <- factor(sce$spatial.cluster)
+SpatialDimPlot(brain, group.by = "bayes_domain", label = TRUE)
+```
+
+## 方法 2：SpaGCN（Python，仅参考）
+
+SpaGCN 是 Python 工具，本仓库不标准化 Python 环境，因此本节**仅给出调用模板**，不在 quarto 渲染时执行。
+
+```python
+# python 环境（参考）
+# pip install SpaGCN scanpy
+import scanpy as sc
+import SpaGCN as spg
+
+adata = sc.read_visium("/path/to/spaceranger_outs")
+sc.pp.normalize_total(adata, target_sum=1e4)
+sc.pp.log1p(adata)
+
+# 构建邻接图：表达 + 坐标 + 组织图像
+adj = spg.calculate_adj_matrix(
+    x=adata.obs["array_row"], y=adata.obs["array_col"],
+    x_pixel=adata.obs["pxl_col_in_fullres"],
+    y_pixel=adata.obs["pxl_row_in_fullres"],
+    image=adata.uns["spatial"]["...your_sample..."]["images"]["hires"],
+    beta=49, alpha=1, histology=True
+)
+
+clf = spg.SpaGCN()
+clf.set_l(0.5)
+clf.train(adata, adj, init_spa=True, init="louvain", res=0.4)
+y_pred, _ = clf.predict()
+adata.obs["spagcn_domain"] = y_pred
+```
+
+输出的 `spagcn_domain` 可通过 `Seurat_2_h5ad.qmd` 流程往返到 Seurat。
+
+## BayesSpace vs SpaGCN
+
+- BayesSpace：纯统计模型，结果稳定、可解释
+- SpaGCN：能利用 H&E 图像、对噪声 spot 更鲁棒，但调参更敏感
+- 实践上常先 BayesSpace，结果不理想或想用图像信息时换 SpaGCN
+
+## 注意事项
+
+- BayesSpace 用 `nrep = 50000` 才是 paper 推荐设置；本模板为加速用 1000
+- SpaGCN 章节本仓库不执行；如需运行，自建 Python venv
+
+## 下游
+
+- domain 间差异分析等同于 cluster 间差异（见 `spatial_workflow.qmd`）
+- domain 内的 niche 分析： `spatial_niche.qmd`
