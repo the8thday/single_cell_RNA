@@ -507,7 +507,7 @@ library(harmony)
 # merged_seurat <- RunUMAP(merged_seurat, dims = 1:30, reduction = "pca")
 ```
 
-
+Once integrative analysis is complete, you can rejoin the layers - which collapses the individual datasets together and recreates the original counts and data layers. You will need to do this before performing any differential expression analysis. 
 ```{r}
 merged_seurat <- RunPCA(merged_seurat, npcs = 50, verbose = FALSE)
 
@@ -521,7 +521,7 @@ merged_seurat <- RunPCA(merged_seurat, npcs = 50, verbose = FALSE)
 #   orig.reduction = "pca", # 输入为PCA结果
 #   new.reduction = "harmony",
 #   group.by.vars = "orig.ident", # 按样本分组校正
-#   assay = "SCT",
+#   assay = "SCT",normalization.method = "SCT",
 #   theta = 2, # 控制校正强度（值越大校正越强）
 #   lambda = 0.5, # 平衡全局与局部结构
 #   verbose = TRUE
@@ -709,6 +709,7 @@ DimPlot(harmonized_seurat,
 增殖细胞：MKI67、PCNA
 
 
+Once integrative analysis is complete, you can rejoin the layers - which collapses the individual datasets together and recreates the original counts and data layers. You will need to do this before performing any differential expression analysis. However, you can always resplit the layers in case you would like to reperform integrative analysis.
 ```{r}
 # load("./datasets/harmonized_seurat.rds")
 # harmonized_seurat <- readRDS("./datasets/harmonized_seurat.rds")
@@ -1597,9 +1598,10 @@ results_h <- topTable(fit2_h, number = Inf)
 print(paste0("Hallmark差异富集通路数量: ", sum(results_h$adj.P.Val < 0.05)))
 ```
 
+
 ##### 在单个细胞层面运行
 
-
+首先是选择感兴趣的细胞亚群。在一个细胞亚群中做不同condition的下的富集分数的差异分析是我们的目的。
 ```{r}
 seurat_obj <- harmonized_seurat
 ```

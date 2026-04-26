@@ -1,0 +1,227 @@
+---
+title: "inferCNV Pipeline"
+author: "liuc"
+date: "2025-01-01"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+---
+
+# Overview
+
+This notebook provides a fully-commented workflow for running **inferCNV** on an already processed Seurat object. Each chunk defaults to `eval: false`; remove or change that once you have updated the paths and parameters for your dataset.
+
+High-level steps:
+
+1. Load required packages and configure parallelization.
+2. Load the final Seurat object (or reference an object already in memory).
+3. Define malignant/reference annotations and prepare the metadata table.
+4. Assemble the raw counts matrix and gene order file expected by inferCNV.
+5. Construct and run the inferCNV object with optional denoising/HMM.
+6. Summarize and plot CNV signals, and save results.
+
+# 1. Setup
+
+```{r packages}
+#| label: packages
+#| message: false
+#| warning: false
+# Step 1: load packages used in the pipeline
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(infercnv)
+  library(dplyr)
+  library(readr)
+  library(stringr)
+  library(future)
+  library(tibble)
+  library(rlang)
+  library(ggplot2)
+})
+```
+
+```{r parallel}
+#| label: parallel
+#| eval: false
+# Step 2: optional parallelisation configuration (adjust workers to your machine)
+plan("multicore", workers = 4)
+```
+
+# 2. Load Seurat Object
+
+```{r load-object}
+#| label: load-object
+#| eval: false
+# Step 3: load the processed Seurat object; skip if already in the environment
+seurat_obj <- readRDS("data/final_seurat_object.rds")
+```
+
+```{r inspect-meta}
+#| label: inspect-meta
+#| eval: false
+# Step 4: inspect metadata to choose annotation columns
+head(seurat_obj@meta.data)
+table(seurat_obj$celltype)
+table(seurat_obj$sample_id)
+```
+
+# 3. Prepare Annotations
+
+```{r define-groups}
+#| label: define-groups
+#| eval: false
+# Step 5: specify the metadata columns and class labels
+annotation_col <- "celltype"        # column that distinguishes cell states / types
+malignant_groups <- c("Tumor")      # levels considered malignant
+reference_groups <- c("T_cells", "B_cells", "NK_cells") # non-malignant controls
+
+metadata_tbl <- seurat_obj@meta.data %>%
+  tibble::rownames_to_column("cell_id") %>%
+  select(cell_id, group = !!rlang::sym(annotation_col))
+
+stopifnot(all(malignant_groups %in% metadata_tbl$group))
+stopifnot(all(reference_groups %in% metadata_tbl$group))
+```
+
+```{r write-annotation}
+#| label: write-annotation
+#| eval: false
+# Step 6: write the annotation file (cell IDs in column 1, group labels in column 2)
+annotation_path <- "inferCNV/annotations.tsv"
+dir.create(dirname(annotation_path), showWarnings = FALSE, recursive = TRUE)
+write_tsv(metadata_tbl, annotation_path, col_names = FALSE)
+```
+
+# 4. Prepare Expression Matrix
+
+```{r counts-matrix}
+#| label: counts-matrix
+#| eval: false
+# Step 7: extract the raw counts matrix (genes x cells) from the RNA assay
+DefaultAssay(seurat_obj) <- "RNA"
+counts_matrix <- GetAssayData(seurat_obj, slot = "counts")
+
+# Optional: filter genes or cells prior to inferCNV (e.g., based on coverage)
+# counts_matrix <- counts_matrix[rowSums(counts_matrix) > 50, ]
+
+counts_path <- "inferCNV/counts_matrix.tsv"
+write.table(counts_matrix, file = counts_path, sep = "\t",
+            quote = FALSE, col.names = NA)
+```
+
+```{r gene-order}
+#| label: gene-order
+#| eval: false
+# Step 8: build the gene order file (chromosome, gene start, gene symbol)
+# Supply an existing table if you already have one; otherwise build from a GTF.
+gene_order_path <- "inferCNV/gene_order.tsv"
+
+gtf_file <- "reference/gencode.v45.basic.annotation.gtf.gz" # update to your annotation
+
+gene_order_tbl <- read_tsv(
+  gtf_file,
+  comment = "#",
+  col_names = c("chromosome", "source", "feature",
+                "start", "end", "score", "strand", "frame", "attribute"),
+  progress = FALSE
+) %>%
+  filter(feature == "gene") %>%
+  transmute(
+    gene = str_match(attribute, 'gene_name "([^"]+)"')[, 2],
+    chromosome = chromosome,
+    start = start
+  ) %>%
+  distinct(gene, .keep_all = TRUE) %>%
+  arrange(chromosome, start)
+
+# Align gene order to genes present in the counts matrix
+gene_order_tbl <- gene_order_tbl %>% filter(gene %in% rownames(counts_matrix))
+
+write_tsv(gene_order_tbl, gene_order_path, col_names = FALSE)
+```
+
+# 5. Create inferCNV Object
+
+```{r create-infercnv}
+#| label: create-infercnv
+#| eval: false
+# Step 9: instantiate the inferCNV object
+infercnv_obj <- CreateInfercnvObject(
+  raw_counts_matrix = counts_path,     # or pass counts_matrix directly
+  annotations_file = annotation_path,
+  delim = "\t",
+  gene_order_file = gene_order_path,
+  ref_group_names = reference_groups
+)
+```
+
+# 6. Run inferCNV
+
+```{r run-infercnv}
+#| label: run-infercnv
+#| eval: false
+# Step 10: configure output directory and run the main pipeline
+output_dir <- "inferCNV/results"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+infercnv_obj <- infercnv::run(
+  infercnv_obj,
+  cutoff = 0.1,                    # 0.1 recommended for 10x data, 1 for Smart-seq
+  out_dir = output_dir,
+  cluster_by_groups = TRUE,
+  denoise = TRUE,
+  HMM = TRUE,
+  num_threads = max(1, future::nbrOfWorkers())
+)
+```
+
+# 7. Post-processing
+
+```{r load-results}
+#| label: load-results
+#| eval: false
+# Step 11: load inferCNV outputs for downstream interpretation
+cnv_matrix <- readRDS(file.path(output_dir, "infercnv.observations.rds"))
+reference_matrix <- readRDS(file.path(output_dir, "infercnv.references.rds"))
+
+# Example: compute average CNV signal per group
+cnv_df <- as.data.frame(cnv_matrix)
+cnv_df$gene <- rownames(cnv_matrix)
+```
+
+```{r quick-plot}
+#| label: quick-plot
+#| eval: false
+# Step 12: quick visualization of chromosome-level CNV scores
+infercnv::plot_cnv(
+  infercnv_obj,
+  out_dir = file.path(output_dir, "plots"),
+  plot_per_chr = TRUE,
+  title = "inferCNV CNV heatmap"
+)
+```
+
+# 8. Save Updated Object
+
+```{r save-objects}
+#| label: save-objects
+#| eval: false
+# Step 13: optionally attach inferCNV results back to the Seurat object
+seurat_obj@misc$infercnv <- list(
+  cnv_matrix = cnv_matrix,
+  reference_matrix = reference_matrix,
+  params = list(
+    malignant = malignant_groups,
+    reference = reference_groups
+  )
+)
+
+saveRDS(seurat_obj, file = "inferCNV/seurat_with_cnv.rds")
+```
+
+# Notes
+
+- Ensure the cell names in the Seurat object and annotation file match exactly.
+- If you prefer to avoid intermediate files, supply matrices and data frames directly to `CreateInfercnvObject`; see `?CreateInfercnvObject` for accepted input types.
+- Review the inferCNV documentation for advanced settings such as Bayesian mixture models, multi-sample comparisons, and alternative plotting modes.

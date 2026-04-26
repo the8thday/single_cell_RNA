@@ -3,3 +3,24 @@
 .Rdata
 .httr-oauth
 .DS_Store
+.qodo
+
+# Analysis intermediates / outputs (regeneratable)
+datasets/*.qs
+datasets/*.qs2
+datasets/*.rds
+datasets/*.RData
+datasets/*.rdata
+datasets/*.h5ad
+datasets/*.loom
+Results/
+figures/
+Hallmark_boxplots/
+*_cache/
+*_files/
+
+# Re-include tracked demo data
+!datasets/ctrl_raw_feature_bc_matrix/
+!datasets/stim_raw_feature_bc_matrix/
+!datasets/monocle_trajectory_test/
+!datasets/monocle_trajectory_test/*.rds

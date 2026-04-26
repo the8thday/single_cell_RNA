@@ -1669,11 +1669,142 @@ scDotComplex <- function(
     legend_gp = grid::gpar(col = "grey50"), size = grid::unit(sqrt(c(0.25, 0.5, 0.75, 1)) * dot_size_max, "mm"),
     background = "white"
   )
-  
+
   ComplexHeatmap::draw(hm, annotation_legend_list = list(lgd_size))
 }
 
 
+#' Marker-module heatmap with side-by-side enrichment bar plot
+#'
+#' Builds the common single-cell figure of: rows = marker genes (split into
+#' modules), columns = cell types, with a coloured block annotation per module
+#' on the left and a horizontal bar plot of pathway / GO enrichment per module
+#' on the right.
+#'
+#' @param expr_matrix Numeric matrix, rows = genes, cols = cell types. Typically
+#'   row-scaled (z-scores) average expression.
+#' @param gene_groups Named list of character vectors. Each element is one
+#'   module; order of the list defines row block order.
+#' @param enrichment_df data.frame with columns `gene_group` (matching
+#'   names(gene_groups)), `term` (GO/pathway label), `neg_log10_padj`.
+#' @param group_colors Named vector of fill colours for the modules. Default is
+#'   a 7-colour palette recycled as needed.
+#' @param expr_col ComplexHeatmap colour function for the expression scale.
+#' @param column_colors Optional named vector of label colours for the column
+#'   (cell-type) names.
+#' @param row_height_mm Per-row height of the heatmap in mm. Default 4.5.
+#' @param rel_widths Relative widths of (heatmap, bar plot) panels. Default
+#'   c(4.2, 3).
+#' @param outfile Optional path; if given, the combined figure is saved as PDF.
+#'
+#' @return A `cowplot` plot_grid object (also drawn to the active device).
+plotMarkerEnrichmentHeatmap <- function(expr_matrix,
+                                        gene_groups,
+                                        enrichment_df,
+                                        group_colors = NULL,
+                                        expr_col = circlize::colorRamp2(c(-2, 0, 2),
+                                                                        c("blue", "white", "red")),
+                                        column_colors = NULL,
+                                        row_height_mm = 4.5,
+                                        rel_widths = c(4.2, 3),
+                                        outfile = NULL) {
+  stopifnot(is.matrix(expr_matrix),
+            is.list(gene_groups), !is.null(names(gene_groups)),
+            all(c("gene_group", "term", "neg_log10_padj") %in% colnames(enrichment_df)))
 
+  if (is.null(group_colors)) {
+    pal <- c("#F9A23D", "#F47C40", "#E7A56F", "#8CC37A",
+             "#79BC5C", "#F7968C", "#ED6564")
+    group_colors <- setNames(pal[((seq_along(gene_groups) - 1) %% length(pal)) + 1],
+                             names(gene_groups))
+  }
+
+  row_groups <- rep(names(gene_groups), lengths(gene_groups))
+  row_label_colors <- group_colors[row_groups]
+  expr_matrix <- expr_matrix[unlist(gene_groups), , drop = FALSE]
+
+  left_anno <- ComplexHeatmap::rowAnnotation(
+    module = ComplexHeatmap::anno_block(
+      gp = grid::gpar(fill = group_colors),
+      labels = names(gene_groups),
+      labels_gp = grid::gpar(col = "black", fontsize = 8)
+    )
+  )
+
+  hm <- ComplexHeatmap::Heatmap(
+    expr_matrix, name = "Expression", col = expr_col,
+    cluster_rows = FALSE, cluster_columns = FALSE,
+    row_split = factor(row_groups, levels = names(gene_groups)),
+    row_gap = grid::unit(0, "mm"),
+    show_row_names = TRUE, row_names_side = "left",
+    column_names_side = "bottom",
+    row_names_gp = grid::gpar(col = row_label_colors, fontsize = 8),
+    column_names_gp = if (!is.null(column_colors))
+      grid::gpar(col = column_colors[colnames(expr_matrix)], fontsize = 8)
+    else grid::gpar(fontsize = 8),
+    height = grid::unit(nrow(expr_matrix) * row_height_mm, "mm"),
+    left_annotation = left_anno
+  )
+
+  enrichment_df$gene_group <- factor(enrichment_df$gene_group, levels = names(gene_groups))
+  enrichment_df$term <- factor(enrichment_df$term, levels = rev(enrichment_df$term))
+
+  bar <- ggplot2::ggplot(enrichment_df,
+                         ggplot2::aes(x = neg_log10_padj, y = term, fill = gene_group)) +
+    ggplot2::geom_bar(stat = "identity", width = 0.7) +
+    ggplot2::scale_fill_manual(values = group_colors) +
+    ggplot2::theme_minimal() +
+    ggplot2::theme(
+      axis.title = ggplot2::element_blank(),
+      axis.text.y = ggplot2::element_text(size = 8),
+      panel.grid = ggplot2::element_blank(),
+      legend.position = "none"
+    )
+
+  combined <- cowplot::plot_grid(
+    grid::grid.grabExpr(ComplexHeatmap::draw(hm)),
+    bar, ncol = 2, rel_widths = rel_widths, align = "h", axis = "tb"
+  )
+
+  if (!is.null(outfile)) {
+    ggplot2::ggsave(outfile, combined,
+                    width = sum(rel_widths) + 1.5,
+                    height = nrow(expr_matrix) * 0.25 + 1.5)
+  }
+  combined
+}
+
+
+#' Convert genes between human and mouse via Ensembl biomaRt
+#'
+#' @param genes character vector of gene IDs to convert
+#' @param geneid one of "symbol", "ensembl", "entrez"
+#' @param invert if TRUE, human -> mouse; if FALSE, mouse -> human
+#' @param host biomaRt host. Use an archive (e.g. "https://aug2020.archive.ensembl.org")
+#'   for a frozen GRCh38/GRCm38 mapping; default is the current Ensembl.
+#' @return data.frame with the source and target gene IDs
+convertHumanMouse <- function(genes,
+                              geneid = c("symbol", "ensembl", "entrez"),
+                              invert = FALSE,
+                              host = "https://www.ensembl.org") {
+  geneid <- match.arg(geneid)
+  human <- biomaRt::useMart("ensembl", dataset = "hsapiens_gene_ensembl", host = host)
+  mouse <- biomaRt::useMart("ensembl", dataset = "mmusculus_gene_ensembl", host = host)
+
+  ids <- switch(geneid,
+                symbol  = list(human = "hgnc_symbol",     mouse = "mgi_symbol"),
+                ensembl = list(human = "ensembl_gene_id", mouse = "ensembl_gene_id"),
+                entrez  = list(human = "entrezgene_id",   mouse = "entrezgene_id"))
+
+  if (invert) {
+    biomaRt::getLDS(attributes = ids$human, filters = ids$human, values = genes,
+                    mart = human, attributesL = ids$mouse, martL = mouse,
+                    uniqueRows = TRUE)
+  } else {
+    biomaRt::getLDS(attributes = ids$mouse, filters = ids$mouse, values = genes,
+                    mart = mouse, attributesL = ids$human, martL = human,
+                    uniqueRows = TRUE)
+  }
+}
 
 
