@@ -1,0 +1,153 @@
+---
+title: "10x Visium 端到端工作流"
+format: html
+---
+
+## 简介
+
+本文件是 10x Genomics Visium 空转数据的端到端模板：从数据加载、QC、标准化、聚类、空间区域差异分析到 marker 可视化。后续的反卷积、空间可变基因、空间 domain、niche、空间通讯、ST × scRNA 整合等分析，分别在 `spatial/` 下的同名 `.qmd` 文件中展开。
+
+适用平台：标准 Visium（55µm spot）。Visium HD 见 `visium_hd.qmd`，亚细胞分辨率成像平台见 `xenium_workflow.qmd` / `merfish_cosmx.qmd`。
+
+```{r}
+#| include: false
+library(Seurat)
+library(SeuratData)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(qs2)
+source(here::here("singlecell_utiles.R"))
+```
+
+## 数据加载
+
+使用 `SeuratData::stxBrain` 作演示样本（小鼠脑前后冠状切片各一）。第一次运行需要 `InstallData("stxBrain")`。
+
+```{r}
+# InstallData("stxBrain")  # 首次运行解开
+brain_a <- LoadData("stxBrain", type = "anterior1")
+brain_p <- LoadData("stxBrain", type = "posterior1")
+brain_a$sample <- "anterior"
+brain_p$sample <- "posterior"
+```
+
+实际项目里把样本路径放进 `LoadVisiumMulti()`：
+
+```{r}
+#| eval: false
+sample_dirs <- c("/path/to/sample1/outs",
+                 "/path/to/sample2/outs")
+sample_names <- c("sample1", "sample2")
+obj_list <- LoadVisiumMulti(sample_dirs, sample_names, mt_pattern = "^mt-")
+```
+
+## QC
+
+```{r}
+brain_a[["percent.mt"]] <- PercentageFeatureSet(brain_a, pattern = "^mt-")
+SpatialQCPlot(brain_a)
+```
+
+按 nCount / nFeature / 线粒体比例过滤。阈值需按组织类型调整：
+
+```{r}
+brain_a <- subset(brain_a,
+                  subset = nCount_Spatial > 500 &
+                           nFeature_Spatial > 200 &
+                           percent.mt < 20)
+```
+
+## 标准化与降维
+
+```{r}
+brain_a <- SCTransform(brain_a, assay = "Spatial", verbose = FALSE)
+brain_a <- RunPCA(brain_a, assay = "SCT", verbose = FALSE)
+ElbowPlot(brain_a, ndims = 30)
+```
+
+## 聚类与可视化
+
+```{r}
+brain_a <- FindNeighbors(brain_a, reduction = "pca", dims = 1:20)
+brain_a <- FindClusters(brain_a, resolution = 0.4, verbose = FALSE)
+brain_a <- RunUMAP(brain_a, reduction = "pca", dims = 1:20)
+
+p1 <- SpatialDimPlot(brain_a, label = TRUE, label.size = 4)
+p2 <- DimPlot(brain_a, reduction = "umap", label = TRUE) + NoLegend()
+p1 + p2
+```
+
+## 空间区域定义与差异分析
+
+通过 H&E 形态学 + 聚类位置手工定义解剖区域，然后做区域间差异：
+
+```{r}
+brain_a$Region <- dplyr::case_when(
+  brain_a$seurat_clusters %in% c("0", "3") ~ "Cortex",
+  brain_a$seurat_clusters %in% c("1", "2") ~ "Striatum",
+  TRUE ~ "Other"
+)
+SpatialDimPlot(brain_a, group.by = "Region")
+```
+
+区域间差异基因（Cortex vs Striatum，方向写明保持一致）：
+
+```{r}
+Idents(brain_a) <- "Region"
+de_cortex_vs_striatum <- FindMarkers(brain_a,
+                                     ident.1 = "Cortex",
+                                     ident.2 = "Striatum",
+                                     test.use = "wilcox")
+head(de_cortex_vs_striatum, 10)
+```
+
+## Marker 基因
+
+```{r}
+Idents(brain_a) <- "seurat_clusters"
+all_markers <- FindAllMarkers(brain_a,
+                              only.pos = TRUE,
+                              min.pct = 0.25,
+                              logfc.threshold = 0.25)
+top5 <- all_markers |>
+  dplyr::group_by(cluster) |>
+  dplyr::slice_max(avg_log2FC, n = 5)
+SpatialFeaturePlot(brain_a, features = head(top5$gene, 4))
+```
+
+## 多样本整合
+
+```{r}
+#| eval: false
+obj_list <- list(anterior = brain_a, posterior = brain_p)
+obj_list <- lapply(obj_list, SCTransform, assay = "Spatial", verbose = FALSE)
+features <- SelectIntegrationFeatures(obj_list, nfeatures = 3000)
+obj_list <- PrepSCTIntegration(obj_list, anchor.features = features)
+anchors  <- FindIntegrationAnchors(obj_list,
+                                   normalization.method = "SCT",
+                                   anchor.features = features)
+brain    <- IntegrateData(anchorset = anchors, normalization.method = "SCT")
+```
+
+## 保存
+
+```{r}
+#| eval: false
+qs2::qs_save(brain_a, "Results/brain_anterior.qs")
+```
+
+## 下游分析
+
+- 反卷积： `spatial/spatial_deconvolution.qmd`
+- 空间可变基因： `spatial/spatial_SVG.qmd`
+- 空间 domain 检测： `spatial/spatial_domain.qmd`
+- niche / 邻域： `spatial/spatial_niche.qmd`
+- 空间通讯： `spatial/spatial_celltalk.qmd`
+- ST × scRNA 整合： `spatial/spatial_scRNA_integration.qmd`
+
+## 注意事项
+
+- Seurat v5 多样本整合后调用反卷积 / CytoTRACE2 等之前需 `JoinLayers()`
+- 序列化用 `qs2::qs_save`，不要用 `qs::`
+- 区域差异分析比较方向（如 Cortex vs Striatum）变量名 / 标题 / 注释三者保持一致
