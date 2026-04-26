@@ -1858,4 +1858,3 @@ SpatialQCPlot <- function(obj,
                                      ncol = length(features))
   p_vln / p_sp
 }
-
