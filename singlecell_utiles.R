@@ -1895,3 +1895,37 @@ PlotDeconvProportion <- function(obj, decon_assay, group_col, top_n = 12) {
 
   list(bar = bar, spatial = spatial)
 }
+
+#' For each spot, compute the k-NN neighborhood composition over a categorical column.
+#'
+#' Uses the spatial coordinates from obj@images[[1]] (first image slice).
+#'
+#' @param obj Seurat object with at least one spatial image slot.
+#' @param group_col meta.data column with the categorical label per spot
+#'   (e.g. cell-type assignment or seurat_clusters).
+#' @param k Number of nearest neighbors. Default 6 (Visium hex grid).
+#' @return A long-format data.frame with columns: spot, group, neighbor_group, fraction.
+NeighborComposition <- function(obj, group_col, k = 6) {
+  stopifnot(group_col %in% colnames(obj@meta.data))
+  if (length(obj@images) == 0) {
+    stop("No image slot found on Seurat object.")
+  }
+  coords <- Seurat::GetTissueCoordinates(obj@images[[1]])
+  coords <- as.matrix(coords[, c("imagerow", "imagecol")])
+  nn <- FNN::get.knn(coords, k = k)$nn.index
+  labels <- obj@meta.data[[group_col]]
+  spots <- rownames(coords)
+  out <- vector("list", length(spots))
+  for (i in seq_along(spots)) {
+    nb_lab <- labels[nn[i, ]]
+    tab <- table(nb_lab) / k
+    out[[i]] <- data.frame(
+      spot = spots[i],
+      group = labels[i],
+      neighbor_group = names(tab),
+      fraction = as.numeric(tab),
+      stringsAsFactors = FALSE
+    )
+  }
+  do.call(rbind, out)
+}
