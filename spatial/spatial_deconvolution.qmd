@@ -1,0 +1,132 @@
+---
+title: "Spot 反卷积"
+format: html
+---
+
+## 简介
+
+Visium 每个 spot 直径约 55µm，包含多个细胞，因此需要用 scRNA 参考做反卷积，估计每个 spot 的细胞类型组成。
+
+本文件涵盖三种工具：
+- **RCTD（spacexr）**：泊松似然 + 双类型混合，鲁棒，目前最常用
+- **CARD**：考虑空间相关性的非负回归
+- **SPOTlight**：非负矩阵分解（NMF）
+
+```{r}
+#| include: false
+library(Seurat)
+library(SeuratData)
+library(spacexr)     # RCTD
+library(CARD)
+library(SPOTlight)
+library(qs2)
+library(dplyr)
+library(ggplot2)
+source(here::here("singlecell_utiles.R"))
+```
+
+## 数据加载（ST + 参考 scRNA）
+
+```{r}
+# 空转
+brain <- LoadData("stxBrain", type = "anterior1")
+brain[["percent.mt"]] <- PercentageFeatureSet(brain, pattern = "^mt-")
+brain <- subset(brain, subset = nFeature_Spatial > 200 & percent.mt < 20)
+# Seurat v5: 取 counts 前先 JoinLayers
+brain <- JoinLayers(brain, assay = "Spatial")
+brain <- SCTransform(brain, assay = "Spatial", verbose = FALSE)
+brain <- RunPCA(brain, assay = "SCT", verbose = FALSE)
+
+# 参考 scRNA（Allen 脑图谱）
+allen <- LoadData("allen_reference")
+allen <- UpdateSeuratObject(allen)
+# Seurat v5：JoinLayers 再取 counts
+allen <- JoinLayers(allen)
+```
+
+## 方法 1：RCTD (spacexr)
+
+```{r}
+ref_counts <- GetAssayData(allen, assay = "RNA", layer = "counts")
+ref_meta <- as.factor(allen$subclass)
+names(ref_meta) <- colnames(allen)
+reference <- Reference(ref_counts, ref_meta)
+
+st_counts <- GetAssayData(brain, assay = "Spatial", layer = "counts")
+st_coords <- GetTissueCoordinates(brain@images[[1]])[, c("imagerow", "imagecol")]
+puck <- SpatialRNA(st_coords, st_counts)
+
+rctd <- create.RCTD(puck, reference, max_cores = 2)
+rctd <- run.RCTD(rctd, doublet_mode = "doublet")
+
+# 提取权重并写入 Seurat
+weights <- as.matrix(rctd@results$weights)
+norm_w <- sweep(weights, 1, rowSums(weights), "/")
+brain[["RCTD"]] <- CreateAssayObject(data = t(norm_w))
+
+# 可视化
+DefaultAssay(brain) <- "RCTD"
+SpatialFeaturePlot(brain, features = head(rownames(brain[["RCTD"]]), 6),
+                   ncol = 3, alpha = c(0.1, 1))
+```
+
+## 方法 2：CARD
+
+```{r}
+#| eval: false
+card_obj <- createCARDObject(
+  sc_count = ref_counts,
+  sc_meta = data.frame(cellType = ref_meta, sampleInfo = "all"),
+  spatial_count = st_counts,
+  spatial_location = data.frame(x = st_coords[, 1], y = st_coords[, 2]),
+  ct.varname = "cellType",
+  ct.select = unique(ref_meta),
+  sample.varname = "sampleInfo"
+)
+card_obj <- CARD_deconvolution(CARD_object = card_obj)
+CARD.visualize.pie(proportion = card_obj@Proportion_CARD,
+                   spatial_location = card_obj@spatial_location)
+```
+
+## 方法 3：SPOTlight
+
+```{r}
+#| eval: false
+hvg <- VariableFeatures(allen)[1:3000]
+mgs <- FindAllMarkers(allen, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+mgs_top <- mgs |> group_by(cluster) |> slice_max(avg_log2FC, n = 100)
+spotlight_res <- SPOTlight(
+  x = GetAssayData(allen, layer = "counts"),
+  y = GetAssayData(brain, assay = "Spatial", layer = "counts"),
+  groups = allen$subclass,
+  mgs = mgs_top,
+  hvg = hvg,
+  weight_id = "avg_log2FC",
+  group_id = "cluster",
+  gene_id = "gene"
+)
+```
+
+## 三种方法的可视化对比
+
+```{r}
+res <- PlotDeconvProportion(brain, decon_assay = "RCTD",
+                            group_col = "seurat_clusters", top_n = 10)
+res$bar
+res$spatial
+```
+
+## 与原 `spacexr_STalign` 文件的关系
+
+`spacexr` 即 RCTD 包；本文件已涵盖。原 `spatial/spacexr_STalign.qmd` 占位文件已删除。
+
+## 注意事项
+
+- Seurat v5 参考对象在 `Reference()` 之前必须 `JoinLayers()`
+- `doublet_mode = "doublet"` 适合标准 Visium；高分辨率（Slide-seq、HD）用 `"full"`
+- 序列化反卷积结果用 `qs2::qs_save`
+
+## 下游
+
+- niche / 邻域分析（基于反卷积比例）： `spatial/spatial_niche.qmd`
+- 空间通讯（按反卷积细胞类型）： `spatial/spatial_celltalk.qmd`
