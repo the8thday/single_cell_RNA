@@ -1,0 +1,127 @@
+---
+title: "空间增强的细胞通讯"
+format: html
+---
+
+## 简介
+
+普通的细胞通讯分析（CellChat / NicheNet）不考虑空间，但实际上 ligand-receptor 信号通常发生在邻近 spot 间。本文件覆盖：
+- **CellChat v2 spatial**（R，可跑）— 在 CellChat 中加入 spatial 距离约束
+- **COMMOT**（Python，仅参考）— 用最优传输直接在空间上估计信号流
+
+```{r}
+#| include: false
+library(Seurat)
+library(SeuratData)
+library(CellChat)
+library(patchwork)
+library(dplyr)
+library(ggplot2)
+library(clusterProfiler)
+library(ReactomePA)
+source(here::here("singlecell_utiles.R"))
+```
+
+## 数据准备
+
+```{r}
+brain <- LoadData("stxBrain", type = "anterior1")
+brain <- SCTransform(brain, assay = "Spatial", verbose = FALSE) |>
+  RunPCA(assay = "SCT", verbose = FALSE) |>
+  FindNeighbors(dims = 1:20) |>
+  FindClusters(resolution = 0.4, verbose = FALSE)
+brain$celltype <- paste0("CT", brain$seurat_clusters)
+# Seurat v5: 取 data 前先 JoinLayers
+brain <- JoinLayers(brain, assay = "Spatial")
+```
+
+## CellChat v2 spatial（可跑）
+
+```{r}
+data_input <- GetAssayData(brain, assay = "SCT", layer = "data")
+meta <- data.frame(labels = brain$celltype, row.names = colnames(brain))
+
+# 空间坐标
+coords <- GetTissueCoordinates(brain@images[[1]])
+spatial_locs <- as.matrix(coords[, c("imagerow", "imagecol")])
+
+# Visium 的 spot 物理大小（µm）
+scale_factors <- list(
+  spot.diameter = 65,
+  spot = 65,
+  fiducial = 0,
+  hires = brain@images[[1]]@scale.factors$hires,
+  lowres = brain@images[[1]]@scale.factors$lowres
+)
+
+cellchat <- createCellChat(
+  object = data_input,
+  meta = meta,
+  group.by = "labels",
+  datatype = "spatial",
+  coordinates = spatial_locs,
+  scale.factors = scale_factors
+)
+cellchat@DB <- CellChatDB.mouse  # 小鼠数据
+cellchat <- subsetData(cellchat)
+cellchat <- identifyOverExpressedGenes(cellchat)
+cellchat <- identifyOverExpressedInteractions(cellchat)
+cellchat <- computeCommunProb(cellchat,
+                              type = "truncatedMean", trim = 0.1,
+                              distance.use = TRUE,
+                              interaction.length = 200,
+                              scale.distance = 0.01)
+cellchat <- filterCommunication(cellchat, min.cells = 10)
+cellchat <- computeCommunProbPathway(cellchat)
+cellchat <- aggregateNet(cellchat)
+```
+
+可视化：
+
+```{r}
+groupSize <- as.numeric(table(cellchat@idents))
+netVisual_circle(cellchat@net$weight, vertex.weight = groupSize,
+                 weight.scale = TRUE, label.edge = FALSE,
+                 title.name = "Interaction weights")
+```
+
+## L-R pair 富集（含 Reactome）
+
+```{r}
+top_lr <- subsetCommunication(cellchat) |>
+  arrange(desc(prob)) |>
+  head(50)
+genes_in_top <- unique(c(top_lr$ligand, top_lr$receptor))
+entrez <- clusterProfiler::bitr(genes_in_top, fromType = "SYMBOL",
+                                toType = "ENTREZID", OrgDb = "org.Mm.eg.db")$ENTREZID
+ereact <- ReactomePA::enrichPathway(gene = entrez, organism = "mouse")
+dotplot(ereact, showCategory = 15) + ggtitle("Reactome enrichment of top L-R pairs")
+```
+
+## COMMOT（Python，仅参考）
+
+```python
+# 参考调用，本文件不执行
+import scanpy as sc
+import commot as ct
+
+adata = sc.read_visium("/path/to/spaceranger_outs")
+df_lr = ct.tl.ligand_receptor_database(species="mouse", signaling_type="Secreted Signaling")
+ct.tl.spatial_communication(
+    adata, database_name="cellchat", df_ligrec=df_lr,
+    dis_thr=500, heteromeric=True, pathway_sum=True
+)
+ct.pl.plot_cell_communication(adata, database_name="cellchat",
+                              pathway_name="WNT", plot_method="grid")
+```
+
+## 注意事项
+
+- `interaction.length` 单位是像素（图像坐标）；按组织调整
+- `distance.use = TRUE` 才启用空间约束，否则等价于普通 CellChat
+- L-R 富集必须含 Reactome（repo 约定）
+
+## 下游
+
+- niche-by-niche 通讯比较：用 `spatial_niche.qmd` 的标签替换 `meta$labels`
+- 通讯结果与 NicheNet 模型整合：参考根目录 `nichenet.qmd`
