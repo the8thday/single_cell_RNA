@@ -1858,3 +1858,40 @@ SpatialQCPlot <- function(obj,
                                      ncol = length(features))
   p_vln / p_sp
 }
+
+#' Plot deconvolution proportions: stacked bar (per cluster/region) + spatial overlay
+#'
+#' @param obj Seurat object.
+#' @param decon_assay Assay name holding the cell-type proportion matrix
+#'   (rows = cell types, columns = spots, values in [0,1]).
+#' @param group_col meta.data column to summarise proportions by (e.g. seurat_clusters or Region).
+#' @param top_n Show the top N cell types by overall mean proportion. Default 12.
+#' @return A list with elements `bar` and `spatial` (patchwork of per-celltype maps).
+PlotDeconvProportion <- function(obj, decon_assay, group_col, top_n = 12) {
+  stopifnot(decon_assay %in% Seurat::Assays(obj))
+  stopifnot(group_col %in% colnames(obj@meta.data))
+  m <- Seurat::GetAssayData(obj, assay = decon_assay, slot = "data")
+  m <- as.matrix(m)
+  overall <- sort(rowMeans(m), decreasing = TRUE)
+  keep <- names(overall)[seq_len(min(top_n, length(overall)))]
+  m_keep <- m[keep, , drop = FALSE]
+
+  grp <- obj@meta.data[[group_col]]
+  agg <- t(apply(m_keep, 1, function(x) tapply(x, grp, mean)))
+  agg_df <- as.data.frame(agg)
+  agg_df$celltype <- rownames(agg_df)
+  long <- tidyr::pivot_longer(agg_df, cols = -celltype,
+                              names_to = "group", values_to = "prop")
+
+  bar <- ggplot2::ggplot(long, ggplot2::aes(x = group, y = prop, fill = celltype)) +
+    ggplot2::geom_col(position = "fill") +
+    ggplot2::labs(x = group_col, y = "Proportion", fill = "Cell type") +
+    ggplot2::theme_classic() +
+    ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1))
+
+  Seurat::DefaultAssay(obj) <- decon_assay
+  spatial <- Seurat::SpatialFeaturePlot(obj, features = keep, ncol = 4,
+                                        pt.size.factor = 1.6, alpha = c(0.1, 1))
+
+  list(bar = bar, spatial = spatial)
+}
