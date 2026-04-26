@@ -1,0 +1,104 @@
+---
+title: "10x Xenium 工作流"
+format: html
+---
+
+## 简介
+
+Xenium 是 10x 的亚细胞分辨率（< 1µm）成像空转平台。和 Visium 相比：
+- 每个 cell 一行（已有 segmentation），不是 spot
+- 基因 panel 有限（~300–5000 基因）
+- 数据量大（百万级细胞）
+
+Seurat v5 原生支持 Xenium：`LoadXenium()`。
+
+```{r}
+#| include: false
+library(Seurat)
+library(future)
+library(ggplot2)
+library(dplyr)
+library(qs2)
+source(here::here("singlecell_utiles.R"))
+plan("multisession", workers = 4)
+options(future.globals.maxSize = 8 * 1024^3)
+```
+
+## 数据加载
+
+```{r}
+#| eval: false
+# 10x 公开 Xenium 小鼠脑样本（Tiny Subset）
+# 下载： https://www.10xgenomics.com/datasets （Xenium → Mouse Brain）
+xen_dir <- "/path/to/xenium_output_bundle"
+xen <- LoadXenium(xen_dir, fov = "fov")
+```
+
+替换为可演示的 mock（实际使用替换为上面的 `LoadXenium`）：
+
+```{r}
+xen <- readRDS(system.file("extdata", "xenium_demo.rds", package = "Seurat"))
+# 若包内无 demo，跳过此 chunk
+```
+
+## QC
+
+```{r}
+xen[["nCount"]] <- xen$nCount_Xenium
+xen[["nFeature"]] <- xen$nFeature_Xenium
+SpatialQCPlot(xen, features = c("nCount", "nFeature"))
+xen <- subset(xen, subset = nCount_Xenium > 10 & nFeature_Xenium > 5)
+```
+
+## 标准化与聚类
+
+Xenium 基因数少，常用 `SCTransform` 或简单的 log-normalize：
+
+```{r}
+xen <- NormalizeData(xen) |>
+  FindVariableFeatures(nfeatures = 2000) |>
+  ScaleData() |>
+  RunPCA(npcs = 30)
+xen <- FindNeighbors(xen, dims = 1:20) |>
+  FindClusters(resolution = 0.5)
+xen <- RunUMAP(xen, dims = 1:20)
+```
+
+## 可视化
+
+```{r}
+ImageDimPlot(xen, fov = "fov", axes = TRUE, cols = "polychrome")
+ImageFeaturePlot(xen, fov = "fov", features = head(VariableFeatures(xen), 4))
+```
+
+## 与 scRNA 参考做标签迁移
+
+```{r}
+#| eval: false
+ref <- qs2::qs_read("/path/to/scRNA_reference.qs") |> JoinLayers()
+ref <- SCTransform(ref) |> RunPCA() |> RunUMAP(dims = 1:30, return.model = TRUE)
+anchors <- FindTransferAnchors(reference = ref, query = xen,
+                               normalization.method = "LogNormalize",
+                               reduction = "pcaproject")
+preds <- TransferData(anchors, refdata = ref$celltype,
+                      weight.reduction = xen[["pca"]], dims = 1:30)
+xen <- AddMetaData(xen, preds)
+ImageDimPlot(xen, group.by = "predicted.id", fov = "fov")
+```
+
+## 与 Visium 的关键差异
+
+- **不需要反卷积**（已是单细胞分辨率）
+- 邻域分析直接基于 cell 中心坐标，邻接定义不同（Delaunay / 半径 vs hex）
+- 基因 panel 有限，HVG 选择基本无意义
+
+## 注意事项
+
+- `LoadXenium` 默认读 `cell_feature_matrix.h5` + `cells.csv.gz` + `morphology.ome.tif`
+- 多 FOV 数据需用 `SubsetByImageBox`
+- 大数据集用 BPCells 后端：`LoadXenium(..., load_bpcells = TRUE)`
+
+## 下游
+
+- niche / 邻域分析（基于 cell 邻接）： `spatial_niche.qmd` 中把 `k = 6` 改成更合适的 cell 邻接 k
+- 空间通讯： `spatial_celltalk.qmd`
