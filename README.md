@@ -76,8 +76,14 @@ pipelines are easy to find and historical material stays out of the way.
 - **`projects/`** — analyses tied to specific datasets/projects:
   `BLM_six.qmd`, `BLM_mice.qmd`, `liver_cancer.qmd`, `GSE138794.qmd`,
   `GSE242889.qmd`, `临港实验室.qmd`.
-- **`spatial/`** — `Spatial_Transcripts.qmd`, `10x_Genomics_Visium.R`,
-  `spacexr_STalign.qmd`, `ST_test.qmd`, `spatial_scRNA_workflow.ipynb`.
+- **`spatial/`** — 10 主题模板覆盖 Visium / Visium HD / Xenium / MERFISH /
+  CosMx 全平台。按依赖关系分组：
+  - 端到端流程： `spatial_workflow.qmd`
+  - 空转专属分析： `spatial_SVG.qmd`, `spatial_deconvolution.qmd`,
+    `spatial_domain.qmd`, `spatial_niche.qmd`, `spatial_celltalk.qmd`,
+    `spatial_scRNA_integration.qmd`
+  - 亚细胞分辨率平台： `xenium_workflow.qmd`, `merfish_cosmx.qmd`,
+    `visium_hd.qmd`
 - **`scATAC/`** — placeholders (`ArchR.R`, `Signnac.R`) to be expanded.
 - **`immune_repertoire/`** — `scRepertoire.R`, to be expanded.
 
