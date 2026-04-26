@@ -1,0 +1,114 @@
+---
+title: "Niche / 邻域分析"
+format: html
+---
+
+## 简介
+
+Niche / 邻域分析关心的是"哪些细胞类型 / domain 在空间上**共定位**"。本文件三种角度：
+- **邻接共定位矩阵**（自定义 + helper）
+- **hoodscanR**：基于 KNN 的邻域统计 + 富集 vs 随机
+- **MISTy**：用 ML 模型把局部 / 中度 / 远距离邻域的影响拆开
+
+```{r}
+#| include: false
+library(Seurat)
+library(SeuratData)
+library(hoodscanR)
+library(SpatialExperiment)
+library(mistyR)
+library(future)
+library(dplyr)
+library(ggplot2)
+source(here::here("singlecell_utiles.R"))
+```
+
+## 数据加载（已带反卷积结果）
+
+假设 `spatial_deconvolution.qmd` 已跑完，加载结果：
+
+```{r}
+#| eval: false
+brain <- qs2::qs_read("Results/brain_with_RCTD.qs")
+DefaultAssay(brain) <- "RCTD"
+```
+
+为了独立可跑，这里 mock 一个 dominant cell type 标签：
+
+```{r}
+brain <- LoadData("stxBrain", type = "anterior1")
+brain <- SCTransform(brain, assay = "Spatial", verbose = FALSE) |>
+  RunPCA(assay = "SCT", verbose = FALSE) |>
+  FindNeighbors(dims = 1:20) |>
+  FindClusters(resolution = 0.4, verbose = FALSE)
+brain$celltype <- paste0("CT", brain$seurat_clusters)
+# Seurat v5: 取 counts/data 前先 JoinLayers
+brain <- JoinLayers(brain, assay = "Spatial")
+```
+
+## 方法 1：邻接共定位（helper）
+
+```{r}
+nb <- NeighborComposition(brain, group_col = "celltype", k = 6)
+agg <- nb |>
+  dplyr::group_by(group, neighbor_group) |>
+  dplyr::summarise(mean_frac = mean(fraction), .groups = "drop")
+ggplot(agg, aes(x = neighbor_group, y = group, fill = mean_frac)) +
+  geom_tile() +
+  scale_fill_viridis_c() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = "Neighbor cell type", y = "Center cell type", fill = "Mean fraction")
+```
+
+## 方法 2：hoodscanR
+
+```{r}
+spe <- SpatialExperiment::SpatialExperiment(
+  assays = list(counts = GetAssayData(brain, assay = "Spatial", layer = "counts")),
+  colData = brain@meta.data,
+  spatialCoords = as.matrix(GetTissueCoordinates(brain@images[[1]])[, c("imagerow", "imagecol")])
+)
+spe <- hoodscanR::readHoodData(spe, anno_col = "celltype")
+fnc  <- hoodscanR::findNearCells(spe, k = 100)
+pm   <- hoodscanR::scanHoods(fnc$distance)
+hoods <- hoodscanR::mergeByGroup(pm, fnc$cells)
+spe   <- hoodscanR::mergeHoodSpe(spe, hoods)
+hoodscanR::plotHoodMat(spe, n = 20)
+```
+
+## 方法 3：MISTy（多视角邻域回归）
+
+```{r}
+#| eval: false
+plan(multisession, workers = 2)
+expr <- as.matrix(GetAssayData(brain, assay = "SCT", layer = "data"))
+markers <- VariableFeatures(brain)[1:50]
+expr_sub <- t(expr[markers, ])
+
+coords_df <- as.data.frame(GetTissueCoordinates(brain@images[[1]])[, c("imagerow", "imagecol")])
+
+views <- create_initial_view(as.data.frame(expr_sub)) |>
+  add_juxtaview(positions = coords_df, neighbor.thr = 200) |>
+  add_paraview(positions = coords_df, l = 1000)
+
+run_misty(views, results.folder = "Results/misty_brain")
+misty_results <- collect_results("Results/misty_brain")
+plot_improvement_stats(misty_results)
+plot_view_contributions(misty_results)
+```
+
+## 比较方向约定
+
+本文件中每个矩阵的"row = center, column = neighbor"，所有标题与文字保持一致。
+
+## 注意事项
+
+- hoodscanR `k = 100` 是默认，组织小时调小
+- MISTy 训练耗时长，示例只跑 50 个特征
+- 反卷积比例输入 niche 分析需先 `JoinLayers()` 后再取 spot × cell-type 矩阵
+
+## 下游
+
+- niche × 通讯： `spatial_celltalk.qmd`
+- niche × 区域 DE：参考 `spatial_workflow.qmd` Region 那节，把 Region 替换成 niche 标签
