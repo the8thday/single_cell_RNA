@@ -54,7 +54,9 @@ SpatialFeaturePlot(brain, features = top_svg[1:6], ncol = 3)
 SPARK-X 在大样本下显著快于 SPARK / Moran's I。
 
 ```{r}
-counts <- GetAssayData(brain, assay = "Spatial", slot = "counts")
+# Seurat v5: 取 counts 前先 JoinLayers，否则多样本分层时 counts 为空
+brain <- JoinLayers(brain, assay = "Spatial")
+counts <- GetAssayData(brain, assay = "Spatial", layer = "counts")
 coords <- GetTissueCoordinates(brain@images[[1]])
 coords <- as.matrix(coords[, c("imagerow", "imagecol")])
 sparkx_res <- sparkx(counts, coords, numCores = 2, option = "mixture")
@@ -66,8 +68,13 @@ SpatialFeaturePlot(brain, features = sparkx_top[1:6], ncol = 3)
 
 ```{r}
 #| eval: false
-sfe <- SpatialFeatureExperiment::toSpatialFeatureExperiment(brain)
-sfe <- Voyager::runMoransI(sfe, features = rownames(sfe)[1:500])
+# Voyager 工作流以 SpatialFeatureExperiment (SFE) 为底层对象。
+# 推荐直接从 SpaceRanger 输出构建 SFE，而不是从 Seurat 转换：
+# sfe <- SpatialFeatureExperiment::read10xVisiumSFE(
+#   samples = sample_dirs,
+#   sample_id = sample_names
+# )
+# sfe <- Voyager::runMoransI(sfe, features = rownames(sfe)[1:500])
 ```
 
 ## SVG 富集分析（含 Reactome）
