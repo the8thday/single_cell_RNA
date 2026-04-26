@@ -1,0 +1,113 @@
+---
+title: "Visium HD 工作流"
+format: html
+---
+
+## 简介
+
+Visium HD 是 10x 的高分辨率版（2µm × 2µm bins，分析常用 8µm 或 16µm bins）。和标准 Visium 的关键差异：
+- 每张切片 ~10⁶ bin，spot 数从 5k 跳到 1M+
+- 默认 bin 是 8µm
+- 必须用 BPCells 等 disk-backed 后端
+
+Seurat v5 原生支持： `Load10X_Spatial(..., bin.size = c(8, 16))`。
+
+```{r}
+#| include: false
+library(Seurat)
+library(BPCells)
+library(future)
+library(ggplot2)
+library(dplyr)
+source(here::here("singlecell_utiles.R"))
+plan("multisession", workers = 4)
+options(future.globals.maxSize = 16 * 1024^3)
+```
+
+## 数据加载
+
+```{r}
+#| eval: false
+hd_dir <- "/path/to/visium_hd_output/binned_outputs"
+hd <- Load10X_Spatial(
+  data.dir = hd_dir,
+  bin.size = c(8, 16),
+  filter.matrix = TRUE
+)
+# bin 8 默认 active
+DefaultAssay(hd) <- "Spatial.008um"
+```
+
+## QC
+
+```{r}
+#| eval: false
+hd[["percent.mt"]] <- PercentageFeatureSet(hd, pattern = "^mt-",
+                                           assay = "Spatial.008um")
+SpatialQCPlot(hd, features = c("nCount_Spatial.008um",
+                               "nFeature_Spatial.008um", "percent.mt"))
+hd <- subset(hd, subset = nCount_Spatial.008um > 10 & percent.mt < 30)
+```
+
+## 标准化（log-norm 推荐，SCTransform 太慢）
+
+```{r}
+#| eval: false
+hd <- NormalizeData(hd, assay = "Spatial.008um")
+hd <- FindVariableFeatures(hd, assay = "Spatial.008um", nfeatures = 2000)
+hd <- ScaleData(hd, assay = "Spatial.008um")
+hd <- RunPCA(hd, assay = "Spatial.008um", reduction.name = "pca.008um", npcs = 30)
+```
+
+## 聚类（用 sketch / 子采样加速）
+
+```{r}
+#| eval: false
+hd <- SketchData(hd, assay = "Spatial.008um", ncells = 50000,
+                 method = "LeverageScore", sketched.assay = "sketch")
+DefaultAssay(hd) <- "sketch"
+hd <- FindVariableFeatures(hd) |> ScaleData() |> RunPCA(npcs = 30)
+hd <- FindNeighbors(hd, dims = 1:20) |>
+  FindClusters(resolution = 0.5)
+hd <- RunUMAP(hd, dims = 1:20, return.model = TRUE)
+
+# 投回完整数据
+hd <- ProjectData(hd,
+                  assay = "Spatial.008um",
+                  full.reduction = "pca.008um",
+                  sketched.assay = "sketch",
+                  sketched.reduction = "pca",
+                  umap.model = "umap",
+                  dims = 1:20,
+                  refdata = list(cluster_full = "seurat_clusters"))
+```
+
+## 可视化
+
+```{r}
+#| eval: false
+DefaultAssay(hd) <- "Spatial.008um"
+SpatialDimPlot(hd, group.by = "cluster_full", label = FALSE) +
+  theme(legend.position = "right")
+```
+
+## 16µm bin（用于跨样本聚类比较）
+
+```{r}
+#| eval: false
+DefaultAssay(hd) <- "Spatial.016um"
+hd <- NormalizeData(hd, assay = "Spatial.016um")
+# ... 重复上面的流程
+```
+
+## 注意事项
+
+- Visium HD 必须 `library(BPCells)` 配合 `Load10X_Spatial`，否则内存爆掉
+- 全量聚类不可行，用 `SketchData` + `ProjectData`
+- `SCTransform` 在 1M+ bins 上太慢，用 `NormalizeData`
+- 多个 bin size assay 同时挂在对象上，操作前显式 `DefaultAssay()`
+
+## 下游
+
+- 反卷积： Visium HD 的 8µm bin 已接近单细胞，可不必反卷积；如需反卷积用 RCTD `doublet_mode = "full"`
+- 与 scRNA 整合： `spatial_scRNA_integration.qmd`
