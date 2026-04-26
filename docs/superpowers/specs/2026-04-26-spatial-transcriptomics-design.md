@@ -26,7 +26,7 @@ Issues:
 - **Platform scope:** Visium + Visium HD + Xenium + MERFISH + CosMx. Stereo-seq / Slide-seqV2 / DBiT-seq are out of scope.
 - **Existing files:** consolidate (option B). Merge the three overlapping R files into one end-to-end workflow; archive originals; expand from there.
 - **Completeness:** option B for all files (runnable on a small public dataset). Two exceptions where Python-only tools fall back to option A (skeleton, annotated but not executed): SpaGCN in `spatial_domain.qmd`, and COMMOT in `spatial_celltalk.qmd`. The R-side sections of those two files (BayesSpace, CellChat v2 spatial) remain runnable.
-- **Python:** the existing `.ipynb` is preserved as-is. No new Python files in this scope.
+- **Python:** `spatial/spatial_scRNA_workflow.ipynb` has been intentionally removed; the root-level `scRNAseq_workflow.ipynb` is the surviving Python/Scanpy notebook and stays as-is. No new Python files in this scope.
 
 ## File deliverables
 
@@ -49,7 +49,7 @@ Issues:
 
 - `Spatial_Transcripts.qmd`, `ST_test.qmd`, `10x_Genomics_Visium.R` → contents merged into `spatial_workflow.qmd`; originals **moved to `archive/superseded_rmd/`** (preserve history; do not delete).
 - `spacexr_STalign.qmd` (19-line placeholder) → relevant lines folded into `spatial_deconvolution.qmd`; original **deleted**.
-- `spatial_scRNA_workflow.ipynb` → **untouched**.
+- `spatial_scRNA_workflow.ipynb` → **deleted** (Python/Scanpy coverage now lives in root-level `scRNAseq_workflow.ipynb`).
 
 ## File internal structure
 
