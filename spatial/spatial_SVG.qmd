@@ -1,0 +1,115 @@
+---
+title: "空间可变基因 (SVG)"
+format: html
+---
+
+## 简介
+
+空间可变基因（spatially variable genes, SVG）是指表达模式在组织空间上**非随机**的基因——既包括聚集分布的，也包括沿梯度变化的。比单纯的高变基因（HVG）更能捕捉空间生物学。
+
+本文件覆盖三种主流方法：
+- Seurat `FindSpatiallyVariableFeatures`（Moran's I / `markvariogram`）
+- SPARK-X（基于核的快速 SVG 测试，适合大样本）
+- `Voyager` 包计算的 Moran's I（更细粒度的空间统计）
+
+```{r}
+#| include: false
+library(Seurat)
+library(SeuratData)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(SPARK)        # SPARK-X
+library(Voyager)
+library(SpatialFeatureExperiment)
+library(clusterProfiler)
+library(ReactomePA)   # 富集必须含 Reactome
+source(here::here("singlecell_utiles.R"))
+```
+
+## 数据加载
+
+```{r}
+brain <- LoadData("stxBrain", type = "anterior1")
+brain[["percent.mt"]] <- PercentageFeatureSet(brain, pattern = "^mt-")
+brain <- subset(brain, subset = nFeature_Spatial > 200 & percent.mt < 20)
+brain <- SCTransform(brain, assay = "Spatial", verbose = FALSE)
+```
+
+## 方法 1：Seurat `FindSpatiallyVariableFeatures`
+
+```{r}
+brain <- FindSpatiallyVariableFeatures(
+  brain,
+  assay = "SCT",
+  features = VariableFeatures(brain)[1:1000],
+  selection.method = "moransi"
+)
+top_svg <- SpatiallyVariableFeatures(brain, selection.method = "moransi") |> head(12)
+SpatialFeaturePlot(brain, features = top_svg[1:6], ncol = 3)
+```
+
+## 方法 2：SPARK-X
+
+SPARK-X 在大样本下显著快于 SPARK / Moran's I。
+
+```{r}
+counts <- GetAssayData(brain, assay = "Spatial", slot = "counts")
+coords <- GetTissueCoordinates(brain@images[[1]])
+coords <- as.matrix(coords[, c("imagerow", "imagecol")])
+sparkx_res <- sparkx(counts, coords, numCores = 2, option = "mixture")
+sparkx_top <- rownames(sparkx_res$res_mtest)[order(sparkx_res$res_mtest$adjustedPval)][1:20]
+SpatialFeaturePlot(brain, features = sparkx_top[1:6], ncol = 3)
+```
+
+## 方法 3：Voyager / Moran's I
+
+```{r}
+#| eval: false
+sfe <- SpatialFeatureExperiment::toSpatialFeatureExperiment(brain)
+sfe <- Voyager::runMoransI(sfe, features = rownames(sfe)[1:500])
+```
+
+## SVG 富集分析（含 Reactome）
+
+```{r}
+svg_genes <- top_svg
+ego <- enrichGO(gene = svg_genes,
+                OrgDb = "org.Mm.eg.db",
+                keyType = "SYMBOL",
+                ont = "BP",
+                pAdjustMethod = "BH")
+ekegg <- enrichKEGG(gene = clusterProfiler::bitr(svg_genes,
+                                                 fromType = "SYMBOL",
+                                                 toType = "ENTREZID",
+                                                 OrgDb = "org.Mm.eg.db")$ENTREZID,
+                    organism = "mmu")
+ereact <- ReactomePA::enrichPathway(
+  gene = clusterProfiler::bitr(svg_genes,
+                               fromType = "SYMBOL",
+                               toType = "ENTREZID",
+                               OrgDb = "org.Mm.eg.db")$ENTREZID,
+  organism = "mouse"
+)
+dotplot(ereact, showCategory = 15) + ggtitle("Reactome enrichment of SVGs")
+```
+
+## 三种方法对比
+
+```{r}
+seurat_svg <- top_svg
+sparkx_svg <- sparkx_top[1:12]
+overlap <- intersect(seurat_svg, sparkx_svg)
+cat("Overlap:", length(overlap), "/", length(union(seurat_svg, sparkx_svg)), "\n")
+```
+
+## 注意事项
+
+- SPARK-X 比 Seurat Moran's I 快很多，大样本（>5k spots）首选
+- SVG 不等于 marker：marker 是 cluster 间高表达，SVG 是空间结构非随机
+- 富集中必须包含 Reactome（repo 约定）
+
+## 下游
+
+- 找到 SVG 后可作为 BayesSpace / SpaGCN 的输入特征： `spatial/spatial_domain.qmd`
+- SVG 模块共表达分析可对接 `hdWGCNA.qmd`（根目录）
