@@ -9,13 +9,17 @@ format:
 
 ## Introduction
 
-AUCell (Area Under the Curve for Cell) 是一种基于排名的通路活性评估方法，适用于单细胞RNA-seq数据。与GSVA不同，AUCell不依赖于跨细胞的归一化，而是在每个细胞内部独立计算基因集的富集程度。其核心思想是：如果一个通路中的基因在某个细胞的表达排名中集中出现在前5%，则认为该通路在该细胞中是活跃的。
+AUCell (Area Under the Curve for Cell) 是一种基于排名的单细胞通路活性评分方法，由 Aibar et al. (2017) 提出，最初用于 SCENIC 的转录因子活性推断，后广泛用于任意基因集的活性评估。
 
-优点：
+**核心原理：** 对每个细胞，将所有基因按表达量从高到低排名，然后计算目标基因集中的基因在排名前 N%（默认 5%）中的富集程度（AUC 面积）。AUC 值越高，说明该基因集的成员基因越集中出现在高表达区域。
 
-- 不受dropout影响（基于排名而非绝对表达量）
-- 每个细胞独立评估，无需跨细胞比较
-- 计算结果可直接作为metadata添加到Seurat对象中
+**为什么适合单细胞：**
+
+- **对 dropout 鲁棒** — 基于排名而非绝对表达量，未检测到的基因只是排在末尾，不会产生假阴性
+- **细胞独立评估** — 每个细胞的排名在自身内部完成，不受批次效应和文库大小的干扰
+- **无需归一化** — 直接使用 raw counts 即可，AUCell 内部完成排名
+
+**与 GSVA 的互补关系：** GSVA 适合 pseudobulk/样本级别的通路比较（配合 limma 做差异分析），AUCell 适合单细胞级别的通路活性刻画（可视化、聚类、轨迹分析）。两者结合使用效果最佳。
 
 
 ## Setup
@@ -24,10 +28,10 @@ AUCell (Area Under the Curve for Cell) 是一种基于排名的通路活性评�
 #| include: false
 
 library(AUCell)
-library(GSEABase)
 library(Seurat)
 library(tidyverse)
 library(msigdbr)
+library(BiocParallel)
 library(patchwork)
 library(viridis)
 library(ComplexHeatmap)
@@ -54,6 +58,8 @@ table(seurat_obj$cell_type, seurat_obj$group)
 
 ## Prepare Gene Sets
 
+AUCell 接受 named list 格式的基因集，无需转换为 GeneSetCollection。
+
 ### MSigDB: Hallmark + KEGG + Reactome
 
 ```{r}
@@ -71,6 +77,7 @@ reactome_sets <- msigdbr(species = "Homo sapiens", category = "C2", subcollectio
 
 # 合并
 gene_sets <- c(hallmark_sets, kegg_sets, reactome_sets)
+message(length(gene_sets), " gene sets loaded")
 ```
 
 ### Custom Gene Sets（自定义通路，自免相关）
@@ -97,83 +104,135 @@ gene_sets <- c(gene_sets, custom_sets)
 ```{r}
 #| eval: false
 
-# 从GMT文件读取基因集
-# gmt_lines <- readLines("path/to/your_gene_sets.gmt")
-# gmt_sets <- lapply(gmt_lines, function(line) {
-#   fields <- strsplit(line, "\t")[[1]]
-#   genes <- fields[3:length(fields)]
-#   genes <- genes[genes != ""]
-#   return(genes)
-# })
-# names(gmt_sets) <- sapply(gmt_lines, function(line) strsplit(line, "\t")[[1]][1])
-# gene_sets <- c(gene_sets, gmt_sets)
+# GSEABase::getGmt() 可直接读取 GMT 文件为 GeneSetCollection，AUCell 也接受此格式
+# gmt_sets <- getGmt("path/to/your_gene_sets.gmt")
+# gene_sets <- c(gene_sets, geneIds(gmt_sets))
 ```
 
-### Convert to GeneSetCollection
+### 过滤基因集
 
 ```{r}
-# 转换为GeneSetCollection对象
-gene_set_collection <- lapply(names(gene_sets), function(name) {
-  GeneSet(gene_sets[[name]], setName = name)
-})
-gene_set_collection <- GeneSetCollection(gene_set_collection)
+# 只保留在表达矩阵中至少有 10 个基因匹配的集合
+genes_in_data <- rownames(seurat_obj)
+gene_sets <- lapply(gene_sets, unique)  # 去重并确保为普通 character vector
+gene_sets <- gene_sets[sapply(gene_sets, function(gs) {
+  sum(gs %in% genes_in_data) >= 10
+})]
+message(length(gene_sets), " gene sets retained after filtering")
 ```
 
 
 ## Build Expression Rankings
 
+AUCell 的第一步是对每个细胞内的基因按表达量排名。使用 raw counts 即可——AUCell 只关心相对排名，不关心绝对表达量。
+
+对于大数据集（>100K cells），保持稀疏矩阵格式（dgCMatrix）非常关键，AUCell 会自动启用 `splitByBlocks` 分块处理以控制内存。并行化通过 BiocParallel 的 `BPPARAM` 参数实现（`nCores` 已废弃）。
+
 ```{r}
-# 使用RNA counts矩阵（非SCT），AUCell内部会自行排名
+# 获取 RNA counts 稀疏矩阵（不要 as.matrix()，保持 dgCMatrix 节省内存）
 exprMatrix <- GetAssayData(seurat_obj, assay = "RNA", layer = "counts")
 
-# 构建排名矩阵（139K cells，需要较大内存）
-cells_rankings <- AUCell_buildRankings(exprMatrix, nCores = 4, plotStats = TRUE)
+message("Expression matrix: ", nrow(exprMatrix), " genes x ", ncol(exprMatrix), " cells")
+message("Matrix class: ", class(exprMatrix))
+```
+
+```{r}
+# 构建排名矩阵
+# - BPPARAM: 替代已废弃的 nCores，通过 BiocParallel 并行
+# - dgCMatrix 输入会自动启用 splitByBlocks，按块并行处理
+# - plotStats: 绘制基因检测数量分布（用于 QC）
+cells_rankings <- AUCell_buildRankings(
+  exprMatrix,
+  plotStats = TRUE,
+  BPPARAM = MulticoreParam(workers = 4)
+)
+```
+
+```{r}
+# 排名矩阵 QC：检查维度是否正确
+dim(cells_rankings)
 ```
 
 
 ## Calculate AUC Scores
 
+`aucMaxRank` 控制只考虑排名前 N% 的基因。默认 5% 是 scRNA-seq 的经验值——单细胞数据 dropout 严重，大多数基因不表达，真正活跃的基因集中在一小部分高表达基因中。
+
+注意：`AUCell_calcAUC()` 目前仍使用 `nCores` 进行并行（尚未迁移到 BiocParallel）。
+
 ```{r}
-# 计算AUC分数，aucMaxRank设为top 5%
 cells_AUC <- AUCell_calcAUC(
-  gene_set_collection,
+  gene_sets,
   cells_rankings,
-  aucMaxRank = nrow(cells_rankings) * 0.05
+  aucMaxRank = ceiling(nrow(cells_rankings) * 0.05),
+  nCores = 4
 )
 ```
 
+```{r}
+# 查看 AUC 结果概要
+cells_AUC
+```
 
-## Explore Thresholds
+
+## Explore Thresholds（可选）
+
+AUCell 可以自动探测每个基因集的"活跃"阈值——拟合混合分布模型寻找双峰拐点，将细胞二分为"活跃/不活跃"。
+
+这一步**耗时较长**（需要对每个基因集拟合 mixtools 模型），且下游分析通常直接使用连续 AUC 值，因此默认跳过。如果需要对特定通路做二分类（如标记"Th17 活跃细胞"），可取消注释运行。
+
+AUCell 可以自动探测每个基因集的"活跃"阈值。它拟合 AUC 分布，寻找双峰分布的拐点，将细胞二分为"活跃/不活跃"。
+
+这一步主要用于探索性分析，实际下游分析中通常直接使用连续的 AUC 值。因为是针对每一个基因、所以运行非常慢！！！⚠️⚠️⚠️⚠️可以考虑为可选项，并不影响后续的使用。
+其会对每一条pathway生成一个二分类的density plot.
+
+- 蓝线 (minimumDens) — AUC 分布密度曲线的拐点（最低点），适合双峰分布
+- 红线 (L_k2) — 两个正态分布混合模型的左分布边界（mixtools 拟合）
+- 粉线 (R_k3) — 三个正态分布混合模型的右分布边界
+
+它们都是在尝试回答同一个问题：AUC 值超过多少算"通路活跃"？ AUCell 会从中自动选一个最优阈值。
 
 ```{r}
+#| eval: false
 #| fig-width: 12
 #| fig-height: 8
 
-# 自动探索阈值（选取前几个通路展示）
-set.seed(42)
-example_sets <- head(names(gene_sets), 6)
+# 只对少量感兴趣的通路运行，不要对全部基因集跑（会非常慢）
 cells_assignment <- AUCell_exploreThresholds(
-  cells_AUC[example_sets, ],
+  cells_AUC[names(custom_sets), ],
   plotHist = TRUE,
-  assign = TRUE
+  assignCells = TRUE
 )
+```
+
+```{r}
+# 查看自动阈值和被分配为"活跃"的细胞数
+lapply(cells_assignment, function(x) {
+  list(
+    threshold = x$aucThr$selected,
+    n_active = length(x$assignment)
+  )
+})
 ```
 
 
 ## Add AUC to Seurat Metadata
 
 ```{r}
-# 提取AUC矩阵
+# 提取 AUC 矩阵
 auc_matrix <- getAUC(cells_AUC)
 
-# 清理通路名称，确保可以作为metadata列名
+# 清理通路名称，确保可以作为 metadata 列名
+# R 的 make.names() 会将非法字符替换为 "."
 rownames(auc_matrix) <- rownames(auc_matrix) %>%
   make.names() %>%
   gsub("-", "_", .)
 
-# 转置后添加到Seurat metadata
+# 转置后添加到 Seurat metadata
 auc_df <- as.data.frame(t(auc_matrix))
 seurat_obj <- AddMetaData(seurat_obj, metadata = auc_df)
+
+message(ncol(auc_df), " pathway scores added to metadata")
 ```
 
 
@@ -222,13 +281,13 @@ p_vln <- lapply(show_pathways, function(pw) {
 wrap_plots(p_vln, ncol = 2)
 ```
 
-### Heatmap（平均AUC per cell type）
+### Heatmap（平均 AUC per cell type）
 
 ```{r}
 #| fig-width: 14
 #| fig-height: 10
 
-# 计算每个细胞类型的平均AUC
+# 计算每个细胞类型的平均 AUC
 auc_cols <- intersect(colnames(auc_df), colnames(seurat_obj@meta.data))
 
 mean_auc <- seurat_obj@meta.data %>%
@@ -261,15 +320,21 @@ Heatmap(
 #| fig-width: 14
 #| fig-height: 10
 
-# 计算每个细胞类型中通路的平均AUC和活跃比例
-# 使用top30通路
+# 计算每个细胞类型中通路的平均 AUC 和活跃比例
+# 先计算每个通路的全局 75% 分位数作为阈值，这样不同细胞类型之间才有区分度
+global_thresholds <- seurat_obj@meta.data %>%
+  select(all_of(top30)) %>%
+  summarise(across(everything(), ~ quantile(.x, 0.75))) %>%
+  pivot_longer(everything(), names_to = "pathway", values_to = "threshold")
+
 dot_data <- seurat_obj@meta.data %>%
   select(cell_type, all_of(top30)) %>%
   pivot_longer(-cell_type, names_to = "pathway", values_to = "auc") %>%
+  left_join(global_thresholds, by = "pathway") %>%
   group_by(cell_type, pathway) %>%
   summarise(
     mean_auc = mean(auc),
-    pct_active = mean(auc > quantile(auc, 0.75)) * 100,  # 高于75%分位数视为活跃
+    pct_active = mean(auc > threshold[1]) * 100,
     .groups = "drop"
   )
 
@@ -310,7 +375,7 @@ wrap_plots(p_box, ncol = 2)
 #| fig-width: 14
 #| fig-height: 10
 
-p_ridge <- lapply(show_pathways[1:2], function(pw) {
+p_ridge <- lapply(show_pathways[1:min(2, length(show_pathways))], function(pw) {
   seurat_obj@meta.data %>%
     ggplot(aes(x = .data[[pw]], y = cell_type, fill = cell_type)) +
     geom_density_ridges(scale = 1.5, alpha = 0.7) +
@@ -326,8 +391,12 @@ wrap_plots(p_ridge, ncol = 2)
 
 ## Statistical Comparison
 
+### 1. Wilcoxon Test（单细胞水平，初筛）
+
+单细胞水平的统计检验需要注意：由于细胞数量巨大（>100K），几乎所有通路都会得到极小的 p 值。因此 **effect size（delta_auc）比 p 值更重要**，应优先关注 AUC 差异的生物学意义。
+
 ```{r}
-# 每个细胞类型、每个通路进行Wilcoxon检验（Normal vs Treatment）
+# 每个细胞类型、每个通路进行 Wilcoxon 检验（Normal vs Treatment）
 stat_results <- seurat_obj@meta.data %>%
   select(cell_type, group, all_of(auc_cols)) %>%
   pivot_longer(-c(cell_type, group), names_to = "pathway", values_to = "auc") %>%
@@ -339,15 +408,93 @@ stat_results <- seurat_obj@meta.data %>%
     ),
     mean_normal = mean(auc[group == "Normal"]),
     mean_treatment = mean(auc[group != "Normal"]),
+    delta_auc = mean_treatment - mean_normal,
     log2FC = log2((mean_treatment + 1e-10) / (mean_normal + 1e-10)),
     .groups = "drop"
   ) %>%
   mutate(p_adj = p.adjust(p_value, method = "BH")) %>%
   arrange(p_adj)
 
-# 查看显著结果
+# 查看显著且 effect size 较大的结果
 stat_results %>%
-  filter(p_adj < 0.05) %>%
+  filter(p_adj < 0.05, abs(delta_auc) > 0.01) %>%
+  head(20)
+```
+
+### 2. Pseudobulk + limma（样本水平，验证）
+
+单细胞 Wilcoxon 检验存在伪重复问题——来自同一个样本的细胞不是独立观测。Pseudobulk 按样本聚合后用 limma 做差异分析，是审稿人更认可的统计方法。两种方法结论一致的通路可信度最高。
+
+```{r}
+library(limma)
+
+# 按 cell_type × sample 计算每个通路的平均 AUC
+pseudobulk_auc <- seurat_obj@meta.data %>%
+  select(cell_type, group, orig.ident, all_of(auc_cols)) %>%
+  group_by(cell_type, group, orig.ident) %>%
+  summarise(across(all_of(auc_cols), mean), .groups = "drop")
+
+# 对每个细胞类型做 limma 差异分析
+limma_results <- lapply(unique(pseudobulk_auc$cell_type), function(ct) {
+  ct_data <- pseudobulk_auc %>% filter(cell_type == ct)
+
+  # 至少每组 2 个样本才能做 limma
+  if (min(table(ct_data$group)) < 2) return(NULL)
+
+  # 构建表达矩阵（pathway × sample）
+  mat <- ct_data %>%
+    select(all_of(auc_cols)) %>%
+    t()
+  colnames(mat) <- ct_data$orig.ident
+
+  # limma
+  grp <- factor(ct_data$group)
+  design <- model.matrix(~ 0 + grp)
+  colnames(design) <- levels(grp)
+
+  fit <- lmFit(mat, design)
+  treatment_name <- setdiff(levels(grp), "Normal")
+  contrast_str <- paste0(treatment_name, " - Normal")
+  contrast_mat <- makeContrasts(contrasts = contrast_str, levels = design)
+
+  fit2 <- contrasts.fit(fit, contrast_mat)
+  fit2 <- eBayes(fit2)
+
+  topTable(fit2, number = Inf) %>%
+    rownames_to_column("pathway") %>%
+    mutate(cell_type = ct)
+}) %>%
+  bind_rows()
+
+# 显著结果
+limma_results %>%
+  filter(adj.P.Val < 0.05) %>%
+  arrange(adj.P.Val) %>%
+  head(20)
+```
+
+### 比较两种方法的一致性
+
+```{r}
+# 合并 Wilcoxon 和 limma 结果
+comparison <- stat_results %>%
+  select(cell_type, pathway, wilcox_padj = p_adj, wilcox_delta = delta_auc) %>%
+  inner_join(
+    limma_results %>%
+      select(cell_type, pathway, limma_padj = adj.P.Val, limma_logFC = logFC),
+    by = c("cell_type", "pathway")
+  ) %>%
+  mutate(
+    wilcox_sig = wilcox_padj < 0.05,
+    limma_sig = limma_padj < 0.05,
+    both_sig = wilcox_sig & limma_sig,
+    consistent_direction = sign(wilcox_delta) == sign(limma_logFC)
+  )
+
+# 两种方法都显著且方向一致的通路——可信度最高
+comparison %>%
+  filter(both_sig, consistent_direction) %>%
+  arrange(limma_padj) %>%
   head(20)
 ```
 
@@ -357,10 +504,10 @@ stat_results %>%
 #| fig-width: 16
 #| fig-height: 12
 
-# 选取最显著的4个通路
+# 选取 effect size 最大的 4 个显著通路
 top_sig <- stat_results %>%
   filter(p_adj < 0.05) %>%
-  slice_head(n = 4) %>%
+  slice_max(abs(delta_auc), n = 4) %>%
   pull(pathway) %>%
   unique()
 
@@ -381,6 +528,108 @@ if (length(top_sig) > 0) {
 }
 ```
 
+### Waterfall Plot（特定细胞亚群通路变化）
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+
+# 筛选特定细胞亚群的显著通路，展示 delta AUC 方向和幅度
+target_ct <- "Recruited Macrophages"  # 替换为感兴趣的细胞亚群
+
+waterfall_data <- stat_results %>%
+  filter(cell_type == target_ct, p_adj < 0.05) %>%
+  mutate(
+    pathway = str_replace(pathway, "^HALLMARK_|^KEGG_|^REACTOME_", ""),
+    pathway = str_replace_all(pathway, "_", " "),
+    direction = ifelse(delta_auc > 0, "Up in QR056251", "Down in QR056251")
+  )
+
+if (nrow(waterfall_data) > 0) {
+  ggplot(waterfall_data, aes(x = reorder(pathway, delta_auc), y = delta_auc, fill = direction)) +
+    geom_col() +
+    coord_flip() +
+    scale_fill_manual(values = c("Up in QR056251" = "#E41A1C", "Down in QR056251" = "#377EB8")) +
+    theme_classic() +
+    labs(x = "", y = "Delta AUC (QR056251 - Model)",
+         title = paste0(target_ct, ": Pathway Changes"),
+         fill = "") +
+    theme(axis.text.y = element_text(size = 8))
+}
+```
+
+
+### Waterfall Plot（细胞亚群间通路比较）
+
+类似 SeuratExtend::WaterfallPlot 的思路：比较两个细胞亚群在所有通路上的 AUC 差异，按 logFC 排序展示。
+
+```{r}
+#| fig-width: 12
+#| fig-height: 10
+
+# 设置要比较的两个细胞亚群
+ident.1 <- "Recruited Macrophages"  # 替换为你的细胞亚群
+ident.2 <- "CD8 T cell"            # 替换为你的细胞亚群
+
+# 计算 t-score 和 Wilcoxon p-value
+# t-score = (mean1 - mean2) / SE，综合考虑均值差异和方差
+meta <- seurat_obj@meta.data
+cells_1 <- meta[meta$cell_type == ident.1, auc_cols, drop = FALSE]
+cells_2 <- meta[meta$cell_type == ident.2, auc_cols, drop = FALSE]
+
+waterfall_ct <- lapply(auc_cols, function(pw) {
+  x <- cells_1[[pw]]
+  y <- cells_2[[pw]]
+  tt <- t.test(x, y)
+  wt <- wilcox.test(x, y)
+  data.frame(
+    pathway = pw,
+    t_score = tt$statistic,
+    p_value = wt$p.value,
+    mean_1 = mean(x),
+    mean_2 = mean(y)
+  )
+}) %>%
+  bind_rows() %>%
+  mutate(
+    p_adj = p.adjust(p_value, method = "BH"),
+    sig = case_when(
+      p_adj < 0.001 ~ "***",
+      p_adj < 0.01  ~ "**",
+      p_adj < 0.05  ~ "*",
+      TRUE ~ "ns"
+    ),
+    direction = ifelse(t_score > 0, ident.1, ident.2),
+    pathway_label = str_replace(pathway, "^HALLMARK\\.|^KEGG\\.|^REACTOME\\.", ""),
+    pathway_label = str_replace_all(pathway_label, "\\.", " ")
+  ) %>%
+  arrange(t_score)
+
+# 取两端各 top N（显著优先）
+top_n <- 20
+waterfall_show <- bind_rows(
+  waterfall_ct %>% filter(p_adj < 0.05) %>% slice_head(n = top_n),
+  waterfall_ct %>% filter(p_adj < 0.05) %>% slice_tail(n = top_n)
+) %>%
+  distinct(pathway, .keep_all = TRUE) %>%
+  mutate(pathway_label = factor(pathway_label, levels = pathway_label[order(t_score)]))
+
+ggplot(waterfall_show, aes(x = pathway_label, y = t_score, fill = direction)) +
+  geom_col() +
+  geom_text(aes(label = sig,
+                hjust = ifelse(t_score > 0, -0.2, 1.2)),
+            size = 3) +
+  coord_flip() +
+  scale_fill_manual(values = setNames(c("#E41A1C", "#377EB8"), c(ident.1, ident.2))) +
+  theme_classic() +
+  labs(
+    x = "", y = "t-score",
+    title = paste0(ident.1, " vs ", ident.2, ": Pathway Activity"),
+    fill = "Higher in"
+  ) +
+  theme(axis.text.y = element_text(size = 7))
+```
+
 
 ## Delta AUC Heatmap
 
@@ -388,8 +637,8 @@ if (length(top_sig) > 0) {
 #| fig-width: 14
 #| fig-height: 10
 
-# 计算每个细胞类型中Treatment vs Normal的AUC差值
-delta_auc <- seurat_obj@meta.data %>%
+# 计算每个细胞类型中 Treatment vs Normal 的 AUC 差值
+delta_auc_data <- seurat_obj@meta.data %>%
   select(cell_type, group, all_of(top30)) %>%
   pivot_longer(-c(cell_type, group), names_to = "pathway", values_to = "auc") %>%
   group_by(cell_type, group, pathway) %>%
@@ -400,14 +649,13 @@ delta_auc <- seurat_obj@meta.data %>%
 group_levels <- unique(seurat_obj$group)
 treatment_group <- setdiff(group_levels, "Normal")
 
-delta_mat <- delta_auc %>%
+delta_mat <- delta_auc_data %>%
   mutate(delta = .data[[treatment_group]] - Normal) %>%
   select(cell_type, pathway, delta) %>%
   pivot_wider(names_from = cell_type, values_from = delta) %>%
   column_to_rownames("pathway") %>%
   as.matrix()
 
-# 蓝-白-红配色
 max_abs <- max(abs(delta_mat), na.rm = TRUE)
 
 Heatmap(
@@ -426,14 +674,14 @@ Heatmap(
 ## Save Results
 
 ```{r}
-# 保存更新后的Seurat对象
+# 保存更新后的 Seurat 对象（含 AUC metadata）
 qs2::qs_save(seurat_obj, "datasets/harmonized_seurat_AUCell.qs")
 
 # 导出统计结果
 write.csv(stat_results, "Results/AUCell_stat_results.csv", row.names = FALSE)
 
-# 导出AUC矩阵
+# 导出 AUC 矩阵
 write.csv(auc_df, "Results/AUCell_auc_matrix.csv", row.names = TRUE)
 
-message("AUCell分析完成！结果已保存。")
+message("AUCell 分析完成！")
 ```

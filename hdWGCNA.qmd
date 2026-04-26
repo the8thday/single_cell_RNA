@@ -3,7 +3,7 @@ title: "hdWGCNA Single-Cell Co-expression Network Analysis"
 format:
   html:
     toc: true
-    toc-depth: 2
+    toc-depth: 3
 ---
 
 
@@ -21,6 +21,73 @@ hdWGCNA (high-dimensional Weighted Gene Co-expression Network Analysis) 将经�
 **注意：** hdWGCNA 作者不推荐使用 SCTransform 归一化的数据，建议使用标准 `NormalizeData` 流程的 RNA assay。
 
 
+## 常见使用场景
+
+### 1. 疾病 vs. 正常的分子机制研究
+最主流的场景。在疾病组织（肿瘤、纤维化、神经退行性疾病等）的单细胞数据中，识别特定细胞类型内驱动疾病的共表达模块。
+
+> 典型数据：癌症患者 vs. 健康对照的 scRNA-seq，目标细胞类型如肿瘤相关巨噬细胞（TAM）、癌症相关成纤维细胞（CAF）。
+
+### 2. 细胞状态/亚型的转录调控网络解析
+当一种细胞类型存在多个亚群（如 M1/M2 巨噬细胞、耗竭 vs. 效应 T 细胞），hdWGCNA 可识别每种状态下激活的基因模块，揭示亚型背后的共表达程序。与单纯 marker gene 分析不同，hdWGCNA 捕捉的是**协同表达的基因群**，而非单个基因的差异。
+
+### 3. 多条件/多样本的比较研究
+有治疗前后、多个时间点或多种处理条件时，通过 **Module-Trait Correlation** 找到与特定条件系统性关联的模块，并通过 **Module Preservation** 检验模块是否在不同条件下保守。
+
+> 例：免疫治疗响应者 vs. 无响应者的 T 细胞共表达程序差异。
+
+### 4. 结合拟时序（Pseudotime）的发育/分化研究
+将 hdWGCNA 模块 eigengene 投影到 Monocle3/RNA velocity 的拟时序轨迹上，分析基因模块在分化过程中的激活/关闭顺序，识别驱动分化节点的调控程序。
+
+> 例：造血干细胞 → 单核细胞 → 巨噬细胞分化过程中，哪些基因模块依次被激活。
+
+### 5. 空间转录组学（Spatial Transcriptomics）
+hdWGCNA 支持 Visium 等空间数据，可在空间坐标下分析特定区域（如肿瘤核心 vs. 浸润边缘）的共表达网络，识别具有空间特异性的基因模块。
+
+### 6. 跨数据集/跨物种的模块保守性验证
+在一个数据集中建立模块后，用 **ModulePreservation** 在独立数据集（验证队列、其他物种）中检验模块的稳健性，增加结论可信度。
+
+### 7. 候选基因/靶点优先级排序
+通过 kME（module membership）排序，从大量差异基因中筛选出最"核心"的 hub 基因，作为后续功能验证（CRISPR、敲除）的优先靶点。
+
+
+## hdWGCNA 能回答的核心问题
+
+**hdWGCNA 不是用来找"哪些基因差异表达"的（那是 DEG 分析的任务），而是用来回答"差异背后，哪些基因协同工作、形成什么功能程序、与什么表型相关、哪个基因最核心"。** 它通常作为标准流程（降维 → 聚类 → 注释 → DEG）之后的深度机制挖掘步骤使用。
+
+**模块发现（"什么基因一起工作？"）**
+
+| 问题 | 对应分析 |
+|---|---|
+| 这种细胞类型内，基因是如何组织成协同表达程序的？ | `ConstructNetwork` → `GetModules` |
+| 每个模块的核心调控基因（hub genes）是哪些？ | `ModuleConnectivity` → `GetHubGenes` |
+| 这些模块在功能上代表什么生物学过程？ | `RunEnrichr`（GO / KEGG / Reactome 富集）|
+
+**模块-表型关联（"哪些基因程序与疾病/条件相关？"）**
+
+| 问题 | 对应分析 |
+|---|---|
+| 哪个基因模块与疾病状态（或治疗响应）最相关？ | `ModuleTraitCorrelation` |
+| 模块表达量是否随病情严重程度线性变化？ | trait 设置为连续变量（如评分、pseudotime） |
+| 某模块的表达是否在特定细胞亚群中富集？ | `ModuleFeaturePlot` / `ModuleExprScore` |
+
+**模块保守性（"这个网络结构是否稳健？"）**
+
+| 问题 | 对应分析 |
+|---|---|
+| 在疾病组中发现的模块，在正常组中是否也存在？ | `ModulePreservation` |
+| 小鼠数据中的模块，在人类数据中是否保守？ | 跨物种 `ModulePreservation` |
+| 该模块是否在独立验证队列中可重复？ | 独立数据集的 preservation 检验 |
+
+**基因优先化（"我应该关注哪些基因？"）**
+
+| 问题 | 对应分析 |
+|---|---|
+| 从数百个差异基因中，哪些是最值得功能验证的？ | kME 排序筛选 hub genes |
+| 某个已知关键基因属于哪个功能模块？ | 查询基因的模块归属和 kME 值 |
+| 多个细胞类型中是否有共同的基因出现在核心模块？ | 跨细胞类型 hub gene 比较 |
+
+
 ## Setup
 
 ```{r}
@@ -31,14 +98,14 @@ library(Seurat)
 library(hdWGCNA)
 library(ggplot2)
 library(tidyverse)  # includes dplyr
+library(cowplot)
 library(patchwork)
 library(qs2)
 
-# 注意：hdWGCNA 内部使用 WGCNA 自带的多线程，不建议同时启用 future multisession
-# 如需并行，仅在非 WGCNA 步骤中设置，或改用 allowWGCNAThreads()
-# plan("multisession", workers = 4)
-# options(future.globals.maxSize = 40 * 1024^3)
-WGCNA::allowWGCNAThreads(nThreads = 4)
+theme_set(theme_cowplot())
+
+# hdWGCNA 内部使用 WGCNA 自带的多线程，不建议同时启用 future multisession
+enableWGCNAThreads(nThreads = 4)
 
 set.seed(42)
 ```
@@ -62,9 +129,40 @@ table(seurat_obj$level1)
 ```
 
 
-## Subset Cells (Optional)
+## Pre-flight QC
 
-hdWGCNA 需要对特定细胞谱系构建网络。如果关注某个大类（如免疫细胞），可以先提取子集以减少计算量和提高信噪比。
+hdWGCNA 对细胞数量敏感。分析前必须检查每个 cell_type × sample 的细胞数，确保 metacell 构建有足够的细胞（每个分组至少需要 k 个细胞，通常 ≥50）。
+
+```{r}
+#| label: preflight-qc
+#| eval: false
+
+# 检查 cell_type × sample 的细胞数分布
+ct_sample_tbl <- table(seurat_obj$cell_type, seurat_obj$sample)
+ct_sample_tbl
+
+# 检查 cell_type × group 的分布（关注某些条件下是否有缺失或过少的亚型）
+ct_group_tbl <- table(seurat_obj$cell_type, seurat_obj$group)
+ct_group_tbl
+
+# 标记可能有问题的组合（< 50 cells）
+problematic <- which(ct_sample_tbl < 50 & ct_sample_tbl > 0, arr.ind = TRUE)
+if (nrow(problematic) > 0) {
+  message("Warning: the following cell_type x sample combinations have < 50 cells:")
+  for (i in seq_len(nrow(problematic))) {
+    message("  ", rownames(ct_sample_tbl)[problematic[i, 1]], " x ",
+            colnames(ct_sample_tbl)[problematic[i, 2]], " : ",
+            ct_sample_tbl[problematic[i, 1], problematic[i, 2]])
+  }
+}
+```
+
+
+## Subset Cells (Recommended)
+
+hdWGCNA 需要对特定细胞谱系构建网络。**强烈建议先 subset**，原因：`SetupForWGCNA` 的基因筛选（`fraction = 0.05`）是基于对象内所有细胞计算的。不 subset 会导致目标细胞类型的特异性基因被错误过滤。
+
+如果目标细胞类型存在多个亚型且某些亚型细胞数不足，建议合并同一谱系（如所有巨噬细胞亚型），再通过 `ModuleTraitCorrelation` 拆解亚型效应。
 
 ```{r}
 #| label: subset-cells
@@ -73,7 +171,7 @@ hdWGCNA 需要对特定细胞谱系构建网络。如果关注某个大类（如
 # === 方案1：使用全部数据（对所有细胞类型分别建网络） ===
 seurat_sub <- seurat_obj
 
-# === 方案2：提取特定谱系 ===
+# === 方案2：提取特定谱系（推荐：保证基因筛选和样本量的合理性） ===
 # seurat_sub <- subset(seurat_obj, level1 == "Immune")
 
 # === 方案3：提取特定细胞类型 ===
@@ -81,6 +179,7 @@ seurat_sub <- seurat_obj
 # seurat_sub <- subset(seurat_obj, cell_type %in% target_types)
 
 table(seurat_sub$cell_type)
+table(seurat_sub$cell_type, seurat_sub$sample)
 ```
 
 
@@ -116,8 +215,7 @@ seurat_sub <- SetupForWGCNA(
   seurat_obj = seurat_sub,
   gene_select = "fraction",
   fraction = 0.05,
-  wgcna_name = "hdwgcna_main",
-  seurat_assay = "RNA"
+  wgcna_name = "hdwgcna_main"
 )
 ```
 
@@ -134,11 +232,13 @@ Metacell 将转录组相似的单细胞聚合，减少 dropout 和噪声，稳�
 
 seurat_sub <- MetacellsByGroups(
   seurat_obj = seurat_sub,
-  group.by = c("cell_type", "sample"),  # 按细胞类型和样本分层
-  reduction = "harmony",                 # 使用harmony校正后的PCA
-  k = 25,                                # KNN邻居数，根据数据量调整（20-75）
-  max_shared = 10,
-  ident.group = "cell_type"
+  group.by = c("cell_type", "sample"),  # 按细胞类型和样本分层，避免跨类型/跨样本混合
+  reduction = "harmony",                 # 使用harmony校正后的PCA空间找KNN
+  k = 25,                                # KNN邻居数：每个metacell聚合~25个相似细胞
+                                          # 数据量大(>10k cells/type)可增加到50-75
+                                          # 每个cell_type x sample分组至少需要 k 个细胞
+  max_shared = 10,                        # 两个metacell之间最多共享10个细胞，避免过度重叠
+  ident.group = "cell_type"               # metacell的identity标签用cell_type
 )
 
 seurat_sub <- NormalizeMetacells(seurat_sub)
@@ -153,7 +253,7 @@ seurat_sub <- NormalizeMetacells(seurat_sub)
 seurat_sub <- ScaleMetacells(seurat_sub, features = VariableFeatures(seurat_sub))
 seurat_sub <- RunPCAMetacells(seurat_sub, features = VariableFeatures(seurat_sub))
 seurat_sub <- RunHarmonyMetacells(seurat_sub, group.by.vars = "sample")
-seurat_sub <- RunUMAPMetacells(seurat_sub, reduction = "harmony", dims = 1:20)
+seurat_sub <- RunUMAPMetacells(seurat_sub, reduction = "harmony", dims = 1:15)
 
 DimPlotMetacells(seurat_sub, group.by = "cell_type") +
   ggtitle("Metacell UMAP")
@@ -168,8 +268,12 @@ DimPlotMetacells(seurat_sub, group.by = "cell_type") +
 #| label: set-dat-expr
 #| eval: false
 
-# 替换为实际的目标细胞类型
+# !! 替换为实际的目标细胞类型 !!
+# 可以是单个类型，也可以合并多个亚型一起建网络
+# 单类型：适合每个 sample × group 细胞数 >50 的情况
+# 多类型：适合某些亚型在部分条件下细胞不足的情况（合并后通过 trait correlation 拆解差异）
 target_groups <- c("Alveolar Macrophages")
+# target_groups <- c("Alveolar Macrophages", "Interstitial Macrophages", "MregDC")
 
 seurat_sub <- SetDatExpr(
   seurat_obj = seurat_sub,
@@ -184,7 +288,9 @@ seurat_sub <- SetDatExpr(
 
 ## Soft Power Selection
 
-选择使网络近似无标度拓扑的最低 soft power（Scale Free Topology Model Fit ≥ 0.8）。
+选择使网络近似无标度拓扑的**最低** soft power（Scale Free Topology Model Fit ≥ 0.8）。
+
+**如何看图：** 左上角 R² 曲线首次达到 0.8 对应的 power 就是目标值。右侧三个 connectivity 图应该在该 power 处趋于平稳。在平台期内（如 7 vs. 8）选择差异极小，不影响下游结果。只有跨越太大（如 5 vs. 20）才会有显著差异。
 
 ```{r}
 #| label: test-soft-powers
@@ -193,7 +299,8 @@ seurat_sub <- SetDatExpr(
 seurat_sub <- TestSoftPowers(
   seurat_sub,
   networkType = "signed",
-  power_vector = 1:30
+  powers = c(seq(1, 10, by = 1), seq(12, 30, by = 2)),
+  corFnc = "bicor"
 )
 
 plot_list <- PlotSoftPowers(seurat_sub)
@@ -225,24 +332,27 @@ if (length(soft_power) == 0) {
 
 ## Construct Network
 
+`ConstructNetwork` 内部调用 WGCNA 的 `blockwiseConsensusModules`。以下参数控制模块的粒度和合并行为，应根据数据规模和生物学目标调整：
+
+- **`minModuleSize`** — 每个模块最少基因数（默认 50）。太小的模块生物学意义弱，太大则失去精度
+- **`mergeCutHeight`** — 合并相似模块的阈值（默认 0.25）。值越大合并越激进、模块越少
+- **`deepSplit`** — 树切割灵敏度（0-4，默认 2）。值越高切出的模块越多越细
+
 ```{r}
 #| label: construct-network
 #| eval: false
 
 tom_name <- paste0("tom_", gsub(" ", "_", target_groups[1]))
 
-if (is.null(soft_power)) {
-  seurat_sub <- ConstructNetwork(
-    seurat_sub,
-    tom_name = tom_name
-  )
-} else {
-  seurat_sub <- ConstructNetwork(
-    seurat_sub,
-    soft_power = soft_power,
-    tom_name = tom_name
-  )
-}
+seurat_sub <- ConstructNetwork(
+  seurat_sub,
+  soft_power = soft_power,       # 若为 NULL，函数会自动选择
+  tom_name = tom_name,
+  overwrite_tom = TRUE,
+  minModuleSize = 50,            # 模块最小基因数
+  mergeCutHeight = 0.25,         # 相似模块合并阈值（0-1，越大合并越多）
+  deepSplit = 2                  # 树切割灵敏度（0=保守, 4=激进）
+)
 ```
 
 
@@ -253,10 +363,19 @@ if (is.null(soft_power)) {
 # 模块树状图
 PlotDendrogram(seurat_sub,
                main = paste("hdWGCNA Dendrogram:", target_groups[1]))
+
+# 查看模块概况
+modules_summary <- GetModules(seurat_sub) %>%
+  filter(module != "grey") %>%
+  dplyr::count(module, name = "n_genes") %>%
+  arrange(desc(n_genes))
+modules_summary
 ```
 
 
 ## Module Eigengenes & Connectivity
+
+对每个模块，取模块内所有基因的表达矩阵做 PCA，第一主成分即为 module eigengene (ME)，代表该模块的整体表达趋势。`group.by.vars = "sample"` 不是逐样本跑，而是用 Harmony 对所有 ME 统一做批次校正（和 `RunHarmony` 逻辑相同）。
 
 ```{r}
 #| label: module-eigengenes
@@ -265,19 +384,21 @@ PlotDendrogram(seurat_sub,
 # 计算模块eigengenes，通过harmony校正批次效应
 seurat_sub <- ModuleEigengenes(
   seurat_sub,
-  group.by.vars = "sample"  # 批次变量
+  group.by.vars = "sample"  # 告诉Harmony"sample是批次变量"
 )
 
-hMEs <- GetMEs(seurat_sub)                     # 校正后的MEs
-MEs  <- GetMEs(seurat_sub, harmonized = FALSE) # 原始MEs
+hMEs <- GetMEs(seurat_sub)                     # Harmony校正后的MEs（推荐用于下游分析）
+MEs  <- GetMEs(seurat_sub, harmonized = FALSE) # 原始MEs（用于检查校正效果）
 ```
 
 
+hdWGCNA提供了ModuleConnectivity 函数，用于在完整的单细胞数据集(而不是metacell数据集)中计算基因的kME值。这个函数本质上是计算基因与模块特征基因之间的成对相关性。虽然技术上可以对整个数据集的所有细胞计算 kME，但建议仅在构建网络时所用的同一细胞群中计算，以保持结果的生物学一致性。
 ```{r}
 #| label: module-connectivity
 #| eval: false
 
-# 计算kME（基因与模块eigengene的相关性）
+# 计算kME（module membership）：每个基因与每个模块eigengene的相关性
+# kME越高，该基因在模块中越"核心"，用于排序hub genes
 seurat_sub <- ModuleConnectivity(
   seurat_sub,
   group.by = "cell_type",
@@ -294,11 +415,14 @@ seurat_sub <- ResetModuleNames(seurat_sub, new_name = "M")
 #| eval: false
 
 # kME分布图：展示每个模块top基因的连接度
+# 理想情况：每个模块都有一批高kME基因（>0.5），形成清晰的"核心基因"梯队
 PlotKMEs(seurat_sub, ncol = 4)
 ```
 
 
 ## Hub Genes
+
+Hub gene 是模块内 kME 值最高的基因——它与模块 eigengene 相关性最强，代表该模块的"核心调控者"。Hub genes 是后续功能验证（CRISPR 敲除、IHC 染色等）的优先候选靶点。Grey 模块代表未分配到任何模块的基因，应排除。
 
 ```{r}
 #| label: hub-genes
@@ -337,26 +461,64 @@ feature_plots <- ModuleFeaturePlot(
   order = TRUE
 )
 
-wrap_plots(feature_plots, ncol = 4)
+wrap_plots(feature_plots, ncol = 4) +
+  plot_annotation(title = "Module Eigengene (hMEs)")
+```
+
+
+### Module Correlogram
+
+模块间的相关性矩阵。如果两个模块高度相关（r > 0.8），说明可能应该合并（调高 `mergeCutHeight`）。理想情况下模块间应相对独立。
+
+```{r}
+#| label: module-correlogram
+#| eval: false
+
+# 模块间相关性矩阵，检查模块独立性
+ModuleCorrelogram(seurat_sub)
 ```
 
 
 ### Module Score (UCell)
+
+UCell scores 用于可视化和发文章，因为图更好看、更直观地展示"哪些细胞群高表达这个模块"
+
+UCell 是基于排序的非参数基因集打分方法，对噪声和极端值更鲁棒。与 ME 的区别：
+
+| | Module Eigengene (ME) | UCell Score |
+|---|---|---|
+| 方法 | PCA 第一主成分 | 基于排序的非参数打分 |
+| 输入 | 模块内所有基因 | 模块内 top N 基因（按 kME） |
+| 鲁棒性 | 受低表达基因影响 | 对噪声更稳健 |
+| 用途 | 统计分析（trait correlation 等） | 可视化（FeaturePlot 更干净、对比度更好） |
 
 ```{r}
 #| label: module-scores
 #| eval: false
 
 # 使用UCell计算模块表达分数（每个细胞）
+library(UCell)
 seurat_sub <- ModuleExprScore(
   seurat_sub,
   n_genes = 25,
   method = "UCell"
 )
+
+# 在UMAP上展示UCell scores（通常比ME的FeaturePlot更干净，适合发文章）
+score_plots <- ModuleFeaturePlot(
+  seurat_sub,
+  features = "scores",
+  order = "shuffle",
+  ucell = TRUE
+)
+wrap_plots(score_plots, ncol = 4) +
+  plot_annotation(title = "Module UCell Scores")
 ```
 
 
 ### Network Plot
+
+两种网络图：`ModuleNetworkPlot` 对每个模块单独画（内圈 hub genes，外圈其他基因），适合逐模块解读；`HubGeneNetworkPlot` 把所有模块的 hub genes 画在一张图上，模块内边用模块颜色、模块间边用灰色，展示模块间的交互全景。
 
 ```{r}
 #| label: module-network-plot
@@ -372,7 +534,9 @@ ModuleNetworkPlot(seurat_sub)
 #| label: hub-network-plot
 #| eval: false
 
-# 多模块hub基因的联合网络图
+# 多模块hub基因的联合网络图（模块内边=模块颜色，模块间边=灰色）
+# TOM矩阵可能很大，需要提高future全局变量大小限制
+options(future.globals.maxSize = 40 * 1024^3)
 HubGeneNetworkPlot(seurat_sub,
                     n_hubs = 10,
                     n_other = 5,
@@ -382,11 +546,13 @@ HubGeneNetworkPlot(seurat_sub,
 
 ### Module UMAP
 
+将 TOM（Topological Overlap Matrix）降维到 UMAP 空间。注意：这里的 UMAP **不是细胞的 UMAP**，而是**基因的 UMAP**——每个点是一个基因，距离近的基因共表达关系强，颜色代表模块归属。
+
 ```{r}
 #| label: module-umap
 #| eval: false
 
-# 将TOM矩阵降维到UMAP空间，展示基因模块的低维嵌入
+# 将TOM矩阵降维到UMAP空间，展示基因模块的低维嵌入（每个点=一个基因）
 seurat_sub <- RunModuleUMAP(
   seurat_sub,
   n_hubs = 10,
@@ -405,6 +571,119 @@ ModuleUMAPPlot(
 ```
 
 
+### Supervised Module UMAP (Optional)
+
+使用模块标签作为监督信号，可以获得更清晰的模块分离。`target_weight` 控制标签的影响权重（0 = 纯无监督，1 = 完全依赖标签）。
+
+```{r}
+#| label: supervised-module-umap
+#| eval: false
+
+seurat_sub <- RunModuleUMAP(
+  seurat_sub,
+  n_hubs = 10,
+  n_neighbors = 15,
+  min_dist = 0.1,
+  supervised = TRUE,
+  target_weight = 0.5
+)
+
+ModuleUMAPPlot(
+  seurat_sub,
+  edge_prop = 0.1,
+  sample_edges = TRUE,
+  edge.alpha = 0.25,
+  keep_grey_edges = FALSE,
+  label_hubs = 2
+)
+```
+
+
+## Module Eigengene Comparison Across Groups
+
+直接比较模块 eigengene 在不同条件间的分布差异。这是发文章时最直观的核心图之一。
+
+**注意：** 模块是从 target cell type 中发现的，ME 值会投射到所有细胞，但统计比较应限制在目标细胞类型内，避免其他细胞类型的投影值稀释信号。
+
+```{r}
+#| label: me-group-comparison
+#| eval: false
+
+# 将 harmonized MEs 添加到 metadata
+hMEs <- GetMEs(seurat_sub)
+me_cols <- colnames(hMEs)
+seurat_sub@meta.data <- cbind(seurat_sub@meta.data, hMEs)
+
+# 限制到目标细胞类型
+seurat_target <- subset(seurat_sub, cell_type %in% target_groups)
+
+# --- VlnPlot：每个模块的 eigengene 在不同 group 间的分布 ---
+vln_plots <- lapply(me_cols, function(me) {
+  VlnPlot(seurat_target, features = me, group.by = "group", pt.size = 0) +
+    geom_boxplot(width = 0.2, outlier.shape = NA, fill = "white", alpha = 0.7) +
+    theme(legend.position = "none") +
+    ggtitle(me)
+})
+wrap_plots(vln_plots, ncol = 4)
+
+# --- 统计检验：Kruskal-Wallis（≥3组）或 Wilcoxon（2组） ---
+# statsExpressions 底层调用 stats/PMCMRplus/effectsize，输出 tidy tibble
+library(statsExpressions)
+
+me_stats <- lapply(me_cols, function(me) {
+  df <- data.frame(
+    me_value = seurat_target@meta.data[[me]],
+    group = seurat_target$group
+  )
+  res <- two_sample_test(df, x = group, y = me_value, type = "nonparametric")
+  res %>% mutate(module = me)
+}) %>% bind_rows() %>%
+  arrange(p.value)
+
+me_stats
+```
+
+
+```{r}
+#| label: me-pairwise-comparison
+#| eval: false
+
+# --- Post-hoc 两两比较（≥3 组时必须） ---
+# Kruskal-Wallis 只告诉"三组之间有没有差异"
+# pairwise_comparisons 自动做 Dunn's test + p.adjust
+me_pairwise <- lapply(me_cols, function(me) {
+  df <- data.frame(
+    me_value = seurat_target@meta.data[[me]],
+    group = seurat_target$group
+  )
+  res <- pairwise_comparisons(df, x = group, y = me_value, type = "nonparametric",
+                               p.adjust.method = "BH")
+  res %>% mutate(module = me)
+}) %>% bind_rows()
+
+# 筛选显著的两两比较
+me_pairwise_sig <- me_pairwise %>% filter(p.value < 0.05)
+me_pairwise_sig
+
+# 保存完整结果
+dir.create("Results/hdwgcna", recursive = TRUE, showWarnings = FALSE)
+write.csv(me_pairwise, "Results/hdwgcna/me_pairwise_comparison.csv", row.names = FALSE)
+```
+
+
+```{r}
+#| label: me-dotplot
+#| eval: false
+
+# --- DotPlot：模块 eigengene 跨 cell_type × group 的表达模式 ---
+# 适用于多细胞类型分析时的全景展示
+DotPlot(seurat_sub, features = me_cols, group.by = "cell_type") +
+  RotatedAxis() +
+  coord_flip() +
+  ggtitle("Module Eigengenes Across Cell Types")
+```
+
+
 ## Module-Trait Correlation
 
 将模块 eigengene 与元数据中的表型/实验变量关联，识别与特定条件相关的模块。
@@ -414,13 +693,20 @@ ModuleUMAPPlot(
 #| eval: false
 
 # 选择关联的变量（需要是数值型或二分类因子）
-# 显式指定因子顺序，避免 as.numeric(factor()) 因 level 顺序不同而编码错误
-# !! 请按实际分组名称修改 levels（Control 应排在第一位，编码为 0）!!
-seurat_sub$group_numeric <- as.numeric(
-  factor(seurat_sub$group, levels = c("Normal", "Treatment"))
-) - 1
 
-traits <- c("nCount_RNA", "nFeature_RNA", "percent_mito", "group_numeric")
+# === 方案A：两组比较（如 Normal vs. Treatment） ===
+# 显式指定因子顺序，Control 编码为 0，Treatment 编码为 1
+# seurat_sub$group_numeric <- as.numeric(
+#   factor(seurat_sub$group, levels = c("Normal", "Treatment"))
+# ) - 1
+# traits <- c("nCount_RNA", "nFeature_RNA", "percent_mito", "group_numeric")
+
+# === 方案B：三组比较（如 Normal / Model / Drug），拆为二值变量 ===
+# 适用于药物干预实验：预期 Drug 逆转 Model → Normal，不是线性递增
+# 每个二值变量分别与模块做相关，不假设三组间有线性顺序
+seurat_sub$is_model <- as.numeric(seurat_sub$group == "Model")
+seurat_sub$is_QR056251 <- as.numeric(seurat_sub$group == "QR056251")
+traits <- c("nCount_RNA", "nFeature_RNA", "percent_mito", "is_model", "is_QR056251")
 
 seurat_sub <- ModuleTraitCorrelation(
   seurat_sub,
@@ -453,12 +739,16 @@ plt
 #| eval: false
 
 # 对模块基因做Enrichr富集
-# 常用数据库：GO_Biological_Process_2023, GO_Cellular_Component_2023,
-# GO_Molecular_Function_2023, KEGG_2021_Human, MSigDB_Hallmark_2020
-dbs <- c("GO_Biological_Process_2023",
-         "GO_Cellular_Component_2023",
-         "KEGG_2021_Human",
-         "Reactome_2022")
+# 注意：Enrichr 数据库版本由其服务器决定，无法自选版本
+# 建议优先使用下方 clusterProfiler 本地富集（数据库更新更及时、可复现）
+
+# === 人类数据 ===
+# dbs <- c("GO_Biological_Process_2023", "GO_Cellular_Component_2023",
+#          "GO_Molecular_Function_2023", "KEGG_2021_Human", "Reactome_2022")
+
+# === 小鼠数据 ===
+dbs <- c("GO_Biological_Process_2023", "GO_Cellular_Component_2023",
+         "GO_Molecular_Function_2023", "KEGG_2019_Mouse", "Reactome_2022")
 
 seurat_sub <- RunEnrichr(
   seurat_sub,
@@ -497,6 +787,154 @@ EnrichrBarPlot(
   n_terms = 10,
   plot_size = c(5, 7)
 )
+```
+
+
+### clusterProfiler Local Enrichment (Recommended)
+
+Enrichr 依赖外部 API，不稳定且不可复现。`clusterProfiler` 在本地运行 ORA，结果更可靠，适合发表。
+
+```{r}
+#| label: clusterprofiler-enrichment
+#| eval: false
+
+library(clusterProfiler)
+library(ReactomePA)
+
+# === 选择物种注释包 ===
+# 人类：library(org.Hs.eg.db); org_db <- org.Hs.eg.db; kegg_org <- "hsa"; reactome_org <- "human"
+# 小鼠：library(org.Mm.eg.db); org_db <- org.Mm.eg.db; kegg_org <- "mmu"; reactome_org <- "mouse"
+library(org.Mm.eg.db)
+org_db <- org.Mm.eg.db
+kegg_org <- "mmu"
+reactome_org <- "mouse"
+
+modules_tbl <- GetModules(seurat_sub) %>% filter(module != "grey")
+module_list <- split(modules_tbl$gene_name, modules_tbl$module)
+
+# --- GO enrichment（每个模块） ---
+go_results <- compareCluster(
+  geneClusters = module_list,
+  fun = "enrichGO",
+  OrgDb = org_db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+dotplot(go_results, showCategory = 5) + ggtitle("GO BP Enrichment by Module")
+
+# --- KEGG enrichment ---
+# 需要先将 SYMBOL 转换为 ENTREZID
+gene_id_map <- bitr(unique(modules_tbl$gene_name), fromType = "SYMBOL",
+                     toType = "ENTREZID", OrgDb = org_db)
+modules_entrez <- modules_tbl %>%
+  inner_join(gene_id_map, by = c("gene_name" = "SYMBOL"))
+module_list_entrez <- split(modules_entrez$ENTREZID, modules_entrez$module)
+
+kegg_results <- compareCluster(
+  geneClusters = module_list_entrez,
+  fun = "enrichKEGG",
+  organism = kegg_org,
+  pvalueCutoff = 0.05
+)
+dotplot(kegg_results, showCategory = 5) + ggtitle("KEGG Enrichment by Module")
+
+# --- Reactome enrichment ---
+reactome_results <- compareCluster(
+  geneClusters = module_list_entrez,
+  fun = "enrichPathway",
+  organism = reactome_org,
+  pvalueCutoff = 0.05
+)
+dotplot(reactome_results, showCategory = 5) + ggtitle("Reactome Enrichment by Module")
+```
+
+
+### Module Overlap with Known Gene Signatures
+
+将模块基因与 MSigDB Hallmark 等 curated gene sets 做重叠分析（Fisher exact test），快速判断模块的生物学定位。
+
+```{r}
+#| label: module-overlap-signatures
+#| eval: false
+
+library(msigdbr)
+
+# 获取 Hallmark gene sets
+# 人类用 "Homo sapiens"，小鼠用 "Mus musculus"
+hallmark <- msigdbr(species = "Mus musculus", category = "H") %>%
+  select(gs_name, gene_symbol) %>%
+  group_by(gs_name) %>%
+  summarise(genes = list(gene_symbol), .groups = "drop")
+
+# 对每个模块计算与每个 Hallmark 的 Fisher exact test overlap
+modules_tbl <- GetModules(seurat_sub) %>% filter(module != "grey")
+all_genes <- unique(modules_tbl$gene_name)
+module_list <- split(modules_tbl$gene_name, modules_tbl$module)
+
+overlap_results <- expand_grid(
+  module = names(module_list),
+  gs_name = hallmark$gs_name
+) %>%
+  rowwise() %>%
+  mutate(
+    module_genes = list(module_list[[module]]),
+    sig_genes = list(hallmark$genes[hallmark$gs_name == gs_name][[1]]),
+    overlap = list(intersect(module_genes, sig_genes)),
+    n_overlap = length(overlap),
+    p_value = fisher.test(
+      matrix(c(
+        n_overlap,
+        length(module_genes) - n_overlap,
+        length(sig_genes) - n_overlap,
+        length(all_genes) - length(module_genes) - length(sig_genes) + n_overlap
+      ), nrow = 2),
+      alternative = "greater"
+    )$p.value
+  ) %>%
+  ungroup() %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH")) %>%
+  select(module, gs_name, n_overlap, p_value, p_adj) %>%
+  filter(p_adj < 0.05) %>%
+  arrange(module, p_adj)
+
+overlap_results
+```
+
+
+### GSEA Alternative (fgsea)
+
+使用 kME 值作为排序统计量，用 fgsea 做基因集富集分析（GSEA），适合在整个网络层面而非单个模块层面做富集。
+
+```{r}
+#| label: gsea-fgsea
+#| eval: false
+
+library(fgsea)
+
+# 获取模块信息和kME值
+modules <- GetModules(seurat_sub) %>% filter(module != "grey")
+
+# 以某个模块为例，提取kME排序
+target_module <- "M1"  # 替换为实际模块名
+kme_col <- paste0("kME_", target_module)
+
+ranks <- setNames(modules[[kme_col]], modules$gene_name)
+ranks <- sort(ranks, decreasing = TRUE)
+
+# 加载通路数据库（GMT格式，可从 MSigDB 下载）
+# pathways <- fgsea::gmtPathways("path/to/c5.go.bp.v2023.2.Hs.symbols.gmt")
+
+# gsea_result <- fgsea::fgsea(
+#   pathways = pathways,
+#   stats = ranks,
+#   minSize = 10,
+#   maxSize = 500
+# )
+
+# gsea_result <- gsea_result[order(gsea_result$pval), ]
+# head(gsea_result, 20)
 ```
 
 
@@ -555,95 +993,105 @@ dir.create("Results/multi_celltype", recursive = TRUE, showWarnings = FALSE)
 multi_hub_tables <- list()
 multi_module_tables <- list()
 
+failed_types <- c()
+
 for (ct in valid_types) {
   wgcna_name <- paste0("hdwgcna_", gsub(" ", "_", ct))
   ct_safe <- gsub(" ", "_", ct)
 
-  seurat_sub <- SetupForWGCNA(
-    seurat_sub,
-    gene_select = "fraction",
-    fraction = 0.05,
-    wgcna_name = wgcna_name,
-    seurat_assay = "RNA"
-  )
+  tryCatch({
+    message("=== Starting hdWGCNA for: ", ct, " ===")
 
-  seurat_sub <- MetacellsByGroups(
-    seurat_sub,
-    group.by = c("cell_type", "sample"),
-    reduction = "harmony",
-    k = 25, max_shared = 10,
-    ident.group = "cell_type",
-    wgcna_name = wgcna_name
-  )
-  seurat_sub <- NormalizeMetacells(seurat_sub, wgcna_name = wgcna_name)
-
-  seurat_sub <- SetDatExpr(
-    seurat_sub,
-    group_name = ct,
-    group.by = "cell_type",
-    assay = "RNA",
-    layer = "data",
-    use_metacells = TRUE,
-    wgcna_name = wgcna_name
-  )
-
-  seurat_sub <- TestSoftPowers(seurat_sub, networkType = "signed",
-                               wgcna_name = wgcna_name)
-
-  power_table <- GetPowerTable(seurat_sub, wgcna_name = wgcna_name)
-  soft_power <- power_table %>%
-    filter(SFT.R.sq >= 0.8) %>%
-    slice_min(order_by = Power, n = 1, with_ties = FALSE) %>%
-    pull(Power)
-
-  if (length(soft_power) == 0) {
-    seurat_sub <- ConstructNetwork(
+    seurat_sub <- SetupForWGCNA(
       seurat_sub,
-      tom_name = paste0("tom_", ct_safe),
+      gene_select = "fraction",
+      fraction = 0.05,
       wgcna_name = wgcna_name
     )
-  } else {
-    seurat_sub <- ConstructNetwork(
+
+    seurat_sub <- MetacellsByGroups(
       seurat_sub,
-      soft_power = soft_power,
-      tom_name = paste0("tom_", ct_safe),
+      group.by = c("cell_type", "sample"),
+      reduction = "harmony",
+      k = 25, max_shared = 10,
+      ident.group = "cell_type",
       wgcna_name = wgcna_name
     )
-  }
+    seurat_sub <- NormalizeMetacells(seurat_sub, wgcna_name = wgcna_name)
 
-  seurat_sub <- ModuleEigengenes(
-    seurat_sub,
-    group.by.vars = "sample",
-    wgcna_name = wgcna_name
-  )
+    seurat_sub <- SetDatExpr(
+      seurat_sub,
+      group_name = ct,
+      group.by = "cell_type",
+      assay = "RNA",
+      layer = "data",
+      use_metacells = TRUE,
+      wgcna_name = wgcna_name
+    )
 
-  seurat_sub <- ModuleConnectivity(
-    seurat_sub,
-    group.by = "cell_type",
-    group_name = ct,
-    wgcna_name = wgcna_name
-  )
+    seurat_sub <- TestSoftPowers(seurat_sub, networkType = "signed",
+                                 wgcna_name = wgcna_name)
 
-  multi_module_tables[[ct]] <- GetModules(seurat_sub, wgcna_name = wgcna_name) %>%
-    mutate(cell_type = ct, wgcna_name = wgcna_name)
+    power_table <- GetPowerTable(seurat_sub, wgcna_name = wgcna_name)
+    sp <- power_table %>%
+      filter(SFT.R.sq >= 0.8) %>%
+      slice_min(order_by = Power, n = 1, with_ties = FALSE) %>%
+      pull(Power)
+    if (length(sp) == 0) sp <- NULL
 
-  multi_hub_tables[[ct]] <- GetHubGenes(seurat_sub, n_hubs = 20,
-                                        wgcna_name = wgcna_name) %>%
-    mutate(cell_type = ct, wgcna_name = wgcna_name)
+    seurat_sub <- ConstructNetwork(
+      seurat_sub,
+      soft_power = sp,
+      tom_name = paste0("tom_", ct_safe),
+      overwrite_tom = TRUE,
+      minModuleSize = 50,
+      mergeCutHeight = 0.25,
+      deepSplit = 2,
+      wgcna_name = wgcna_name
+    )
 
-  write.csv(
-    multi_module_tables[[ct]],
-    file = file.path("Results/multi_celltype", paste0(ct_safe, "_modules.csv")),
-    row.names = FALSE
-  )
+    seurat_sub <- ModuleEigengenes(
+      seurat_sub,
+      group.by.vars = "sample",
+      wgcna_name = wgcna_name
+    )
 
-  write.csv(
-    multi_hub_tables[[ct]],
-    file = file.path("Results/multi_celltype", paste0(ct_safe, "_hub_genes.csv")),
-    row.names = FALSE
-  )
+    seurat_sub <- ModuleConnectivity(
+      seurat_sub,
+      group.by = "cell_type",
+      group_name = ct,
+      wgcna_name = wgcna_name
+    )
 
-  message("Completed hdWGCNA for: ", ct)
+    multi_module_tables[[ct]] <- GetModules(seurat_sub, wgcna_name = wgcna_name) %>%
+      mutate(cell_type = ct, wgcna_name = wgcna_name)
+
+    multi_hub_tables[[ct]] <- GetHubGenes(seurat_sub, n_hubs = 20,
+                                          wgcna_name = wgcna_name) %>%
+      mutate(cell_type = ct, wgcna_name = wgcna_name)
+
+    write.csv(
+      multi_module_tables[[ct]],
+      file = file.path("Results/multi_celltype", paste0(ct_safe, "_modules.csv")),
+      row.names = FALSE
+    )
+
+    write.csv(
+      multi_hub_tables[[ct]],
+      file = file.path("Results/multi_celltype", paste0(ct_safe, "_hub_genes.csv")),
+      row.names = FALSE
+    )
+
+    message("Completed hdWGCNA for: ", ct)
+
+  }, error = function(e) {
+    message("FAILED for ", ct, ": ", conditionMessage(e))
+    failed_types <<- c(failed_types, ct)
+  })
+}
+
+if (length(failed_types) > 0) {
+  message("The following cell types failed: ", paste(failed_types, collapse = ", "))
 }
 
 multi_modules_tbl <- bind_rows(multi_module_tables)
@@ -671,12 +1119,53 @@ multi_hubs_tbl <- bind_rows(multi_hub_tables)
 ```
 
 
-## Save Results
+## Export & Save Results
 
 ```{r}
-#| label: save-results
+#| label: export-tables
 #| eval: false
 
+dir.create("Results/hdwgcna", recursive = TRUE, showWarnings = FALSE)
+
+# --- 模块基因分配表（含 kME） ---
+modules_full <- GetModules(seurat_sub)
+write.csv(modules_full, "Results/hdwgcna/all_modules_with_kME.csv", row.names = FALSE)
+
+# --- Hub 基因表 ---
+hub_full <- GetHubGenes(seurat_sub, n_hubs = 20)
+write.csv(hub_full, "Results/hdwgcna/hub_genes_top20.csv", row.names = FALSE)
+
+# --- Module Eigengene 矩阵 ---
+hMEs <- GetMEs(seurat_sub)
+write.csv(hMEs, "Results/hdwgcna/harmonized_module_eigengenes.csv")
+
+# --- Module-Trait Correlation 结果 ---
+mt_cor <- GetModuleTraitCorrelation(seurat_sub)
+for (group_name in names(mt_cor$cor)) {
+  cor_df <- as.data.frame(mt_cor$cor[[group_name]])
+  fdr_df <- as.data.frame(mt_cor$fdr[[group_name]])
+  write.csv(cor_df, paste0("Results/hdwgcna/trait_cor_", group_name, ".csv"))
+  write.csv(fdr_df, paste0("Results/hdwgcna/trait_fdr_", group_name, ".csv"))
+}
+
+# --- ME 统计检验结果 ---
+if (exists("me_stats")) {
+  write.csv(me_stats, "Results/hdwgcna/me_group_comparison_stats.csv", row.names = FALSE)
+}
+
+# --- Enrichr 结果 ---
+if (!is.null(tryCatch(GetEnrichrTable(seurat_sub), error = function(e) NULL))) {
+  enrich_full <- GetEnrichrTable(seurat_sub)
+  write.csv(enrich_full, "Results/hdwgcna/enrichr_all_results.csv", row.names = FALSE)
+}
+```
+
+
+```{r}
+#| label: save-seurat
+#| eval: false
+
+# 保存完整的 Seurat 对象（包含所有 hdWGCNA 结果）
 qs2::qs_save(seurat_sub, "datasets/hdwgcna_seurat.qs2")
 ```
 

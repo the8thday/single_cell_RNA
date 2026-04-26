@@ -293,6 +293,41 @@ netAnalysis_contribution(cellchat, signaling = pathways.show)
 ```
 
 
+#### Individual L-R Pair Visualization (Optional)
+
+```{r}
+#| label: plot-individual-lr
+#| eval: false
+
+# 提取该通路下所有显著的 L-R pair
+pairLR.use <- extractEnrichedLR(cellchat,
+                                signaling = pathways.show,
+                                geneLR.return = FALSE)
+pairLR.use
+
+# 方式1：直接取第一个显著 pair 进行展示
+LR.show <- pairLR.use[1, , drop = FALSE]
+
+# 方式2：按名字指定感兴趣的 pair
+# LR.show <- subset(pairLR.use, interaction_name == "TGFB1_TGFBR1_TGFBR2")
+
+# 单个 L-R pair 的圆形图
+netVisual_individual(cellchat,
+                     signaling = pathways.show,
+                     pairLR.use = LR.show,
+                     layout = "circle")
+
+# 单个 L-R pair 的层级图
+# vertex.receiver 需要根据你的细胞类型顺序调整
+vertex.receiver <- seq(1, min(4, nlevels(cellchat@idents)))
+netVisual_individual(cellchat,
+                     signaling = pathways.show,
+                     pairLR.use = LR.show,
+                     vertex.receiver = vertex.receiver,
+                     layout = "hierarchy")
+```
+
+
 #### Bubble Plot
 
 ```{r}
@@ -804,6 +839,67 @@ for (i in seq_along(cc_pair)) {
                       edge.weight.max = weight.max,
                       edge.width.max = 12,
                       signaling.name = paste(pathways.show, names(cc_pair)[i]))
+}
+```
+
+
+### Specific L-R Pair Comparison Within a Pathway (Optional)
+
+```{r}
+#| label: compare-specific-individual-lr
+#| eval: false
+
+pathways.show <- "TGFb"  # 替换为实际通路
+compare_pair <- c("Normal", "Model")  # 也可改为 c("Model", "QR056251")
+cc_pair <- cellchat_list[compare_pair]
+
+# 从参考条件中提取该通路下显著的 L-R pair
+pairLR.use <- extractEnrichedLR(cc_pair[[2]],
+                                signaling = pathways.show,
+                                geneLR.return = FALSE)
+pairLR.use
+
+# 方式1：直接展示第一个显著 pair
+LR.show <- pairLR.use[1, , drop = FALSE]
+
+# 方式2：按名字指定感兴趣的 pair
+# LR.show <- subset(pairLR.use, interaction_name == "TGFB1_TGFBR1_TGFBR2")
+
+lr_name <- LR.show$interaction_name[1]
+
+# 同一个 L-R pair 在两个条件中的圆形图对比
+par(mfrow = c(1, length(cc_pair)), xpd = TRUE)
+for (i in seq_along(cc_pair)) {
+  tryCatch({
+    plot_title <- paste(names(cc_pair)[i], pathways.show, lr_name, sep = " - ")
+    netVisual_individual(cc_pair[[i]],
+                         signaling = pathways.show,
+                         pairLR.use = LR.show,
+                         layout = "circle",
+                         signaling.name = plot_title)
+    title(main = plot_title, line = 1)
+  }, error = function(e) {
+    message("Skipped in ", names(cc_pair)[i], ": ", conditionMessage(e))
+  })
+}
+
+# 层级图对比
+# vertex.receiver 需要根据你的细胞类型顺序调整
+vertex.receiver <- seq(1, min(4, nlevels(cc_pair[[1]]@idents)))
+par(mfrow = c(1, length(cc_pair)), xpd = TRUE)
+for (i in seq_along(cc_pair)) {
+  tryCatch({
+    plot_title <- paste(names(cc_pair)[i], pathways.show, lr_name, sep = " - ")
+    netVisual_individual(cc_pair[[i]],
+                         signaling = pathways.show,
+                         pairLR.use = LR.show,
+                         vertex.receiver = vertex.receiver,
+                         layout = "hierarchy",
+                         signaling.name = plot_title)
+    title(main = plot_title, line = 1)
+  }, error = function(e) {
+    message("Skipped in ", names(cc_pair)[i], ": ", conditionMessage(e))
+  })
 }
 ```
 

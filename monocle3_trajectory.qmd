@@ -38,6 +38,28 @@ set.seed(42)
 ```
 
 
+## Group Config
+
+集中配置实验分组名称和配色，后续所有脚本从这里引用 — 换数据时只需改这一处。
+
+```{r}
+#| label: group-config
+
+# 实验分组名称（改这里即可影响下游所有分析）
+normal_group <- "Normal"
+model_group  <- "Model"
+drug_group   <- "QR056251"  # 替换为实际的药物/处理组名称，如 "Treatment"
+
+group_levels <- c(normal_group, model_group, drug_group)
+
+# 统一配色
+group_colors <- setNames(
+  c("#1F77B4", "#FF7F0E", "#2CA02C"),
+  group_levels
+)
+```
+
+
 ## Load Data
 
 ```{r}
@@ -334,7 +356,7 @@ p1 + p2 + p3 + plot_layout(ncol = 3)
 # 自定义分组颜色
 cds$group <- as.factor(cds$group)
 # 根据实际分组调整颜色（支持任意数量的分组）
-group_colors <- c("Normal" = "#1F77B4", "Model" = "#FF7F0E", "Treatment" = "#2CA02C")
+# group_colors 已在顶部 group-config 中定义，此处直接使用
 
 p_group <- plot_cells(cds,
                       color_cells_by = "group",
@@ -379,6 +401,21 @@ head(Track_genes_sig, 20)
 # 保存完整结果
 dir.create("Results", showWarnings = FALSE)
 write.csv(Track_genes, "Results/trajectory_DEG_graph_test.csv")
+
+# 同时保存为 qs2 格式，方便下次直接读取（graph_test 很慢，避免重复计算）
+qs2::qs_save(Track_genes, "datasets/Track_genes_graph_test.qs2")
+```
+
+```{r}
+#| label: graph-test-load
+#| eval: false
+
+# 下次分析时直接读取已保存的结果
+Track_genes <- qs2::qs_read("datasets/Track_genes_graph_test.qs2")
+
+Track_genes_sig <- Track_genes %>%
+  filter(q_value < 0.05) %>%
+  arrange(desc(morans_I))
 ```
 
 
@@ -425,6 +462,53 @@ plot_genes_in_pseudotime(cds[genes_of_interest, ],
                          color_cells_by = "group",
                          min_expr = 0.5,
                          ncol = 2)
+```
+
+```{r}
+#| label: plot-genes-bin-line
+#| eval: false
+
+# Pseudotime 分 bin 折线图：三组叠在同一张图，离散 bin 均值连线
+# 与 plot_genes_in_pseudotime 互补：更清晰地对比三组的分段动态差异
+library(tidyr)
+
+pt <- pseudotime(cds)
+
+# log1p 归一化表达（简化版，适合少量基因）
+expr <- as.data.frame(
+  t(log1p(as.matrix(assays(cds)$counts[genes_of_interest, ])))
+)
+colnames(expr) <- genes_of_interest
+
+expr$pt <- pt
+expr$group <- colData(cds)$group
+expr <- expr %>% filter(!is.infinite(pt) & !is.na(pt))
+
+# 分 20 个 bin
+expr$pt_bin <- cut(expr$pt, breaks = 20)
+
+expr_long <- expr %>%
+  pivot_longer(cols = all_of(genes_of_interest),
+               names_to = "gene",
+               values_to = "expression")
+
+expr_summary <- expr_long %>%
+  group_by(gene, pt_bin, group) %>%
+  summarise(expr = mean(expression), .groups = "drop")
+
+# group_colors 已在顶部 group-config 中定义，此处直接使用
+
+ggplot(expr_summary, aes(x = pt_bin, y = expr, color = group, group = group)) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~ gene, scales = "free_y", ncol = 2) +
+  scale_color_manual(values = group_colors) +
+  labs(title = "Gene Expression Across Pseudotime Bins (by Group)",
+       x = "Pseudotime (binned)", y = "Mean log-normalized expression") +
+  theme_bw(base_size = 14) +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        plot.title = element_text(face = "bold", hjust = 0.5),
+        strip.text = element_text(face = "bold.italic"))
 ```
 
 
@@ -812,8 +896,7 @@ pseudotime_df <- data.frame(
 # 密度图：分组比较（仅作可视化探索）
 ggplot(pseudotime_df, aes(x = pseudotime, fill = group)) +
   geom_density(alpha = 0.5) +
-  scale_fill_manual(values = c("Normal" = "cornflowerblue",
-                                "Treatment" = "firebrick")) +
+  scale_fill_manual(values = group_colors) +
   labs(title = "Pseudotime Distribution by Group",
        x = "Pseudotime", y = "Density") +
   theme_classic()
@@ -833,8 +916,7 @@ ggplot(pseudotime_df, aes(x = group, y = pseudotime, fill = group)) +
   geom_boxplot(outlier.size = 0.5, alpha = 0.7) +
   annotate("text", x = 1.5, y = max(pseudotime_df$pseudotime) * 0.95,
            label = p_label_cell, size = 4) +
-  scale_fill_manual(values = c("Normal" = "cornflowerblue",
-                                "Treatment" = "firebrick")) +
+  scale_fill_manual(values = group_colors) +
   labs(title = "Pseudotime Comparison (cell-level)",
        subtitle = "⚠ 细胞级检验易受大样本量和细胞组成差异影响，结果需谨慎解读") +
   theme_classic() +
@@ -866,8 +948,7 @@ ggplot(ct_data, aes(x = group, y = median_pseudotime, fill = group)) +
   geom_jitter(width = 0.1, size = 2) +
   annotate("text", x = 1.5, y = max(ct_data$median_pseudotime) * 0.95,
            label = p_label_sample, size = 4) +
-  scale_fill_manual(values = c("Normal" = "cornflowerblue",
-                                "Treatment" = "firebrick")) +
+  scale_fill_manual(values = group_colors) +
   labs(title = paste0("Pseudotime Comparison: ", target_ct, " (sample-level)"),
        subtitle = "Each point = one biological replicate (sample median)",
        y = "Median Pseudotime") +
@@ -884,8 +965,7 @@ ggplot(ct_data, aes(x = group, y = median_pseudotime, fill = group)) +
 ggplot(pseudotime_df, aes(x = pseudotime, fill = group)) +
   geom_density(alpha = 0.5) +
   facet_wrap(~ cell_type, scales = "free_y") +
-  scale_fill_manual(values = c("Normal" = "cornflowerblue",
-                                "Treatment" = "firebrick")) +
+  scale_fill_manual(values = group_colors) +
   labs(title = "Pseudotime Distribution by Cell Type and Group") +
   theme_classic() +
   theme(strip.text = element_text(size = 8))
@@ -946,9 +1026,24 @@ ggplot(vertex_df %>% filter(group == "Normal"),
 ```
 
 
-## Trajectory Gene Reversal Analysis
+## Trajectory Gene Reversal Analysis (Coarse Screen)
 
 在 `graph_test()` 显著基因中，筛选被药物逆转的基因：BLM 相对 Normal 发生变化，Drug 相对 BLM 方向相反。这一分析将轨迹变化基因与药物疗效关联起来。
+
+> **⚠️ 重要局限性（必读）：**
+>
+> 本节使用 `AggregateExpression(group.by = "group")` 将每组所有细胞一起平均，**没有控制细胞类型组成差异**。这会导致两类信号被混在一起：
+>
+> 1. **真信号**：在相同细胞状态下，基因表达确实被 Model 改变、被 Drug 逆转
+> 2. **伪信号**：基因表达和细胞状态强相关，Model 组只是因为**某些细胞类型比例升高**（如 Pro-fibrotic Mac），平均值被拉高；而非基因本身被上调
+>
+> **示例（Chil3）：** Normal 组少数末端巨噬细胞 Chil3 表达很高，但 Normal 组大多数细胞在早期 pseudotime（Chil3 低表达），所以整体平均仍然很低；Model 组末端细胞多，平均被拉高 — 这是**细胞组成驱动的伪逆转**，不是基因表达真的被药物调控。
+>
+> **使用建议：**
+> - 本节结果应视为**粗筛（screening）**，用来获得候选基因和通路
+> - **不要直接基于本节结果下"某个基因被药物逆转"的结论**
+> - 对重点基因必须用 **下一节 "Trajectory Gene Reversal Analysis (Cell-type Controlled)"** 或 GAM 折线图验证
+> - 富集分析的通路结论也会受此影响，需要用改进版交叉验证
 
 ```{r}
 #| label: reversal-gene-calc
@@ -970,8 +1065,8 @@ expr_mat <- AggregateExpression(seurat_sub,
 gene_dynamics <- data.frame(
   gene = rownames(expr_mat),
   Normal = expr_mat[, "Normal"],
-  BLM = expr_mat[, "Model"],
-  Drug = expr_mat[, "Treatment"]
+  Model = expr_mat[, "Model"],
+  Drug = expr_mat[, drug_group]
 ) %>%
   mutate(
     Model_vs_Normal = Model - Normal,
@@ -1008,7 +1103,7 @@ top_reversed <- reversed_genes %>%
   slice_max(abs(Model_vs_Normal), n = 50)
 
 # 提取表达矩阵并 scale
-heatmap_mat <- expr_mat[top_reversed$gene, c("Normal", "Model", "Treatment")]
+heatmap_mat <- expr_mat[top_reversed$gene, group_levels]
 heatmap_mat_scaled <- t(scale(t(heatmap_mat)))
 
 # 行注释：逆转类型
@@ -1030,10 +1125,14 @@ pheatmap::pheatmap(heatmap_mat_scaled,
 #| label: reversal-gene-enrichment
 #| eval: false
 
-# 对逆转基因分类做富集分析
+# 对逆转基因分类做富集分析（GO + KEGG + Reactome）
+library(ReactomePA)
+
 # Model 上调 → Drug 下调的基因（如纤维化相关）
+# reversal_ratio > 0.5: Drug 至少逆转了 Model 变化的 50%，聚焦真正被药物显著回调的基因
 blm_up_drug_down <- reversed_genes %>%
-  filter(category == "Model up -> Drug down") %>%
+  filter(category == "Model up -> Drug down",
+         reversal_ratio > 0.5) %>%
   pull(gene)
 
 eg_up <- bitr(blm_up_drug_down, fromType = "SYMBOL", toType = "ENTREZID",
@@ -1046,9 +1145,21 @@ go_up <- enrichGO(gene = eg_up$ENTREZID,
                   pvalueCutoff = 0.05,
                   readable = TRUE)
 
+kegg_up <- enrichKEGG(gene = eg_up$ENTREZID,
+                      organism = "mmu",
+                      pAdjustMethod = "BH",
+                      pvalueCutoff = 0.05)
+
+reactome_up <- enrichPathway(gene = eg_up$ENTREZID,
+                             organism = "mouse",
+                             pAdjustMethod = "BH",
+                             pvalueCutoff = 0.05,
+                             readable = TRUE)
+
 # Model 下调 → Drug 上调的基因（如正常功能恢复）
 blm_down_drug_up <- reversed_genes %>%
-  filter(category == "Model down -> Drug up") %>%
+  filter(category == "Model down -> Drug up",
+         reversal_ratio > 0.5) %>%
   pull(gene)
 
 eg_down <- bitr(blm_down_drug_up, fromType = "SYMBOL", toType = "ENTREZID",
@@ -1061,18 +1172,762 @@ go_down <- enrichGO(gene = eg_down$ENTREZID,
                     pvalueCutoff = 0.05,
                     readable = TRUE)
 
-# 可视化
-p1 <- dotplot(go_up, showCategory = 10) +
+kegg_down <- enrichKEGG(gene = eg_down$ENTREZID,
+                        organism = "mmu",
+                        pAdjustMethod = "BH",
+                        pvalueCutoff = 0.05)
+
+reactome_down <- enrichPathway(gene = eg_down$ENTREZID,
+                               organism = "mouse",
+                               pAdjustMethod = "BH",
+                               pvalueCutoff = 0.05,
+                               readable = TRUE)
+
+# 可视化：GO BP
+p1_go <- dotplot(go_up, showCategory = 10, label_format = 50) +
   scale_color_gradient(low = "firebrick3", high = "steelblue", name = "p.adjust") +
-  labs(title = "Model up \u2192 Drug down (e.g. fibrosis genes)") +
+  labs(title = "GO BP: Model up \u2192 Drug down (e.g. fibrosis genes)") +
   theme_dotplot()
 
-p2 <- dotplot(go_down, showCategory = 10) +
+p2_go <- dotplot(go_down, showCategory = 10, label_format = 50) +
   scale_color_gradient(low = "firebrick3", high = "steelblue", name = "p.adjust") +
-  labs(title = "Model down \u2192 Drug up (e.g. restored genes)") +
+  labs(title = "GO BP: Model down \u2192 Drug up (e.g. restored genes)") +
   theme_dotplot()
 
-p1 / p2
+p1_go / p2_go
+
+# 可视化：KEGG
+p1_kegg <- dotplot(kegg_up, showCategory = 10, label_format = 50) +
+  scale_color_gradient(low = "firebrick3", high = "steelblue", name = "p.adjust") +
+  labs(title = "KEGG: Model up \u2192 Drug down") +
+  theme_dotplot()
+
+p2_kegg <- dotplot(kegg_down, showCategory = 10, label_format = 50) +
+  scale_color_gradient(low = "firebrick3", high = "steelblue", name = "p.adjust") +
+  labs(title = "KEGG: Model down \u2192 Drug up") +
+  theme_dotplot()
+
+p1_kegg / p2_kegg
+
+# 可视化：Reactome
+p1_reac <- dotplot(reactome_up, showCategory = 10, label_format = 50) +
+  scale_color_gradient(low = "firebrick3", high = "steelblue", name = "p.adjust") +
+  labs(title = "Reactome: Model up \u2192 Drug down") +
+  theme_dotplot()
+
+p2_reac <- dotplot(reactome_down, showCategory = 10, label_format = 50) +
+  scale_color_gradient(low = "firebrick3", high = "steelblue", name = "p.adjust") +
+  labs(title = "Reactome: Model down \u2192 Drug up") +
+  theme_dotplot()
+
+p1_reac / p2_reac
+```
+
+
+## Trajectory Gene Reversal Analysis (Cell-type Controlled)
+
+**改进版：** 在每个细胞类型内部独立做 reversal 分析，避免细胞组成差异造成的伪信号。核心思想：**如果一个基因真的被药物调控（而非因为细胞组成变化"看起来被调控"），那么在相同的细胞状态下（同一细胞类型内），三组之间也应该有差异。**
+
+两步策略：
+1. **Per-cell-type reversal**：在每个细胞类型内部分别计算 Model vs Normal vs Drug
+2. **Robustness check**：找出在多个细胞类型中表现一致的"稳健逆转基因"，作为最可信的药物靶点
+
+```{r}
+#| label: reversal-celltype-calc
+#| eval: false
+
+# graph_test 显著基因（复用前面的 sig_genes）
+# sig_genes <- Track_genes_sig %>%
+#   filter(q_value < 0.01, morans_I > 0.25) %>%
+#   pull(gene_short_name) %>% as.character()
+
+cell_types <- unique(as.character(seurat_sub$cell_type))
+
+# 对每个细胞类型独立计算 Model vs Normal vs Drug
+reversal_ct <- lapply(cell_types, function(ct) {
+  sub <- subset(seurat_sub, subset = cell_type == ct)
+
+  # 检查三组都有足够细胞（避免单组细胞过少导致不稳定）
+  group_counts <- table(sub$group)
+  if (!all(group_levels %in% names(group_counts)) ||
+      any(group_counts[group_levels] < 20)) {
+    message("Skip ", ct, ": insufficient cells in one or more groups")
+    return(NULL)
+  }
+
+  expr <- AggregateExpression(sub,
+                              features = sig_genes,
+                              group.by = "group",
+                              assays = "RNA")$RNA
+  expr <- as.matrix(expr)
+
+  data.frame(
+    gene = rownames(expr),
+    cell_type = ct,
+    Normal = expr[, "Normal"],
+    Model = expr[, "Model"],
+    Drug = expr[, drug_group]
+  ) %>%
+    mutate(
+      Model_vs_Normal = Model - Normal,
+      Drug_vs_Model = Drug - Model,
+      reversed = sign(Model_vs_Normal) != sign(Drug_vs_Model) &
+                 sign(Model_vs_Normal) != 0 & sign(Drug_vs_Model) != 0,
+      reversal_ratio = ifelse(Model_vs_Normal != 0,
+                              -Drug_vs_Model / Model_vs_Normal, 0),
+      # 额外要求：Model vs Normal 的变化幅度不能太小（否则噪音容易造成虚假逆转）
+      abs_change = abs(Model_vs_Normal),
+      category = case_when(
+        !reversed ~ "Not reversed",
+        Model_vs_Normal > 0 & Drug_vs_Model < 0 ~ "Model up -> Drug down",
+        Model_vs_Normal < 0 & Drug_vs_Model > 0 ~ "Model down -> Drug up"
+      )
+    )
+}) %>% bind_rows()
+
+# 每个细胞类型内的严格逆转基因
+reversal_ct_strict <- reversal_ct %>%
+  filter(reversed,
+         reversal_ratio > 0.5,
+         abs_change > quantile(abs_change, 0.5, na.rm = TRUE))
+
+# 汇总：每个细胞类型的逆转基因数
+reversal_ct_strict %>%
+  count(cell_type, category) %>%
+  arrange(cell_type, category)
+```
+
+```{r}
+#| label: reversal-celltype-robust
+#| eval: false
+
+# 稳健性检验：在多个细胞类型中都表现一致逆转的基因 = 最可信的药物靶点
+# 要求同一基因在 ≥2 个细胞类型中被归为同一种逆转类别
+robust_reversed <- reversal_ct_strict %>%
+  group_by(gene, category) %>%
+  summarise(n_celltypes = n(),
+            celltypes = paste(cell_type, collapse = ", "),
+            mean_ratio = mean(reversal_ratio),
+            mean_change = mean(abs_change),
+            .groups = "drop") %>%
+  filter(n_celltypes >= 2) %>%
+  arrange(desc(n_celltypes), desc(mean_change))
+
+cat("Robust reversed genes (≥2 cell types):\n")
+cat("  Model up -> Drug down:", sum(robust_reversed$category == "Model up -> Drug down"), "\n")
+cat("  Model down -> Drug up:", sum(robust_reversed$category == "Model down -> Drug up"), "\n")
+
+head(robust_reversed, 20)
+
+# 细胞类型特异的逆转基因（只在单一细胞类型中被逆转，可能提示细胞类型特异靶点）
+celltype_specific_reversed <- reversal_ct_strict %>%
+  group_by(gene) %>%
+  filter(n() == 1) %>%
+  ungroup()
+
+cat("\nCell-type-specific reversed genes:", nrow(celltype_specific_reversed), "\n")
+```
+
+```{r}
+#| label: reversal-celltype-heatmap
+#| eval: false
+
+# 稳健逆转基因的热图：展示这些基因在不同细胞类型中都被药物逆转
+top_robust <- robust_reversed %>%
+  slice_max(mean_change, n = 40)
+
+# 构建基因 × (cell_type × group) 矩阵
+robust_mat_df <- reversal_ct %>%
+  filter(gene %in% top_robust$gene) %>%
+  select(gene, cell_type, Normal, Model, Drug) %>%
+  pivot_longer(cols = c(Normal, Model, Drug),
+               names_to = "group", values_to = "expr") %>%
+  mutate(col_id = paste(cell_type, group, sep = "_"))
+
+robust_mat <- robust_mat_df %>%
+  select(gene, col_id, expr) %>%
+  pivot_wider(names_from = col_id, values_from = expr) %>%
+  as.data.frame()
+rownames(robust_mat) <- robust_mat$gene
+robust_mat$gene <- NULL
+robust_mat <- as.matrix(robust_mat)
+
+# 按 cell_type → group 顺序排列列
+col_order <- expand.grid(group = c("Normal", "Model", "Drug"),
+                         cell_type = unique(reversal_ct$cell_type)) %>%
+  mutate(col_id = paste(cell_type, group, sep = "_")) %>%
+  pull(col_id)
+col_order <- col_order[col_order %in% colnames(robust_mat)]
+robust_mat <- robust_mat[, col_order]
+
+# 列注释
+col_anno <- data.frame(
+  cell_type = sub("_(Normal|Model|Drug)$", "", colnames(robust_mat)),
+  group = sub("^.*_(Normal|Model|Drug)$", "\\1", colnames(robust_mat)),
+  row.names = colnames(robust_mat)
+)
+
+# 行注释：逆转类别
+row_anno <- top_robust %>%
+  select(gene, category) %>%
+  as.data.frame()
+rownames(row_anno) <- row_anno$gene
+row_anno$gene <- NULL
+
+pheatmap::pheatmap(robust_mat,
+                   scale = "row",
+                   cluster_cols = FALSE,
+                   clustering_method = "ward.D2",
+                   annotation_col = col_anno,
+                   annotation_row = row_anno,
+                   color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+                   main = "Top 40 Robustly Reversed Genes\n(consistent across ≥2 cell types)",
+                   fontsize_row = 7,
+                   fontsize_col = 6,
+                   gaps_col = seq(3, ncol(robust_mat) - 3, by = 3))
+```
+
+```{r}
+#| label: reversal-celltype-enrichment
+#| eval: false
+
+# 对稳健逆转基因做富集分析（最可信的药物作用通路）
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(ReactomePA)
+
+robust_up <- robust_reversed %>%
+  filter(category == "Model up -> Drug down") %>%
+  pull(gene)
+
+robust_down <- robust_reversed %>%
+  filter(category == "Model down -> Drug up") %>%
+  pull(gene)
+
+cat("Robust Model up -> Drug down:", length(robust_up), "genes\n")
+cat("Robust Model down -> Drug up:", length(robust_down), "genes\n")
+
+# 富集：Model up -> Drug down
+if (length(robust_up) >= 10) {
+  eg_up <- bitr(robust_up, fromType = "SYMBOL", toType = "ENTREZID",
+                OrgDb = org.Mm.eg.db)
+
+  go_up_robust <- enrichGO(eg_up$ENTREZID, OrgDb = org.Mm.eg.db,
+                           ont = "BP", pAdjustMethod = "BH",
+                           pvalueCutoff = 0.05, readable = TRUE)
+  kegg_up_robust <- enrichKEGG(eg_up$ENTREZID, organism = "mmu",
+                                pAdjustMethod = "BH", pvalueCutoff = 0.05)
+  reac_up_robust <- enrichPathway(eg_up$ENTREZID, organism = "mouse",
+                                   pAdjustMethod = "BH", pvalueCutoff = 0.05,
+                                   readable = TRUE)
+
+  p_go <- dotplot(go_up_robust, showCategory = 15, label_format = 50) +
+    scale_color_gradient(low = "firebrick3", high = "steelblue", name = "p.adjust") +
+    labs(title = "Robust Model up \u2192 Drug down — GO BP") +
+    theme_dotplot()
+
+  p_kegg <- dotplot(kegg_up_robust, showCategory = 15, label_format = 50) +
+    scale_color_gradient(low = "firebrick3", high = "steelblue", name = "p.adjust") +
+    labs(title = "Robust Model up \u2192 Drug down — KEGG") +
+    theme_dotplot()
+
+  p_reac <- dotplot(reac_up_robust, showCategory = 15, label_format = 50) +
+    scale_color_gradient(low = "firebrick3", high = "steelblue", name = "p.adjust") +
+    labs(title = "Robust Model up \u2192 Drug down — Reactome") +
+    theme_dotplot()
+
+  print(p_go); print(p_kegg); print(p_reac)
+}
+
+# 富集：Model down -> Drug up
+if (length(robust_down) >= 10) {
+  eg_down <- bitr(robust_down, fromType = "SYMBOL", toType = "ENTREZID",
+                  OrgDb = org.Mm.eg.db)
+
+  go_down_robust <- enrichGO(eg_down$ENTREZID, OrgDb = org.Mm.eg.db,
+                             ont = "BP", pAdjustMethod = "BH",
+                             pvalueCutoff = 0.05, readable = TRUE)
+  kegg_down_robust <- enrichKEGG(eg_down$ENTREZID, organism = "mmu",
+                                  pAdjustMethod = "BH", pvalueCutoff = 0.05)
+  reac_down_robust <- enrichPathway(eg_down$ENTREZID, organism = "mouse",
+                                     pAdjustMethod = "BH", pvalueCutoff = 0.05,
+                                     readable = TRUE)
+
+  p_go2 <- dotplot(go_down_robust, showCategory = 15, label_format = 50) +
+    scale_color_gradient(low = "firebrick3", high = "steelblue", name = "p.adjust") +
+    labs(title = "Robust Model down \u2192 Drug up — GO BP") +
+    theme_dotplot()
+
+  p_kegg2 <- dotplot(kegg_down_robust, showCategory = 15, label_format = 50) +
+    scale_color_gradient(low = "firebrick3", high = "steelblue", name = "p.adjust") +
+    labs(title = "Robust Model down \u2192 Drug up — KEGG") +
+    theme_dotplot()
+
+  p_reac2 <- dotplot(reac_down_robust, showCategory = 15, label_format = 50) +
+    scale_color_gradient(low = "firebrick3", high = "steelblue", name = "p.adjust") +
+    labs(title = "Robust Model down \u2192 Drug up — Reactome") +
+    theme_dotplot()
+
+  print(p_go2); print(p_kegg2); print(p_reac2)
+}
+```
+
+```{r}
+#| label: reversal-pseudotime-bin
+#| eval: false
+
+# 第二种独立验证：pseudotime bin 内的 reversal 分析
+# 思路：在相同 pseudotime 位置（=相同细胞状态）比较三组，避免细胞组成差异的混淆
+# 与 cell-type 方法互补：cell_type 是离散标签，pseudotime_bin 是连续状态的离散化
+
+pt <- pseudotime(cds)
+pt <- pt[!is.na(pt) & !is.infinite(pt)]
+n_bins <- 10
+
+cell_meta <- data.frame(
+  cell = names(pt),
+  pt_bin = cut(pt, breaks = n_bins, labels = paste0("Bin", 1:n_bins)),
+  group = as.character(colData(cds)[names(pt), "group"])
+)
+
+# 获取 log-normalized 表达（只取 sig_genes，节省内存）
+sig_genes_in_cds <- intersect(sig_genes, rownames(cds))
+raw_counts <- counts(cds)[sig_genes_in_cds, cell_meta$cell]
+lib_size <- Matrix::colSums(counts(cds)[, cell_meta$cell])
+expr_norm <- log1p(sweep(raw_counts, 2, lib_size, "/") * 1e4)
+
+# 在每个 bin × group 内计算均值
+bin_group <- paste(cell_meta$pt_bin, cell_meta$group, sep = "_")
+unique_bg <- unique(bin_group)
+
+bin_mean_mat <- sapply(unique_bg, function(bg) {
+  cells <- cell_meta$cell[bin_group == bg]
+  if (length(cells) < 10) return(rep(NA, nrow(expr_norm)))
+  Matrix::rowMeans(expr_norm[, cells, drop = FALSE])
+})
+rownames(bin_mean_mat) <- sig_genes_in_cds
+
+# 在每个 bin 内独立做 reversal 判断
+bin_reversal <- lapply(paste0("Bin", 1:n_bins), function(b) {
+  cols_needed <- paste(b, group_levels, sep = "_")
+  if (!all(cols_needed %in% colnames(bin_mean_mat))) return(NULL)
+
+  m <- bin_mean_mat[, cols_needed]
+  m <- m[complete.cases(m), ]
+  if (nrow(m) == 0) return(NULL)
+
+  data.frame(
+    gene = rownames(m),
+    bin = b,
+    Model_vs_Normal = m[, 2] - m[, 1],
+    Drug_vs_Model = m[, 3] - m[, 2]
+  ) %>%
+    mutate(
+      reversed = sign(Model_vs_Normal) != sign(Drug_vs_Model) &
+                 sign(Model_vs_Normal) != 0 & sign(Drug_vs_Model) != 0,
+      category = case_when(
+        !reversed ~ "Not reversed",
+        Model_vs_Normal > 0 & Drug_vs_Model < 0 ~ "Model up -> Drug down",
+        Model_vs_Normal < 0 & Drug_vs_Model > 0 ~ "Model down -> Drug up"
+      )
+    )
+}) %>% bind_rows()
+
+# 在 ≥3 个 bin 中表现一致逆转的基因 = pseudotime-robust 基因
+bin_robust <- bin_reversal %>%
+  filter(reversed) %>%
+  group_by(gene, category) %>%
+  summarise(n_bins = n(), .groups = "drop") %>%
+  filter(n_bins >= 3) %>%
+  arrange(desc(n_bins))
+
+cat("Pseudotime-bin robust reversed genes (≥3 bins):", nrow(bin_robust), "\n")
+table(bin_robust$category)
+
+# 最终高置信度靶点：同时在 cell-type 和 pseudotime-bin 两种方法下都稳健
+final_targets <- intersect(robust_reversed$gene, bin_robust$gene)
+cat("\nHigh-confidence drug targets (validated by both methods):",
+    length(final_targets), "\n")
+print(final_targets)
+```
+
+**结果解读：**
+
+- **`robust_reversed`** — 在 ≥2 个细胞类型中一致逆转的基因，排除了细胞组成差异
+- **`bin_robust`** — 在 ≥3 个 pseudotime bin 中一致逆转的基因，排除了细胞状态位置的混淆
+- **`final_targets`** — 两种方法都支持的基因，**这些才是最可信的药物作用靶点**，可以放心用于文章主图和机制讨论
+- **`celltype_specific_reversed`** — 只在单一细胞类型中逆转，提示该细胞类型特异的药物靶点（也有价值，但解读时需注明"仅在 X 细胞类型中"）
+
+
+## Cell Type Composition Along Pseudotime
+
+将 pseudotime 分 bin，统计每个 bin 内各 cell_type 的比例，用堆叠面积图直观展示沿轨迹的细胞类型转换过程。
+
+```{r}
+#| label: celltype-composition-pseudotime
+#| eval: false
+
+# 构建 pseudotime 数据框
+pt_df <- data.frame(
+  pseudotime = pseudotime(cds),
+  cell_type = colData(cds)$cell_type,
+  group = colData(cds)$group
+) %>% filter(!is.infinite(pseudotime) & !is.na(pseudotime))
+
+# 将 pseudotime 分成等宽 bin
+n_bins <- 20
+pt_df$pt_bin <- cut(pt_df$pseudotime,
+                    breaks = n_bins,
+                    labels = FALSE,
+                    include.lowest = TRUE)
+
+# 计算每个 bin 内的细胞类型比例
+composition <- pt_df %>%
+  count(pt_bin, cell_type) %>%
+  group_by(pt_bin) %>%
+  mutate(proportion = n / sum(n)) %>%
+  ungroup()
+
+# 获取 bin 中心点（用于 x 轴）
+bin_centers <- pt_df %>%
+  group_by(pt_bin) %>%
+  summarise(pt_center = median(pseudotime), .groups = "drop")
+
+composition <- left_join(composition, bin_centers, by = "pt_bin")
+
+# 堆叠面积图
+ggplot(composition, aes(x = pt_center, y = proportion, fill = cell_type)) +
+  geom_area(alpha = 0.85, color = "white", linewidth = 0.3) +
+  labs(title = "Cell Type Composition Along Pseudotime",
+       x = "Pseudotime", y = "Proportion", fill = "Cell Type") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "right",
+        plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+```{r}
+#| label: celltype-composition-by-group
+#| eval: false
+
+# 按分组分面：观察不同条件下细胞类型转换有无差异
+composition_group <- pt_df %>%
+  count(pt_bin, cell_type, group) %>%
+  group_by(pt_bin, group) %>%
+  mutate(proportion = n / sum(n)) %>%
+  ungroup() %>%
+  left_join(bin_centers, by = "pt_bin")
+
+ggplot(composition_group, aes(x = pt_center, y = proportion, fill = cell_type)) +
+  geom_area(alpha = 0.85, color = "white", linewidth = 0.3) +
+  facet_wrap(~ group, ncol = 1) +
+  labs(title = "Cell Type Composition Along Pseudotime (by Group)",
+       x = "Pseudotime", y = "Proportion", fill = "Cell Type") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "right",
+        plot.title = element_text(face = "bold", hjust = 0.5),
+        strip.text = element_text(face = "bold", size = 12))
+```
+
+
+## Key Gene Trends by Group (GAM Smooth)
+
+选择关键基因（如 reversed genes 或 markers），用 GAM 拟合展示三组在同一张图上的表达趋势差异。比 `plot_genes_in_pseudotime` 更灵活，可同时比较多组。
+
+```{r}
+#| label: gene-gam-trends
+#| eval: false
+
+# 构建基因表达 + pseudotime 数据框
+pt <- pseudotime(cds)
+pt <- pt[!is.na(pt) & !is.infinite(pt)]
+
+# 选择感兴趣的基因（从 reversed genes 或 top trajectory genes 中选择）
+# 替换为实际基因名
+genes_to_plot <- c("Gene1", "Gene2", "Gene3", "Gene4")
+
+# 如果已有 reversed_genes，可直接取 top 基因：
+# genes_to_plot <- reversed_genes %>% head(4) %>% pull(gene)
+
+# 获取表达值
+raw_counts <- counts(cds)[genes_to_plot, names(pt)]
+lib_size <- Matrix::colSums(counts(cds)[, names(pt)])
+expr_norm <- log1p(sweep(raw_counts, 2, lib_size, "/") * 1e4)
+
+# 构建长格式数据框
+plot_df <- data.frame(
+  pseudotime = pt,
+  group = colData(cds)[names(pt), "group"]
+)
+
+for (gene in genes_to_plot) {
+  plot_df[[gene]] <- as.numeric(expr_norm[gene, ])
+}
+
+plot_long <- plot_df %>%
+  pivot_longer(cols = all_of(genes_to_plot),
+               names_to = "gene", values_to = "expression")
+
+# GAM smooth 趋势图
+# group_colors 已在顶部 group-config 中定义，此处直接使用
+
+ggplot(plot_long, aes(x = pseudotime, y = expression, color = group)) +
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"),
+              se = TRUE, alpha = 0.2, linewidth = 1) +
+  facet_wrap(~ gene, scales = "free_y", ncol = 2) +
+  scale_color_manual(values = group_colors) +
+  labs(title = "Gene Expression Trends Along Pseudotime",
+       x = "Pseudotime", y = "Log-normalized Expression", color = "Group") +
+  theme_classic(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        strip.text = element_text(face = "bold", size = 11),
+        legend.position = "bottom")
+```
+
+
+## Pseudotime Density: Group × Cell Type
+
+按 group × cell_type 交叉分面的 pseudotime 密度图。可以观察到特定细胞类型在不同条件下沿轨迹的分布变化，例如 Model 组的 Pro-fibrotic Mac 是否在 pseudotime 晚期富集、Drug 是否将其拉回。
+
+```{r}
+#| label: pseudotime-density-cross
+#| eval: false
+
+# 交叉分面密度图
+# group_colors 已在顶部 group-config 中定义，此处直接使用
+
+pt_df_cross <- data.frame(
+  pseudotime = pseudotime(cds),
+  cell_type = colData(cds)$cell_type,
+  group = colData(cds)$group
+) %>% filter(!is.infinite(pseudotime) & !is.na(pseudotime))
+
+ggplot(pt_df_cross, aes(x = pseudotime, fill = group)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~ cell_type, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = group_colors) +
+  labs(title = "Pseudotime Distribution: Group × Cell Type",
+       x = "Pseudotime", y = "Density") +
+  theme_classic(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        strip.text = element_text(face = "bold", size = 11),
+        legend.position = "bottom")
+```
+
+
+## Pseudotime Binning Heatmap
+
+将 pseudotime 分 bin，在每个 bin 内计算三组的基因表达均值，用热图展示基因随轨迹进程在不同条件下的表达模式。可以直观看到"在轨迹的哪个阶段，Drug 开始发挥作用"。
+
+```{r}
+#| label: pseudotime-bin-heatmap
+#| eval: false
+
+# 构建 pseudotime + group 信息
+pt <- pseudotime(cds)
+pt <- pt[!is.na(pt) & !is.infinite(pt)]
+
+# 分 bin
+n_bins <- 10
+pt_bins <- cut(pt, breaks = n_bins, labels = paste0("Bin", 1:n_bins),
+               include.lowest = TRUE)
+
+# 选择基因（使用 reversed genes 或 top trajectory genes）
+# 可替换为实际基因列表
+heatmap_genes <- Track_genes_sig %>%
+  head(50) %>%
+  pull(gene_short_name) %>%
+  as.character()
+
+# 获取表达矩阵并 log-normalize
+raw_counts <- counts(cds)[heatmap_genes, names(pt)]
+lib_size <- Matrix::colSums(counts(cds)[, names(pt)])
+expr_norm <- log1p(sweep(raw_counts, 2, lib_size, "/") * 1e4)
+
+# 构建 bin × group 的均值矩阵
+cell_info <- data.frame(
+  cell = names(pt),
+  bin = pt_bins,
+  group = colData(cds)[names(pt), "group"]
+)
+cell_info$bin_group <- paste(cell_info$bin, cell_info$group, sep = "_")
+
+# 按 bin_group 计算每个基因的均值
+bin_groups <- unique(cell_info$bin_group)
+mean_mat <- sapply(bin_groups, function(bg) {
+  cells <- cell_info$cell[cell_info$bin_group == bg]
+  if (length(cells) > 1) {
+    Matrix::rowMeans(expr_norm[, cells])
+  } else if (length(cells) == 1) {
+    as.numeric(expr_norm[, cells])
+  } else {
+    rep(NA, nrow(expr_norm))
+  }
+})
+rownames(mean_mat) <- heatmap_genes
+
+# 按 bin 编号排序列
+col_order <- cell_info %>%
+  distinct(bin_group, bin, group) %>%
+  arrange(bin, group) %>%
+  pull(bin_group)
+col_order <- col_order[col_order %in% colnames(mean_mat)]
+mean_mat <- mean_mat[, col_order]
+
+# 列注释
+col_anno <- cell_info %>%
+  distinct(bin_group, bin, group) %>%
+  filter(bin_group %in% col_order) %>%
+  arrange(match(bin_group, col_order)) %>%
+  as.data.frame()
+rownames(col_anno) <- col_anno$bin_group
+col_anno <- col_anno[, c("bin", "group"), drop = FALSE]
+
+# 热图
+pheatmap::pheatmap(mean_mat,
+                   scale = "row",
+                   cluster_cols = FALSE,
+                   clustering_method = "ward.D2",
+                   annotation_col = col_anno,
+                   color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+                   fontsize_row = 6,
+                   fontsize_col = 5,
+                   main = "Gene Expression Across Pseudotime Bins × Group",
+                   show_colnames = FALSE)
+```
+
+
+## Transcription Factor Activity Along Pseudotime
+
+从 graph_test 显著基因中筛选转录因子（TF），分析 TF 表达随 pseudotime 的变化。TF 是调控基因表达的关键上游因子，识别沿轨迹变化的 TF 有助于揭示驱动细胞命运决定的核心调控机制。
+
+```{r}
+#| label: tf-pseudotime
+#| eval: false
+
+# 方法1：使用已知转录因子数据库（AnimalTFDB 或手动提供 TF 列表）
+# 可从 AnimalTFDB4 下载鼠的 TF 列表：
+# http://bioinfo.life.hust.edu.cn/AnimalTFDB4/
+# 下载后读取：
+# tf_db <- read.csv("Mus_musculus_TF.txt", sep = "\t")
+# tf_genes <- tf_db$Symbol
+
+# 方法2：使用常见的巨噬细胞相关转录因子（替换为实际 TF 列表）
+tf_genes <- c("Spi1", "Maf", "Mafb", "Cebpb", "Cebpa", "Irf5", "Irf4",
+              "Stat1", "Stat3", "Nfkb1", "Rela", "Pparg", "Nr1h3",
+              "Hif1a", "Atf3", "Jun", "Fos", "Batf", "Runx1")
+
+# 与 graph_test 显著基因取交集
+tf_trajectory <- intersect(tf_genes, Track_genes_sig$gene_short_name)
+cat("Trajectory-associated TFs:", length(tf_trajectory), "\n")
+print(tf_trajectory)
+
+# 获取表达数据
+pt <- pseudotime(cds)
+pt <- pt[!is.na(pt) & !is.infinite(pt)]
+
+tf_in_cds <- tf_trajectory[tf_trajectory %in% rownames(cds)]
+
+if (length(tf_in_cds) > 0) {
+  raw_counts <- counts(cds)[tf_in_cds, names(pt)]
+  lib_size <- Matrix::colSums(counts(cds)[, names(pt)])
+  tf_expr <- log1p(sweep(raw_counts, 2, lib_size, "/") * 1e4)
+
+  # 构建长格式数据
+  tf_plot_df <- data.frame(
+    pseudotime = pt,
+    group = colData(cds)[names(pt), "group"]
+  )
+
+  for (tf in tf_in_cds) {
+    tf_plot_df[[tf]] <- as.numeric(tf_expr[tf, ])
+  }
+
+  tf_long <- tf_plot_df %>%
+    pivot_longer(cols = all_of(tf_in_cds),
+                 names_to = "TF", values_to = "expression")
+
+  # TF 趋势图
+  # group_colors 已在顶部 group-config 中定义，此处直接使用
+
+  ggplot(tf_long, aes(x = pseudotime, y = expression, color = group)) +
+    geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"),
+                se = FALSE, linewidth = 1) +
+    facet_wrap(~ TF, scales = "free_y", ncol = 4) +
+    scale_color_manual(values = group_colors) +
+    labs(title = "Transcription Factor Expression Along Pseudotime",
+         x = "Pseudotime", y = "Log-normalized Expression", color = "Group") +
+    theme_classic(base_size = 11) +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5),
+          strip.text = element_text(face = "bold.italic", size = 10),
+          legend.position = "bottom")
+}
+```
+
+```{r}
+#| label: tf-heatmap
+#| eval: false
+
+# TF 热图：三组中 trajectory TF 的表达比较
+if (length(tf_in_cds) >= 3) {
+  tf_agg <- AggregateExpression(seurat_sub,
+                                 features = tf_in_cds,
+                                 group.by = "group",
+                                 assays = "RNA")$RNA
+  tf_agg_scaled <- t(scale(t(as.matrix(tf_agg))))
+
+  pheatmap::pheatmap(tf_agg_scaled,
+                     cluster_cols = FALSE,
+                     clustering_method = "ward.D2",
+                     color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+                     main = "Trajectory-associated Transcription Factors",
+                     fontsize_row = 10)
+}
+```
+
+
+## Branch Expression Analysis
+
+如果轨迹存在分叉点（branch point），可以分析分叉前后的基因表达差异，揭示细胞在命运决定点的分子特征。如果轨迹没有明显分叉，可跳过此部分。
+
+```{r}
+#| label: branch-analysis
+#| eval: false
+
+# 检查分叉点数量
+graph <- principal_graph(cds)$UMAP
+degree_dist <- igraph::degree(graph)
+branch_points <- names(degree_dist[degree_dist > 2])
+cat("Number of branch points:", length(branch_points), "\n")
+
+# 如果有分叉点，提取分叉附近的细胞进行差异分析
+if (length(branch_points) > 0) {
+  # 获取每个细胞最近的主图节点
+  closest_vertex <- as.character(
+    cds@principal_graph_aux$UMAP$pr_graph_cell_proj_closest_vertex[, 1]
+  )
+  names(closest_vertex) <- colnames(cds)
+
+  # 获取分叉点附近的节点（距离 ≤ 2 步）
+  bp <- branch_points[1]  # 取第一个分叉点
+  neighbors <- igraph::neighborhood(graph, order = 2, nodes = bp)[[1]]
+  neighbor_names <- igraph::V(graph)$name[neighbors]
+
+  # 分叉附近的细胞
+  branch_cells <- names(closest_vertex[closest_vertex %in% neighbor_names])
+  cat("Cells near branch point:", length(branch_cells), "\n")
+
+  # 在 UMAP 上高亮分叉点附近的细胞
+  cds$near_branch <- ifelse(colnames(cds) %in% branch_cells, "Near branch", "Other")
+
+  plot_cells(cds,
+             color_cells_by = "near_branch",
+             label_cell_groups = FALSE,
+             show_trajectory_graph = TRUE) +
+    scale_color_manual(values = c("Near branch" = "firebrick", "Other" = "grey80")) +
+    ggtitle(paste0("Cells near branch point (n=", length(branch_cells), ")"))
+} else {
+  message("No branch points detected — trajectory is linear. Skipping branch analysis.")
+}
 ```
 
 
