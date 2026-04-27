@@ -1,113 +1,278 @@
 ---
-title: "Visium HD 工作流"
+title: "10x Visium HD Workflow"
 format: html
+execute:
+  eval: false
+  warning: false
+  message: false
 ---
 
 ## 简介
 
-Visium HD 是 10x 的高分辨率版（2µm × 2µm bins，分析常用 8µm 或 16µm bins）。和标准 Visium 的关键差异：
-- 每张切片 ~10⁶ bin，spot 数从 5k 跳到 1M+
-- 默认 bin 是 8µm
-- 必须用 BPCells 等 disk-backed 后端
+Visium HD 的 bin 数量远高于标准 Visium，不能简单把常规 SCT 流程照搬到 8 µm bin。这个模板使用 Seurat v5 + BPCells + sketch workflow：先在高分辨率 bin 上做 QC 和 log-normalization，再 sketch 聚类，最后投回全量数据。
 
-Seurat v5 原生支持： `Load10X_Spatial(..., bin.size = c(8, 16))`。
+## Setup
 
 ```{r}
-#| include: false
 library(Seurat)
 library(BPCells)
-library(future)
-library(ggplot2)
 library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(qs2)
+library(here)
 source(here::here("singlecell_utiles.R"))
-plan("multisession", workers = 4)
-options(future.globals.maxSize = 16 * 1024^3)
 ```
 
-## 数据加载
+## Project Configuration
 
 ```{r}
-#| eval: false
-hd_dir <- "/path/to/visium_hd_output/binned_outputs"
+cfg <- list(
+  hd_dir = "/path/to/visium_hd/outs",
+  bin_assay = "Spatial.008um",
+  compare_bin_assay = "Spatial.016um",
+  sample_col = "sample",
+  group_col = "group",
+  mt_pattern = "^MT-",
+  min_counts = 10,
+  min_features = 5,
+  max_percent_mt = 30,
+  sketch_n_cells = 50000,
+  dims = 1:30,
+  resolution = 0.4,
+  results_dir = "Results/visium_hd"
+)
+
+dir.create(cfg$results_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Load Visium HD
+
+```{r}
 hd <- Load10X_Spatial(
-  data.dir = hd_dir,
-  bin.size = c(8, 16),
+  data.dir = cfg$hd_dir,
+  assay = cfg$bin_assay,
+  slice = "hd8um",
   filter.matrix = TRUE
 )
-# bin 8 默认 active
-DefaultAssay(hd) <- "Spatial.008um"
+
+DefaultAssay(hd) <- cfg$bin_assay
+hd[["percent.mt"]] <- PercentageFeatureSet(hd, pattern = cfg$mt_pattern)
+hd[[cfg$sample_col]] <- basename(cfg$hd_dir)
+if (!cfg$group_col %in% colnames(hd@meta.data)) hd[[cfg$group_col]] <- "group_1"
+hd
 ```
 
 ## QC
 
 ```{r}
-#| eval: false
-hd[["percent.mt"]] <- PercentageFeatureSet(hd, pattern = "^mt-",
-                                           assay = "Spatial.008um")
-SpatialQCPlot(hd, features = c("nCount_Spatial.008um",
-                               "nFeature_Spatial.008um", "percent.mt"))
-hd <- subset(hd, subset = nCount_Spatial.008um > 10 & percent.mt < 30)
+qc_tbl <- hd@meta.data |>
+  tibble::rownames_to_column("bin") |>
+  summarise(
+    n_bins = n(),
+    median_counts = median(.data[[paste0("nCount_", cfg$bin_assay)]]),
+    median_features = median(.data[[paste0("nFeature_", cfg$bin_assay)]]),
+    p95_counts = quantile(.data[[paste0("nCount_", cfg$bin_assay)]], 0.95),
+    p95_percent_mt = quantile(percent.mt, 0.95)
+  )
+qc_tbl
+
+SpatialFeaturePlot(
+  hd,
+  features = c(paste0("nCount_", cfg$bin_assay), paste0("nFeature_", cfg$bin_assay), "percent.mt"),
+  ncol = 3
+)
 ```
 
-## 标准化（log-norm 推荐，SCTransform 太慢）
+## QC Decision Table
 
 ```{r}
-#| eval: false
-hd <- NormalizeData(hd, assay = "Spatial.008um")
-hd <- FindVariableFeatures(hd, assay = "Spatial.008um", nfeatures = 2000)
-hd <- ScaleData(hd, assay = "Spatial.008um")
-hd <- RunPCA(hd, assay = "Spatial.008um", reduction.name = "pca.008um", npcs = 30)
+hd_qc_decision_table <- tibble::tibble(
+  metric = c(paste0("nCount_", cfg$bin_assay), paste0("nFeature_", cfg$bin_assay), "percent.mt", "bin_size"),
+  current_rule = c(
+    paste(">=", cfg$min_counts),
+    paste(">=", cfg$min_features),
+    paste("<=", cfg$max_percent_mt),
+    cfg$bin_assay
+  ),
+  rationale = c(
+    "remove near-empty bins",
+    "remove bins with too little panel complexity",
+    "remove damaged/high-mito regions",
+    "8um for high-resolution discovery; 16um for stability review"
+  ),
+  reviewer_note = NA_character_
+)
+
+hd_qc_decision_table
 ```
 
-## 聚类（用 sketch / 子采样加速）
+```{r}
+hd <- subset(
+  hd,
+  cells = rownames(hd@meta.data)[
+    hd@meta.data[[paste0("nCount_", cfg$bin_assay)]] >= cfg$min_counts &
+      hd@meta.data[[paste0("nFeature_", cfg$bin_assay)]] >= cfg$min_features &
+      hd@meta.data$percent.mt <= cfg$max_percent_mt
+  ]
+)
+```
+
+## Normalize Without SCT
+
+SCT 在百万级 bin 上通常过慢。HD 主流程先用 log-normalization，必要时在聚合后的 cell / region 层面再做更复杂模型。
 
 ```{r}
-#| eval: false
-hd <- SketchData(hd, assay = "Spatial.008um", ncells = 50000,
-                 method = "LeverageScore", sketched.assay = "sketch")
+hd <- NormalizeData(hd, assay = cfg$bin_assay)
+hd <- FindVariableFeatures(hd, assay = cfg$bin_assay, nfeatures = 3000)
+```
+
+## Sketch Clustering
+
+```{r}
+hd <- SketchData(
+  object = hd,
+  ncells = cfg$sketch_n_cells,
+  method = "LeverageScore",
+  sketched.assay = "sketch"
+)
+
 DefaultAssay(hd) <- "sketch"
-hd <- FindVariableFeatures(hd) |> ScaleData() |> RunPCA(npcs = 30)
-hd <- FindNeighbors(hd, dims = 1:20) |>
-  FindClusters(resolution = 0.5)
-hd <- RunUMAP(hd, dims = 1:20, return.model = TRUE)
+hd <- FindVariableFeatures(hd)
+hd <- ScaleData(hd)
+hd <- RunPCA(hd, npcs = max(cfg$dims), verbose = FALSE)
+hd <- FindNeighbors(hd, dims = cfg$dims)
+hd <- FindClusters(hd, resolution = cfg$resolution)
+hd <- RunUMAP(hd, dims = cfg$dims, return.model = TRUE)
 
-# 投回完整数据
-hd <- ProjectData(hd,
-                  assay = "Spatial.008um",
-                  full.reduction = "pca.008um",
-                  sketched.assay = "sketch",
-                  sketched.reduction = "pca",
-                  umap.model = "umap",
-                  dims = 1:20,
-                  refdata = list(cluster_full = "seurat_clusters"))
+DimPlot(hd, reduction = "umap", group.by = "seurat_clusters", label = TRUE)
 ```
 
-## 可视化
+## Project Labels Back To Full Data
 
 ```{r}
-#| eval: false
-DefaultAssay(hd) <- "Spatial.008um"
-SpatialDimPlot(hd, group.by = "cluster_full", label = FALSE) +
-  theme(legend.position = "right")
+hd <- ProjectData(
+  object = hd,
+  assay = cfg$bin_assay,
+  full.reduction = "full.pca",
+  sketched.assay = "sketch",
+  sketched.reduction = "pca",
+  umap.model = "umap",
+  dims = cfg$dims,
+  refdata = list(cluster_full = "seurat_clusters")
+)
+
+DefaultAssay(hd) <- cfg$bin_assay
+SpatialDimPlot(hd, group.by = "cluster_full", label = FALSE)
 ```
 
-## 16µm bin（用于跨样本聚类比较）
+## Marker And Region Summaries
 
 ```{r}
-#| eval: false
-DefaultAssay(hd) <- "Spatial.016um"
-hd <- NormalizeData(hd, assay = "Spatial.016um")
-# ... 重复上面的流程
+Idents(hd) <- "cluster_full"
+hd_markers <- FindAllMarkers(
+  hd,
+  only.pos = TRUE,
+  min.pct = 0.05,
+  logfc.threshold = 0.1
+)
+
+hd_marker_top <- hd_markers |>
+  group_by(cluster) |>
+  slice_max(avg_log2FC, n = 10, with_ties = FALSE) |>
+  ungroup()
+
+SpatialFeaturePlot(hd, features = unique(head(hd_marker_top$gene, 8)), ncol = 4)
 ```
 
-## 注意事项
+## Cluster And Bin-Size Decision Table
 
-- Visium HD 必须 `library(BPCells)` 配合 `Load10X_Spatial`，否则内存爆掉
-- 全量聚类不可行，用 `SketchData` + `ProjectData`
-- `SCTransform` 在 1M+ bins 上太慢，用 `NormalizeData`
-- 多个 bin size assay 同时挂在对象上，操作前显式 `DefaultAssay()`
+```{r}
+hd_cluster_decision_table <- hd_marker_top |>
+  group_by(cluster) |>
+  summarise(top_markers = paste(head(gene, 10), collapse = ", "), .groups = "drop") |>
+  mutate(
+    spatial_coherence_8um = NA_character_,
+    agrees_with_16um = NA,
+    histology_label = NA_character_,
+    use_for_downstream = NA,
+    reviewer_note = NA_character_
+  )
 
-## 下游
+hd_cluster_decision_table
+```
 
-- 反卷积： Visium HD 的 8µm bin 已接近单细胞，可不必反卷积；如需反卷积用 RCTD `doublet_mode = "full"`
-- 与 scRNA 整合： `spatial_scRNA_integration.qmd`
+## 16 µm Bin Comparison
+
+更大 bin 常用于跨样本稳定比较。这里保留并行分析入口。
+
+```{r}
+hd16 <- Load10X_Spatial(
+  data.dir = cfg$hd_dir,
+  assay = cfg$compare_bin_assay,
+  slice = "hd16um",
+  filter.matrix = TRUE
+)
+DefaultAssay(hd16) <- cfg$compare_bin_assay
+hd16 <- NormalizeData(hd16)
+hd16 <- FindVariableFeatures(hd16)
+hd16 <- ScaleData(hd16)
+hd16 <- RunPCA(hd16, npcs = max(cfg$dims), verbose = FALSE)
+hd16 <- FindNeighbors(hd16, dims = cfg$dims)
+hd16 <- FindClusters(hd16, resolution = cfg$resolution)
+SpatialDimPlot(hd16, group.by = "seurat_clusters")
+```
+
+## Export
+
+```{r}
+readr::write_csv(qc_tbl, file.path(cfg$results_dir, "visium_hd_qc_summary.csv"))
+readr::write_csv(hd_markers, file.path(cfg$results_dir, "visium_hd_cluster_markers.csv"))
+qs2::qs_save(hd, file.path(cfg$results_dir, "visium_hd_8um_processed.qs2"))
+if (exists("hd16")) qs2::qs_save(hd16, file.path(cfg$results_dir, "visium_hd_16um_processed.qs2"))
+```
+
+## Output Contract
+
+```{r}
+hd_output_contract <- tibble::tribble(
+  ~artifact, ~file, ~used_by, ~description,
+  "8um processed object", "visium_hd_8um_processed.qs2", "SVG/domain/high-res maps", "full-resolution HD object with projected labels",
+  "16um processed object", "visium_hd_16um_processed.qs2", "stability review", "coarser bin object for cross-sample stability",
+  "QC decision table", "visium_hd_qc_decision_table.csv", "project review", "bin-level filter and bin-size decisions",
+  "cluster decision table", "visium_hd_cluster_decision_table.csv", "final interpretation", "marker, coherence, and bin-size agreement review"
+)
+
+hd_output_contract
+readr::write_csv(hd_qc_decision_table, file.path(cfg$results_dir, "visium_hd_qc_decision_table.csv"))
+readr::write_csv(hd_cluster_decision_table, file.path(cfg$results_dir, "visium_hd_cluster_decision_table.csv"))
+readr::write_csv(hd_output_contract, file.path(cfg$results_dir, "visium_hd_output_contract.csv"))
+```
+
+## Claim Evidence Table
+
+```{r}
+hd_claim_evidence <- tibble::tibble(
+  claim_id = c("HD1", "HD2"),
+  claim = c(
+    "High-resolution HD clusters are spatially coherent and marker-supported",
+    "8um findings remain interpretable under 16um stability review"
+  ),
+  evidence_table = c("visium_hd_cluster_decision_table.csv", "visium_hd_cluster_decision_table.csv"),
+  required_visual_check = c("SpatialDimPlot cluster_full and marker maps", "8um vs 16um cluster/marker comparison"),
+  caveat = c("sparse bins can fragment clusters", "bin-size changes can alter apparent boundaries"),
+  status = "to_review"
+)
+
+hd_claim_evidence
+readr::write_csv(hd_claim_evidence, file.path(cfg$results_dir, "visium_hd_claim_evidence_table.csv"))
+```
+
+## Interactive Review
+
+- 8 µm bin 是否太稀疏？是否需要使用 16 µm bin 作为主解释层？
+- cluster 是否空间连续，还是 sketch 投影造成碎裂？
+- marker 是否由少数高 count bin 驱动？
+- 是否需要把 HD bin 聚合到细胞 / histology region 后再做统计？
+- HD 后续可接 `spatial_SVG.qmd`、`spatial_domain.qmd`，但 deconvolution 参数要按 bin 尺度重设。

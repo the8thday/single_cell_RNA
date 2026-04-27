@@ -1,95 +1,297 @@
 ---
-title: "MERFISH / CosMx 工作流"
+title: "MERFISH And CosMx Workflow"
 format: html
+execute:
+  eval: false
+  warning: false
+  message: false
 ---
 
 ## 简介
 
-MERFISH（Vizgen）和 CosMx（Nanostring）是另两个亚细胞分辨率成像平台。和 Xenium 类似（每个 cell 一行），但 panel 大小、segmentation 策略、文件格式不同。
+MERFISH 和 CosMx 都是高分辨率成像平台，分析重点与 Visium 不同：细胞分割质量、panel 覆盖度、FOV / slide 批次、细胞类型标签和邻域结构更重要。本文件给出 Seurat v5 `ReadVizgen()` / `ReadNanostring()` 入口，并统一后续 QC、聚类、marker、邻域导出。
 
-Seurat v5：
-- MERFISH → `ReadVizgen()`
-- CosMx → `ReadNanostring()` 或 `LoadNanostring()`
+## Setup
 
 ```{r}
-#| include: false
 library(Seurat)
-library(future)
-library(ggplot2)
 library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(qs2)
+library(here)
 source(here::here("singlecell_utiles.R"))
-plan("multisession", workers = 4)
-options(future.globals.maxSize = 8 * 1024^3)
 ```
 
-## 数据加载：Vizgen MERFISH
+## Project Configuration
 
 ```{r}
-#| eval: false
-mer_dir <- "/path/to/vizgen_output"
-# Vizgen 输出：cell_by_gene.csv、cell_metadata.csv、cell_boundaries/
-mer_data <- ReadVizgen(data.dir = mer_dir, type = "centroids")
-mer <- CreateSeuratObject(counts = mer_data$transcripts, assay = "Vizgen")
-mer[["fov"]] <- CreateFOV(mer_data$centroids, type = "centroids")
+cfg <- list(
+  platform = "MERFISH",  # "MERFISH" or "CosMx"
+  merfish_dir = "/path/to/vizgen/output",
+  cosmx_dir = "/path/to/cosmx/output",
+  assay = "RNA",
+  fov = "fov",
+  sample_col = "sample",
+  condition_col = "group",
+  fov_col = "fov",
+  celltype_col = "cell_type",
+  min_counts = 20,
+  min_features = 10,
+  resolution = 0.4,
+  dims = 1:30,
+  marker_panel = c("EPCAM", "KRT8", "PTPRC", "COL1A1", "PECAM1"),
+  results_dir = "Results/merfish_cosmx"
+)
+
+dir.create(cfg$results_dir, recursive = TRUE, showWarnings = FALSE)
 ```
 
-## 数据加载：Nanostring CosMx
+## Load Data
+
+### Vizgen MERFISH
 
 ```{r}
-#| eval: false
-cosmx_dir <- "/path/to/cosmx_output"
-cosmx_data <- ReadNanostring(data.dir = cosmx_dir,
-                             mtx.file = "exprMat_file.csv",
-                             metadata.file = "metadata_file.csv",
-                             molecules.file = "tx_file.csv",
-                             segmentations.file = "polygons.csv",
-                             type = c("centroids", "segmentations"))
-cosmx <- CreateSeuratObject(counts = cosmx_data$matrix, assay = "Nanostring")
-cosmx[["fov"]] <- CreateFOV(cosmx_data$centroids,
-                            segmentations = cosmx_data$segmentations,
-                            type = c("centroids", "segmentations"))
+if (cfg$platform == "MERFISH") {
+  obj <- ReadVizgen(data.dir = cfg$merfish_dir, assay = cfg$assay)
+  obj$sample <- basename(cfg$merfish_dir)
+}
 ```
 
-## QC + 标准化（共用）
+### Nanostring CosMx
 
 ```{r}
-#| eval: false
-mer[["nCount"]] <- mer$nCount_Vizgen
-SpatialQCPlot(mer, features = c("nCount"))
-mer <- subset(mer, subset = nCount_Vizgen > 20)
-mer <- NormalizeData(mer) |>
-  FindVariableFeatures() |>
-  ScaleData() |>
-  RunPCA(npcs = 30) |>
-  FindNeighbors(dims = 1:20) |>
-  FindClusters(resolution = 0.5) |>
-  RunUMAP(dims = 1:20)
+if (cfg$platform == "CosMx") {
+  obj <- ReadNanostring(data.dir = cfg$cosmx_dir, assay = cfg$assay)
+  obj$sample <- basename(cfg$cosmx_dir)
+}
+
+if (!cfg$condition_col %in% colnames(obj@meta.data)) obj[[cfg$condition_col]] <- "group_1"
+if (!cfg$fov_col %in% colnames(obj@meta.data)) obj[[cfg$fov_col]] <- "fov_1"
+
+obj
 ```
 
-## 可视化
+## QC
 
 ```{r}
-#| eval: false
-ImageDimPlot(mer, fov = "fov", axes = TRUE)
-ImageFeaturePlot(mer, fov = "fov", features = head(VariableFeatures(mer), 4))
+count_col <- paste0("nCount_", cfg$assay)
+feature_col <- paste0("nFeature_", cfg$assay)
+
+qc_tbl <- obj@meta.data |>
+  tibble::rownames_to_column("cell") |>
+  summarise(
+    n_cells = n(),
+    median_counts = median(.data[[count_col]], na.rm = TRUE),
+    median_features = median(.data[[feature_col]], na.rm = TRUE),
+    p95_counts = quantile(.data[[count_col]], 0.95, na.rm = TRUE)
+  )
+qc_tbl
+
+VlnPlot(obj, features = c(count_col, feature_col), pt.size = 0, ncol = 2)
 ```
 
-## 平台差异速查
+## QC And Segmentation Decision Table
 
-| 维度 | MERFISH (Vizgen) | CosMx (Nanostring) | Xenium (10x) |
-|---|---|---|---|
-| 典型 panel | 140–500 | 1000–6000 | 300–5000 |
-| segmentation | DAPI + 膜 staining | DAPI + 膜 staining | DAPI（默认）/ multi-modal |
-| 加载函数 | `ReadVizgen` | `ReadNanostring` | `LoadXenium` |
-| 子细胞 transcript | `transcripts` | `molecules` | `transcripts` |
+```{r}
+qc_decision_table <- tibble::tibble(
+  metric = c(count_col, feature_col, "cell_boundary", "background_signal", "FOV_batch"),
+  current_rule = c(
+    paste(">=", cfg$min_counts),
+    paste(">=", cfg$min_features),
+    "manual segmentation review",
+    "panel/platform-specific review",
+    "composition and QC by FOV"
+  ),
+  reviewer_note = NA_character_
+)
 
-## 注意事项
+qc_decision_table
+```
 
-- 三平台 segmentation 失败 spot 比例不同；先看 `nCount` 分布
-- Vizgen 早期版本 cell ID 重复跨 FOV，加载后用 `paste0(fov, "_", cell)` 唯一化
-- CosMx 数据量极大，强烈建议 `load_bpcells = TRUE` 或 disk-backed assay
+```{r}
+obj <- subset(
+  obj,
+  cells = rownames(obj@meta.data)[
+    obj@meta.data[[count_col]] >= cfg$min_counts &
+      obj@meta.data[[feature_col]] >= cfg$min_features
+  ]
+)
+```
 
-## 下游
+## Normalization And Clustering
 
-- 标签迁移： `spatial_scRNA_integration.qmd`（同样适用于 imaging 平台）
-- 邻域分析： `spatial_niche.qmd`
+```{r}
+DefaultAssay(obj) <- cfg$assay
+obj <- NormalizeData(obj)
+obj <- FindVariableFeatures(obj)
+obj <- ScaleData(obj)
+obj <- RunPCA(obj, npcs = max(cfg$dims), verbose = FALSE)
+obj <- FindNeighbors(obj, dims = cfg$dims)
+obj <- FindClusters(obj, resolution = cfg$resolution)
+obj <- RunUMAP(obj, dims = cfg$dims)
+
+DimPlot(obj, reduction = "umap", group.by = "seurat_clusters", label = TRUE)
+```
+
+## Spatial Visualization
+
+不同版本 Seurat 成像对象的 FOV 命名可能不同，先检查 `Images(obj)`。
+
+```{r}
+Images(obj)
+ImageDimPlot(obj, fov = cfg$fov, group.by = "seurat_clusters", axes = TRUE)
+
+panel_genes <- intersect(cfg$marker_panel, rownames(obj))
+ImageFeaturePlot(obj, fov = cfg$fov, features = panel_genes, max.cutoff = "q95")
+```
+
+## Marker And Annotation
+
+```{r}
+Idents(obj) <- "seurat_clusters"
+marker_tbl <- FindAllMarkers(
+  obj,
+  only.pos = TRUE,
+  min.pct = 0.1,
+  logfc.threshold = 0.1
+)
+
+marker_top <- marker_tbl |>
+  group_by(cluster) |>
+  slice_max(avg_log2FC, n = 10, with_ties = FALSE) |>
+  ungroup()
+marker_top
+
+annotation_map <- tibble::tibble(
+  seurat_clusters = sort(unique(as.character(obj$seurat_clusters))),
+  cell_type = paste0("CellType_", seurat_clusters),
+  marker_support = NA_character_,
+  reviewer_note = NA_character_
+)
+
+obj@meta.data <- obj@meta.data |>
+  tibble::rownames_to_column("cell") |>
+  left_join(annotation_map, by = "seurat_clusters") |>
+  tibble::column_to_rownames("cell")
+```
+
+## Annotation Decision Table
+
+```{r}
+annotation_decision_table <- annotation_map |>
+  mutate(
+    positive_markers = NA_character_,
+    negative_markers = NA_character_,
+    panel_limitation = NA_character_,
+    spatial_location = NA_character_,
+    confidence = NA_character_,
+    use_for_downstream = NA
+  )
+
+annotation_decision_table
+```
+
+## FOV / Sample Composition
+
+```{r}
+composition_cols <- intersect(c(cfg$sample_col, cfg$celltype_col), colnames(obj@meta.data))
+composition_tbl <- obj@meta.data |>
+  count(across(all_of(composition_cols)), name = "n_cells") |>
+  group_by(across(all_of(setdiff(composition_cols, cfg$celltype_col)))) |>
+  mutate(frac_cells = n_cells / sum(n_cells)) |>
+  ungroup()
+composition_tbl
+```
+
+```{r}
+fov_composition_tbl <- obj@meta.data |>
+  tibble::rownames_to_column("cell") |>
+  count(.data[[cfg$sample_col]], .data[[cfg$condition_col]], .data[[cfg$fov_col]], .data[[cfg$celltype_col]], name = "n_cells") |>
+  group_by(.data[[cfg$sample_col]], .data[[cfg$fov_col]]) |>
+  mutate(frac_cells = n_cells / sum(n_cells)) |>
+  ungroup()
+
+fov_composition_tbl
+```
+
+## Neighborhood Hook
+
+```{r}
+neighbor_long <- NeighborComposition(obj, group_col = cfg$celltype_col, k = 20)
+neighbor_summary <- neighbor_long |>
+  group_by(group, neighbor_group) |>
+  summarise(mean_neighbor_fraction = mean(fraction), .groups = "drop") |>
+  arrange(desc(mean_neighbor_fraction))
+neighbor_summary
+```
+
+## Platform Differences
+
+```{r}
+platform_review <- tibble::tribble(
+  ~item, ~MERFISH, ~CosMx, ~review_note,
+  "input_loader", "ReadVizgen", "ReadNanostring", "Use native Seurat v5 loader",
+  "panel_bias", "panel-specific", "panel-specific", "Do not treat missing genes as absent biology",
+  "segmentation", "cell boundary dependent", "cell boundary dependent", "Review failed / edge cells",
+  "deconvolution", "skip", "skip", "Single-cell resolution; use neighborhood analysis instead"
+)
+platform_review
+```
+
+## Export
+
+```{r}
+readr::write_csv(qc_tbl, file.path(cfg$results_dir, paste0(cfg$platform, "_qc_summary.csv")))
+readr::write_csv(qc_decision_table, file.path(cfg$results_dir, paste0(cfg$platform, "_qc_decision_table.csv")))
+readr::write_csv(marker_tbl, file.path(cfg$results_dir, paste0(cfg$platform, "_cluster_markers.csv")))
+readr::write_csv(annotation_map, file.path(cfg$results_dir, paste0(cfg$platform, "_annotation_review_map.csv")))
+readr::write_csv(annotation_decision_table, file.path(cfg$results_dir, paste0(cfg$platform, "_annotation_decision_table.csv")))
+readr::write_csv(composition_tbl, file.path(cfg$results_dir, paste0(cfg$platform, "_composition.csv")))
+readr::write_csv(fov_composition_tbl, file.path(cfg$results_dir, paste0(cfg$platform, "_fov_composition.csv")))
+readr::write_csv(neighbor_summary, file.path(cfg$results_dir, paste0(cfg$platform, "_neighbor_summary.csv")))
+qs2::qs_save(obj, file.path(cfg$results_dir, paste0(tolower(cfg$platform), "_processed.qs2")))
+```
+
+## Output Contract
+
+```{r}
+platform_output_contract <- tibble::tribble(
+  ~artifact, ~file, ~used_by, ~description,
+  "processed object", paste0(tolower(cfg$platform), "_processed.qs2"), "niche, celltalk, report", "Seurat imaging object with annotations",
+  "QC decision table", paste0(cfg$platform, "_qc_decision_table.csv"), "project review", "filter and segmentation decisions",
+  "annotation decision table", paste0(cfg$platform, "_annotation_decision_table.csv"), "downstream labels", "marker/panel-supported annotation review",
+  "FOV composition", paste0(cfg$platform, "_fov_composition.csv"), "batch review", "cell type abundance by FOV"
+)
+
+platform_output_contract
+readr::write_csv(platform_output_contract, file.path(cfg$results_dir, paste0(cfg$platform, "_output_contract.csv")))
+```
+
+## Claim Evidence Table
+
+```{r}
+platform_claim_evidence <- tibble::tibble(
+  claim_id = c("IMG1", "IMG2"),
+  claim = c(
+    "Imaging-platform annotations are marker-supported within panel limits",
+    "Neighborhood patterns are robust to FOV/sample structure"
+  ),
+  evidence_table = c(paste0(cfg$platform, "_annotation_decision_table.csv"), paste0(cfg$platform, "_fov_composition.csv")),
+  required_visual_check = c("ImageFeaturePlot marker panel", "FOV composition and neighborhood heatmap"),
+  caveat = c("panel design limits biological scope", "segmentation/FOV artifacts can bias local neighborhoods"),
+  status = "to_review"
+)
+
+platform_claim_evidence
+readr::write_csv(platform_claim_evidence, file.path(cfg$results_dir, paste0(cfg$platform, "_claim_evidence_table.csv")))
+```
+
+## Interactive Review
+
+- panel 是否覆盖当前组织的关键 marker？
+- FOV / slide / batch 是否驱动 cluster？
+- 细胞分割低质量区域是否需要剔除？
+- annotation 是否有 marker 支持，还是只来自 unsupervised cluster？
+- 下游进入 `spatial_niche.qmd`，不做 spot deconvolution。

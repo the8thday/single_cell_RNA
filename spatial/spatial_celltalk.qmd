@@ -1,57 +1,102 @@
 ---
-title: "空间增强的细胞通讯"
+title: "Spatial Cell-Cell Communication"
 format: html
+execute:
+  eval: false
+  warning: false
+  message: false
 ---
 
 ## 简介
 
-普通的细胞通讯分析（CellChat / NicheNet）不考虑空间，但实际上 ligand-receptor 信号通常发生在邻近 spot 间。本文件覆盖：
-- **CellChat v2 spatial**（R，可跑）— 在 CellChat 中加入 spatial 距离约束
-- **COMMOT**（Python，仅参考）— 用最优传输直接在空间上估计信号流
+普通 CellChat / NicheNet 主要基于表达和细胞类型，默认不保证 sender 与 receiver 空间相邻。这个模板以 CellChat v2 spatial 为主线，把空间坐标、spot diameter 和距离约束纳入通讯推断，并增加 niche / region 层面的解释表。COMMOT 作为 Python-only 空间通讯工具保留参考接口。
+
+## Setup
 
 ```{r}
-#| include: false
 library(Seurat)
 library(SeuratData)
 library(CellChat)
-library(patchwork)
 library(dplyr)
+library(tidyr)
 library(ggplot2)
+library(patchwork)
 library(clusterProfiler)
 library(ReactomePA)
+library(org.Mm.eg.db)
+library(qs2)
+library(here)
 source(here::here("singlecell_utiles.R"))
 ```
 
-## 数据准备
+## Project Configuration
 
 ```{r}
-brain <- LoadData("stxBrain", type = "anterior1")
-brain <- SCTransform(brain, assay = "Spatial", verbose = FALSE) |>
-  RunPCA(assay = "SCT", verbose = FALSE) |>
-  FindNeighbors(dims = 1:20) |>
-  FindClusters(resolution = 0.4, verbose = FALSE)
-brain$celltype <- paste0("CT", brain$seurat_clusters)
-# Seurat v5: 取 data 前先 JoinLayers
-brain <- JoinLayers(brain, assay = "Spatial")
+cfg <- list(
+  demo_mode = TRUE,
+  spatial_path = "Results/spatial_niche/spatial_with_niches.qs2",
+  group_col = "dominant_celltype",
+  fallback_group_col = "seurat_clusters",
+  sample_col = "sample",
+  condition_col = "group",
+  assay = "SCT",
+  image_index = 1,
+  species = "mouse",
+  spot_diameter_um = 65,
+  interaction_length = 200,
+  scale_distance = 0.01,
+  min_cells = 10,
+  results_dir = "Results/spatial_celltalk"
+)
+
+dir.create(cfg$results_dir, recursive = TRUE, showWarnings = FALSE)
 ```
 
-## CellChat v2 spatial（可跑）
+## Load Data
 
 ```{r}
-data_input <- GetAssayData(brain, assay = "SCT", layer = "data")
-meta <- data.frame(labels = brain$celltype, row.names = colnames(brain))
+if (cfg$demo_mode) {
+  brain <- SeuratData::LoadData("stxBrain", type = "anterior1")
+  brain <- SCTransform(brain, assay = "Spatial", verbose = FALSE)
+  brain <- RunPCA(brain, verbose = FALSE)
+  brain <- FindNeighbors(brain, dims = 1:20)
+  brain <- FindClusters(brain, resolution = 0.4, verbose = FALSE)
+  brain$dominant_celltype <- paste0("CT", brain$seurat_clusters)
+  brain$sample <- "demo_sample"
+  brain$group <- "demo_group"
+} else {
+  brain <- qs2::qs_read(cfg$spatial_path)
+}
 
-# 空间坐标
-coords <- GetTissueCoordinates(brain@images[[1]])
-spatial_locs <- as.matrix(coords[, c("imagerow", "imagecol")])
+label_col <- if (cfg$group_col %in% colnames(brain@meta.data)) cfg$group_col else cfg$fallback_group_col
+table(brain[[label_col]][, 1]) |> sort(decreasing = TRUE)
+SpatialDimPlot(brain, group.by = label_col, label = TRUE)
+```
 
-# Visium 的 spot 物理大小（µm）
+## Build CellChat Spatial Object
+
+CellChat spatial 需要三件事同时正确：normalized expression、真实 coordinates、合理 scale factors。缺任何一个都容易退化成非空间通讯。
+
+```{r}
+brain <- JoinLayers(brain, assay = "Spatial")
+DefaultAssay(brain) <- cfg$assay
+
+data_input <- GetAssayData(brain, assay = cfg$assay, layer = "data")
+meta <- data.frame(
+  labels = brain[[label_col]][, 1],
+  sample = if (cfg$sample_col %in% colnames(brain@meta.data)) brain[[cfg$sample_col]][, 1] else "sample",
+  row.names = colnames(brain)
+)
+
+coords <- GetTissueCoordinates(brain@images[[cfg$image_index]])
+spatial_locs <- as.matrix(coords[colnames(brain), c("imagerow", "imagecol")])
+
 scale_factors <- list(
-  spot.diameter = 65,
-  spot = 65,
+  spot.diameter = cfg$spot_diameter_um,
+  spot = cfg$spot_diameter_um,
   fiducial = 0,
-  hires = brain@images[[1]]@scale.factors$hires,
-  lowres = brain@images[[1]]@scale.factors$lowres
+  hires = brain@images[[cfg$image_index]]@scale.factors$hires,
+  lowres = brain@images[[cfg$image_index]]@scale.factors$lowres
 )
 
 cellchat <- createCellChat(
@@ -62,66 +107,247 @@ cellchat <- createCellChat(
   coordinates = spatial_locs,
   scale.factors = scale_factors
 )
-cellchat@DB <- CellChatDB.mouse  # 小鼠数据
+
+cellchat@DB <- if (cfg$species == "human") CellChatDB.human else CellChatDB.mouse
 cellchat <- subsetData(cellchat)
+```
+
+## Infer Spatial Communication
+
+```{r}
 cellchat <- identifyOverExpressedGenes(cellchat)
 cellchat <- identifyOverExpressedInteractions(cellchat)
-cellchat <- computeCommunProb(cellchat,
-                              type = "truncatedMean", trim = 0.1,
-                              distance.use = TRUE,
-                              interaction.length = 200,
-                              scale.distance = 0.01)
-cellchat <- filterCommunication(cellchat, min.cells = 10)
+
+cellchat <- computeCommunProb(
+  cellchat,
+  type = "truncatedMean",
+  trim = 0.1,
+  distance.use = TRUE,
+  interaction.length = cfg$interaction_length,
+  scale.distance = cfg$scale_distance
+)
+
+cellchat <- filterCommunication(cellchat, min.cells = cfg$min_cells)
 cellchat <- computeCommunProbPathway(cellchat)
 cellchat <- aggregateNet(cellchat)
+cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "netP")
 ```
 
-可视化：
+## Network Overview
 
 ```{r}
-groupSize <- as.numeric(table(cellchat@idents))
-netVisual_circle(cellchat@net$weight, vertex.weight = groupSize,
-                 weight.scale = TRUE, label.edge = FALSE,
-                 title.name = "Interaction weights")
+group_size <- as.numeric(table(cellchat@idents))
+
+netVisual_circle(
+  cellchat@net$count,
+  vertex.weight = group_size,
+  weight.scale = TRUE,
+  label.edge = FALSE,
+  title.name = "Number of spatially plausible interactions"
+)
+
+netVisual_circle(
+  cellchat@net$weight,
+  vertex.weight = group_size,
+  weight.scale = TRUE,
+  label.edge = FALSE,
+  title.name = "Spatial communication strength"
+)
 ```
 
-## L-R pair 富集（含 Reactome）
+## Pathway And Pair Prioritization
 
 ```{r}
-top_lr <- subsetCommunication(cellchat) |>
+pathway_rank <- rankNet(cellchat, mode = "single", return.data = TRUE) |>
+  arrange(desc(contribution))
+head(pathway_rank, 30)
+
+lr_tbl <- subsetCommunication(cellchat) |>
   arrange(desc(prob)) |>
-  head(50)
-genes_in_top <- unique(c(top_lr$ligand, top_lr$receptor))
-entrez <- clusterProfiler::bitr(genes_in_top, fromType = "SYMBOL",
-                                toType = "ENTREZID", OrgDb = "org.Mm.eg.db")$ENTREZID
-ereact <- ReactomePA::enrichPathway(gene = entrez, organism = "mouse")
-dotplot(ereact, showCategory = 15) + ggtitle("Reactome enrichment of top L-R pairs")
+  mutate(
+    sender_receiver = paste(source, target, sep = " -> "),
+    lr_key = paste(ligand, receptor, sep = "_")
+  )
+head(lr_tbl, 30)
+
+top_pathway <- pathway_rank$name[1]
+netVisual_aggregate(cellchat, signaling = top_pathway, layout = "spatial")
+netVisual_bubble(cellchat, signaling = top_pathway, remove.isolate = TRUE)
 ```
 
-## COMMOT（Python，仅参考）
+## Spatial Plausibility Review
+
+用 sender / receiver 的空间邻近性复核高分通讯。这里输出人工复核表，避免只按 CellChat 分数排序。
+
+```{r}
+communication_review <- lr_tbl |>
+  group_by(pathway_name, sender_receiver) |>
+  summarise(
+    n_pairs = n(),
+    max_prob = max(prob),
+    top_lr = paste(head(lr_key, 5), collapse = ", "),
+    .groups = "drop"
+  ) |>
+  arrange(desc(max_prob)) |>
+  mutate(
+    spatially_adjacent = NA,
+    expression_validated = NA,
+    keep_for_story = NA,
+    reviewer_note = NA_character_
+  )
+communication_review
+```
+
+## Sender Receiver Summary
+
+```{r}
+sender_receiver_summary <- lr_tbl |>
+  group_by(source, target, pathway_name) |>
+  summarise(
+    n_lr_pairs = n(),
+    max_prob = max(prob),
+    mean_prob = mean(prob),
+    top_lr = paste(head(lr_key, 3), collapse = ", "),
+    .groups = "drop"
+  ) |>
+  arrange(desc(max_prob))
+
+sender_receiver_summary
+```
+
+## Communication Decision Table
+
+```{r}
+communication_decision_table <- communication_review |>
+  mutate(
+    sender_marker_support = NA_character_,
+    receiver_marker_support = NA_character_,
+    spatial_distance_support = spatially_adjacent,
+    condition_relevance = NA_character_,
+    use_for_final_story = keep_for_story
+  )
+
+communication_decision_table
+```
+
+## Ligand-Receptor Gene Enrichment
+
+Repo 约定：涉及 GO / KEGG 富集时必须包含 Reactome。
+
+```{r}
+top_genes <- unique(c(head(lr_tbl$ligand, 100), head(lr_tbl$receptor, 100)))
+orgdb <- if (cfg$species == "human") org.Hs.eg.db::org.Hs.eg.db else org.Mm.eg.db
+organism_reactome <- if (cfg$species == "human") "human" else "mouse"
+
+entrez <- clusterProfiler::bitr(
+  top_genes,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = orgdb
+)
+
+ego_bp <- clusterProfiler::enrichGO(
+  gene = entrez$ENTREZID,
+  OrgDb = orgdb,
+  ont = "BP",
+  readable = TRUE
+)
+
+ereact <- ReactomePA::enrichPathway(
+  gene = entrez$ENTREZID,
+  organism = organism_reactome,
+  readable = TRUE
+)
+
+dotplot(ego_bp, showCategory = 15) + ggtitle("GO BP of top spatial L-R genes")
+dotplot(ereact, showCategory = 15) + ggtitle("Reactome of top spatial L-R genes")
+```
+
+## Condition-Aware Hook
+
+多样本项目建议按 condition 分别构建 CellChat，再做 merge / compare。不要把所有 spot pooled 后直接做统计结论。
+
+```{r}
+if (cfg$condition_col %in% colnames(brain@meta.data)) {
+  condition_summary <- brain@meta.data |>
+    count(.data[[cfg$condition_col]], .data[[label_col]], name = "n_spots") |>
+    group_by(.data[[cfg$condition_col]]) |>
+    mutate(frac = n_spots / sum(n_spots)) |>
+    ungroup()
+  condition_summary
+}
+```
+
+## COMMOT Reference Block
 
 ```python
-# 参考调用，本文件不执行
-import scanpy as sc
-import commot as ct
-
-adata = sc.read_visium("/path/to/spaceranger_outs")
-df_lr = ct.tl.ligand_receptor_database(species="mouse", signaling_type="Secreted Signaling")
-ct.tl.spatial_communication(
-    adata, database_name="cellchat", df_ligrec=df_lr,
-    dis_thr=500, heteromeric=True, pathway_sum=True
-)
-ct.pl.plot_cell_communication(adata, database_name="cellchat",
-                              pathway_name="WNT", plot_method="grid")
+# Reference only; run in Python environment.
+# import scanpy as sc
+# import commot as ct
+# adata = sc.read_visium("/path/to/spaceranger_outs")
+# df_lr = ct.tl.ligand_receptor_database(species="mouse", signaling_type="Secreted Signaling")
+# ct.tl.spatial_communication(
+#     adata,
+#     database_name="cellchat",
+#     df_ligrec=df_lr,
+#     dis_thr=500,
+#     heteromeric=True,
+#     pathway_sum=True
+# )
+# ct.pl.plot_cell_communication(adata, database_name="cellchat",
+#                               pathway_name="WNT", plot_method="grid")
 ```
 
-## 注意事项
+## Export
 
-- `interaction.length` 单位是像素（图像坐标）；按组织调整
-- `distance.use = TRUE` 才启用空间约束，否则等价于普通 CellChat
-- L-R 富集必须含 Reactome（repo 约定）
+```{r}
+readr::write_csv(pathway_rank, file.path(cfg$results_dir, "cellchat_pathway_rank.csv"))
+readr::write_csv(lr_tbl, file.path(cfg$results_dir, "cellchat_lr_pairs.csv"))
+readr::write_csv(communication_review, file.path(cfg$results_dir, "communication_review_table.csv"))
+readr::write_csv(sender_receiver_summary, file.path(cfg$results_dir, "sender_receiver_pathway_summary.csv"))
+readr::write_csv(communication_decision_table, file.path(cfg$results_dir, "communication_decision_table.csv"))
+readr::write_csv(as.data.frame(ego_bp), file.path(cfg$results_dir, "lr_GO_BP.csv"))
+readr::write_csv(as.data.frame(ereact), file.path(cfg$results_dir, "lr_Reactome.csv"))
+qs2::qs_save(cellchat, file.path(cfg$results_dir, "cellchat_spatial.qs2"))
+```
 
-## 下游
+## Output Contract
 
-- niche-by-niche 通讯比较：用 `spatial_niche.qmd` 的标签替换 `meta$labels`
-- 通讯结果与 NicheNet 模型整合：参考根目录 `nichenet.qmd`
+```{r}
+celltalk_output_contract <- tibble::tribble(
+  ~artifact, ~file, ~used_by, ~description,
+  "CellChat spatial object", "cellchat_spatial.qs2", "replotting and comparison", "CellChat object with distance-constrained probabilities",
+  "L-R table", "cellchat_lr_pairs.csv", "manual review and ligand prioritization", "all inferred ligand-receptor pairs",
+  "communication decision table", "communication_decision_table.csv", "final interpretation", "spatial plausibility and marker support review",
+  "sender receiver summary", "sender_receiver_pathway_summary.csv", "network prioritization", "pathway-level source-target summary"
+)
+
+celltalk_output_contract
+readr::write_csv(celltalk_output_contract, file.path(cfg$results_dir, "celltalk_output_contract.csv"))
+```
+
+## Claim Evidence Table
+
+```{r}
+celltalk_claim_evidence <- tibble::tibble(
+  claim_id = c("CTALK1", "CTALK2"),
+  claim = c(
+    "Prioritized ligand-receptor signals are spatially plausible",
+    "Key sender-receiver pathways support microenvironment remodeling"
+  ),
+  evidence_table = c("communication_decision_table.csv", "sender_receiver_pathway_summary.csv"),
+  required_visual_check = c("spatial network layout and ligand/receptor expression maps", "bubble plot plus source-target summary"),
+  caveat = c("CellChat infers probability, not direct physical binding", "distance threshold and grouping choice affect results"),
+  status = "to_review"
+)
+
+celltalk_claim_evidence
+readr::write_csv(celltalk_claim_evidence, file.path(cfg$results_dir, "celltalk_claim_evidence_table.csv"))
+```
+
+## Interactive Review
+
+- `distance.use = TRUE` 是否启用，`interaction.length` 是否符合组织尺度？
+- 高分 L-R 是否发生在空间邻近区域，而不只是表达高？
+- sender / receiver 标签来自 dominant cell type、niche，还是人工 region？哪个更适合当前问题？
+- 多样本项目是否已经拆成 replicate-level 或 condition-level 分析？

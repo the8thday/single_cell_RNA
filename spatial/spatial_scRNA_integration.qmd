@@ -1,101 +1,317 @@
 ---
-title: "ST × scRNA 整合 / 标签迁移"
+title: "Spatial And scRNA Reference Integration"
 format: html
+execute:
+  eval: false
+  warning: false
+  message: false
 ---
 
 ## 简介
 
-把 scRNA 的细胞类型注释迁移到 spot，是反卷积外的另一条路径：
-- **反卷积**（`spatial_deconvolution.qmd`）：每个 spot 的混合比例
-- **标签迁移**（本文件）：每个 spot 的"主要类型 + 置信度"，更接近单细胞分析的语义
+本文件用于把 scRNA-seq 参考图谱投射到空间转录组数据上：用 Seurat anchor transfer 给 spot / cell 赋予参考 cell type 标签、预测置信度，并与反卷积结果交叉验证。它回答的是“这个空间位置像参考中的哪类细胞”，不是 spot 内真实比例；比例问题见 `spatial_deconvolution.qmd`。
 
-主要工具：Seurat `FindTransferAnchors` + `TransferData` + `MapQuery`。
+## Setup
 
 ```{r}
-#| include: false
 library(Seurat)
 library(SeuratData)
+library(dplyr)
+library(tidyr)
 library(ggplot2)
 library(patchwork)
-library(dplyr)
+library(qs2)
+library(here)
 source(here::here("singlecell_utiles.R"))
 ```
 
-## 数据加载
+## Project Configuration
 
 ```{r}
-brain <- LoadData("stxBrain", type = "anterior1")
-brain <- SCTransform(brain, assay = "Spatial", verbose = FALSE) |>
-  RunPCA(assay = "SCT", verbose = FALSE)
+cfg <- list(
+  demo_mode = TRUE,
+  spatial_path = "Results/spatial_visium/visium_processed.qs2",
+  reference_path = "datasets/harmonized_seurat.qs2",
+  reference_assay = "RNA",
+  spatial_assay = "SCT",
+  reference_label_col = "cell_type",
+  reference_sample_col = "sample",
+  spatial_sample_col = "sample",
+  spatial_group_col = "group",
+  dims = 1:30,
+  min_prediction_score = 0.5,
+  deconv_path = "Results/spatial_deconvolution/spatial_with_rctd.qs2",
+  deconv_assay = "RCTD",
+  results_dir = "Results/spatial_scRNA_integration"
+)
 
-allen <- LoadData("allen_reference") |> UpdateSeuratObject()
-allen <- JoinLayers(allen)  # Seurat v5 必需
-allen <- SCTransform(allen, assay = "RNA", verbose = FALSE) |>
-  RunPCA(assay = "SCT", verbose = FALSE) |>
-  RunUMAP(dims = 1:30, return.model = TRUE)
+dir.create(cfg$results_dir, recursive = TRUE, showWarnings = FALSE)
 ```
 
-## 锚点 + 标签迁移
+## Load Spatial And Reference Objects
+
+```{r}
+if (cfg$demo_mode) {
+  spatial_obj <- SeuratData::LoadData("stxBrain", type = "anterior1")
+  spatial_obj <- SCTransform(spatial_obj, assay = "Spatial", verbose = FALSE)
+  spatial_obj <- RunPCA(spatial_obj, verbose = FALSE)
+
+  ref_obj <- SeuratData::LoadData("allen_reference")
+  ref_obj <- UpdateSeuratObject(ref_obj)
+  ref_obj$cell_type <- ref_obj$subclass
+} else {
+  spatial_obj <- qs2::qs_read(cfg$spatial_path)
+  ref_obj <- qs2::qs_read(cfg$reference_path)
+}
+
+if (!cfg$spatial_sample_col %in% colnames(spatial_obj@meta.data)) spatial_obj[[cfg$spatial_sample_col]] <- "sample_1"
+if (!cfg$spatial_group_col %in% colnames(spatial_obj@meta.data)) spatial_obj[[cfg$spatial_group_col]] <- "group_1"
+
+stopifnot(cfg$reference_label_col %in% colnames(ref_obj@meta.data))
+table(ref_obj[[cfg$reference_label_col]][, 1]) |> sort(decreasing = TRUE) |> head(20)
+```
+
+## Reference Preparation
+
+```{r}
+ref_obj <- JoinLayers(ref_obj, assay = cfg$reference_assay)
+DefaultAssay(ref_obj) <- cfg$reference_assay
+ref_obj <- NormalizeData(ref_obj)
+ref_obj <- FindVariableFeatures(ref_obj)
+ref_obj <- ScaleData(ref_obj)
+ref_obj <- RunPCA(ref_obj, npcs = max(cfg$dims), verbose = FALSE)
+
+DefaultAssay(spatial_obj) <- cfg$spatial_assay
+if (!"pca" %in% Reductions(spatial_obj)) {
+  spatial_obj <- RunPCA(spatial_obj, npcs = max(cfg$dims), verbose = FALSE)
+}
+```
+
+## Find Anchors And Transfer Labels
 
 ```{r}
 anchors <- FindTransferAnchors(
-  reference = allen,
-  query = brain,
+  reference = ref_obj,
+  query = spatial_obj,
   normalization.method = "SCT",
-  reduction = "pcaproject"
+  reference.assay = cfg$reference_assay,
+  query.assay = cfg$spatial_assay,
+  reduction = "pcaproject",
+  dims = cfg$dims
 )
-predictions <- TransferData(
+
+pred <- TransferData(
   anchorset = anchors,
-  refdata = allen$subclass,
-  weight.reduction = brain[["pca"]],
-  dims = 1:30
+  refdata = ref_obj[[cfg$reference_label_col]][, 1],
+  dims = cfg$dims
 )
-brain <- AddMetaData(brain, metadata = predictions)
-SpatialDimPlot(brain, group.by = "predicted.id", label = TRUE)
-```
 
-## 用 MapQuery 把 spot 投到参考 UMAP
-
-```{r}
-brain <- MapQuery(
-  anchorset = anchors,
-  reference = allen,
-  query = brain,
-  refdata = list(subclass = "subclass"),
-  reference.reduction = "pca",
-  reduction.model = "umap"
+spatial_obj <- AddMetaData(spatial_obj, pred)
+spatial_obj$predicted_celltype_filtered <- ifelse(
+  spatial_obj$prediction.score.max >= cfg$min_prediction_score,
+  spatial_obj$predicted.id,
+  "Low_confidence"
 )
-DimPlot(brain, reduction = "ref.umap", group.by = "predicted.subclass", label = TRUE)
 ```
 
-## 置信度过滤
-
-每个 spot 一个 `predicted.id.score`（最大类别概率），低置信度 spot 单独标注：
+## Spatial Label Review
 
 ```{r}
-brain$confident_id <- ifelse(brain$predicted.id.score >= 0.5,
-                             brain$predicted.id, "Uncertain")
-SpatialDimPlot(brain, group.by = "confident_id", label = TRUE)
+SpatialDimPlot(spatial_obj, group.by = "predicted.id", label = TRUE, label.size = 3)
+SpatialFeaturePlot(spatial_obj, features = "prediction.score.max")
+SpatialDimPlot(spatial_obj, group.by = "predicted_celltype_filtered", label = TRUE, label.size = 3)
+
+prediction_summary <- spatial_obj@meta.data |>
+  count(predicted.id, predicted_celltype_filtered, name = "n_spots") |>
+  arrange(desc(n_spots))
+prediction_summary
 ```
 
-## 与反卷积结果交叉验证
+## Prediction Threshold Sweep
 
 ```{r}
-#| eval: false
-# 假设 spatial_deconvolution.qmd 的结果已存
-brain_decon <- qs2::qs_read("Results/brain_with_RCTD.qs")
-# 比较：迁移得到的 predicted.id 与 RCTD argmax 的一致率
-rctd_top <- apply(GetAssayData(brain_decon, assay = "RCTD"), 2, function(x) names(which.max(x)))
-table(brain$predicted.id, rctd_top[colnames(brain)])
+threshold_sweep <- tibble::tibble(threshold = seq(0.3, 0.8, by = 0.1)) |>
+  mutate(
+    n_kept = sapply(threshold, function(th) sum(spatial_obj$prediction.score.max >= th, na.rm = TRUE)),
+    frac_kept = n_kept / ncol(spatial_obj)
+  )
+
+threshold_sweep
+
+ggplot(threshold_sweep, aes(threshold, frac_kept)) +
+  geom_line() +
+  geom_point(size = 2) +
+  theme_classic() +
+  labs(x = "Minimum prediction score", y = "Fraction of spots kept")
 ```
 
-## 注意事项
+## Map Query To Reference UMAP
 
-- Seurat v5：参考对象必须 `JoinLayers()` 才能传给 `FindTransferAnchors`
-- `weight.reduction` 用 query 的 `pca` 比 `pcaproject` 更稳
-- 不要在多样本整合后忘记重做 SCTransform，否则 anchor 找不到
+如果参考对象已有 UMAP，可以用 `MapQuery()` 把空间 spot 投到参考图上，检查是否落在合理细胞类型附近。
 
-## 下游
+```{r}
+if ("umap" %in% Reductions(ref_obj)) {
+  spatial_obj <- MapQuery(
+    anchorset = anchors,
+    query = spatial_obj,
+    reference = ref_obj,
+    refdata = list(cell_type = cfg$reference_label_col),
+    reference.reduction = "pca",
+    reduction.model = "umap"
+  )
+  DimPlot(spatial_obj, reduction = "ref.umap", group.by = "predicted.id", label = TRUE)
+}
+```
 
-- 与反卷积结果交叉： `spatial/spatial_deconvolution.qmd`
-- 多切片标签传递：先 Harmony 整合 ST，然后用此流程批量迁移（参考 `spatial_workflow.qmd` 的整合段）
+## Cross-Validation With Deconvolution
+
+标签迁移给单一 predicted label，反卷积给比例。二者一致时可信度更高；不一致时常提示 mixed spot 或参考缺失。
+
+```{r}
+if (!cfg$demo_mode && file.exists(cfg$deconv_path)) {
+  deconv_obj <- qs2::qs_read(cfg$deconv_path)
+  deconv_mat <- GetAssayData(deconv_obj, assay = cfg$deconv_assay, layer = "data")
+  deconv_dom <- apply(as.matrix(deconv_mat), 2, function(x) names(which.max(x)))
+  deconv_score <- apply(as.matrix(deconv_mat), 2, max)
+
+  cross_tbl <- spatial_obj@meta.data |>
+    tibble::rownames_to_column("spot") |>
+    transmute(
+      spot,
+      transfer_label = predicted.id,
+      transfer_score = prediction.score.max,
+      deconv_label = deconv_dom[spot],
+      deconv_score = deconv_score[spot],
+      label_match = transfer_label == deconv_label
+    )
+  cross_tbl
+}
+```
+
+## Marker Validation
+
+```{r}
+Idents(ref_obj) <- cfg$reference_label_col
+ref_markers <- FindAllMarkers(ref_obj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25) |>
+  group_by(cluster) |>
+  slice_max(avg_log2FC, n = 5, with_ties = FALSE) |>
+  ungroup()
+
+top_transfer_labels <- prediction_summary |>
+  filter(predicted_celltype_filtered != "Low_confidence") |>
+  slice_head(n = 5) |>
+  pull(predicted.id)
+
+marker_to_plot <- ref_markers |>
+  filter(cluster %in% top_transfer_labels) |>
+  pull(gene) |>
+  unique() |>
+  head(12)
+
+SpatialFeaturePlot(spatial_obj, features = marker_to_plot, ncol = 4)
+```
+
+## Interpretation Table
+
+```{r}
+integration_review <- prediction_summary |>
+  group_by(predicted.id) |>
+  summarise(n_spots = sum(n_spots), .groups = "drop") |>
+  mutate(
+    median_prediction_score = sapply(predicted.id, function(lbl) {
+      median(spatial_obj$prediction.score.max[spatial_obj$predicted.id == lbl], na.rm = TRUE)
+    }),
+    marker_support = NA,
+    spatial_location = NA_character_,
+    keep_label = NA,
+    reviewer_note = NA_character_
+  ) |>
+  arrange(desc(n_spots))
+integration_review
+```
+
+## Sample-Aware Prediction Summary
+
+```{r}
+prediction_sample_summary <- spatial_obj@meta.data |>
+  tibble::rownames_to_column("spot") |>
+  count(.data[[cfg$spatial_sample_col]], .data[[cfg$spatial_group_col]], predicted_celltype_filtered, name = "n_spots") |>
+  group_by(.data[[cfg$spatial_sample_col]]) |>
+  mutate(frac_spots = n_spots / sum(n_spots)) |>
+  ungroup()
+
+prediction_sample_summary
+```
+
+## Transfer Decision Table
+
+```{r}
+transfer_decision_table <- integration_review |>
+  mutate(
+    reference_coverage = NA_character_,
+    deconvolution_agreement = NA_character_,
+    marker_validation = marker_support,
+    final_label_policy = NA_character_,
+    use_for_downstream = keep_label
+  )
+
+transfer_decision_table
+```
+
+## Export
+
+```{r}
+prediction_table <- spatial_obj@meta.data |>
+  tibble::rownames_to_column("spot") |>
+  select(spot, predicted.id, prediction.score.max, predicted_celltype_filtered)
+
+readr::write_csv(prediction_table, file.path(cfg$results_dir, "label_transfer_by_spot.csv"))
+readr::write_csv(prediction_summary, file.path(cfg$results_dir, "prediction_summary.csv"))
+readr::write_csv(integration_review, file.path(cfg$results_dir, "integration_review_table.csv"))
+readr::write_csv(threshold_sweep, file.path(cfg$results_dir, "prediction_threshold_sweep.csv"))
+readr::write_csv(prediction_sample_summary, file.path(cfg$results_dir, "prediction_sample_summary.csv"))
+readr::write_csv(transfer_decision_table, file.path(cfg$results_dir, "transfer_decision_table.csv"))
+if (exists("cross_tbl")) readr::write_csv(cross_tbl, file.path(cfg$results_dir, "transfer_deconv_crosscheck.csv"))
+qs2::qs_save(spatial_obj, file.path(cfg$results_dir, "spatial_with_transfer_labels.qs2"))
+```
+
+## Output Contract
+
+```{r}
+integration_output_contract <- tibble::tribble(
+  ~artifact, ~file, ~used_by, ~description,
+  "spatial object with transferred labels", "spatial_with_transfer_labels.qs2", "niche, celltalk, report", "Seurat object with predicted labels and scores",
+  "spot label table", "label_transfer_by_spot.csv", "manual review and plots", "predicted label and score per spot",
+  "threshold sweep", "prediction_threshold_sweep.csv", "score cutoff decision", "fraction retained at each cutoff",
+  "decision table", "transfer_decision_table.csv", "final label policy", "reference coverage and marker support review"
+)
+
+integration_output_contract
+readr::write_csv(integration_output_contract, file.path(cfg$results_dir, "integration_output_contract.csv"))
+```
+
+## Claim Evidence Table
+
+```{r}
+integration_claim_evidence <- tibble::tibble(
+  claim_id = c("INT1", "INT2"),
+  claim = c(
+    "Reference labels map coherently onto spatial tissue regions",
+    "Transferred labels agree with deconvolution or marker evidence"
+  ),
+  evidence_table = c("transfer_decision_table.csv", "transfer_deconv_crosscheck.csv"),
+  required_visual_check = c("SpatialDimPlot predicted labels and score map", "marker maps plus deconvolution cross-check"),
+  caveat = c("reference mismatch can create confident wrong labels", "spot mixtures limit single-label interpretation"),
+  status = "to_review"
+)
+
+integration_claim_evidence
+readr::write_csv(integration_claim_evidence, file.path(cfg$results_dir, "integration_claim_evidence_table.csv"))
+```
+
+## Interactive Review
+
+- 参考图谱是否覆盖空间样本的组织、疾病状态和细胞类型？
+- `prediction.score.max` 低的区域是否对应 mixed spots、坏死区或参考缺失？
+- label transfer 和 deconvolution 是否一致？不一致是否可由混合比例解释？
+- 最终下游使用 predicted label、deconvolution dominant label，还是人工 region / niche？

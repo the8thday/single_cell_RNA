@@ -1,104 +1,286 @@
 ---
-title: "10x Xenium 工作流"
+title: "10x Xenium Workflow"
 format: html
+execute:
+  eval: false
+  warning: false
+  message: false
 ---
 
 ## 简介
 
-Xenium 是 10x 的亚细胞分辨率（< 1µm）成像空转平台。和 Visium 相比：
-- 每个 cell 一行（已有 segmentation），不是 spot
-- 基因 panel 有限（~300–5000 基因）
-- 数据量大（百万级细胞）
+Xenium 是单细胞 / 亚细胞分辨率成像平台，核心任务不是 spot 反卷积，而是细胞级 QC、分割质量复核、panel 基因解释、参考标签迁移和邻域分析。本模板以 Seurat v5 `LoadXenium()` 为主，输出可衔接 `spatial_niche.qmd` 和 `spatial_celltalk.qmd` 的对象。
 
-Seurat v5 原生支持 Xenium：`LoadXenium()`。
+## Setup
 
 ```{r}
-#| include: false
 library(Seurat)
-library(future)
-library(ggplot2)
 library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
 library(qs2)
+library(here)
 source(here::here("singlecell_utiles.R"))
-plan("multisession", workers = 4)
-options(future.globals.maxSize = 8 * 1024^3)
 ```
 
-## 数据加载
+## Project Configuration
 
 ```{r}
-#| eval: false
-# 10x 公开 Xenium 小鼠脑样本（Tiny Subset）
-# 下载： https://www.10xgenomics.com/datasets （Xenium → Mouse Brain）
-xen_dir <- "/path/to/xenium_output_bundle"
-xen <- LoadXenium(xen_dir, fov = "fov")
+cfg <- list(
+  xenium_dir = "/path/to/xenium/output",
+  fov = "fov",
+  assay = "Xenium",
+  celltype_col = "cell_type",
+  sample_col = "sample",
+  condition_col = "group",
+  fov_col = "fov",
+  min_counts = 20,
+  min_features = 10,
+  max_counts = Inf,
+  resolution = 0.4,
+  dims = 1:30,
+  marker_panel = c("Epcam", "Krt8", "Ptprc", "Col1a1", "Pecam1"),
+  results_dir = "Results/xenium_workflow"
+)
+
+dir.create(cfg$results_dir, recursive = TRUE, showWarnings = FALSE)
 ```
 
-替换为可演示的 mock（实际使用替换为上面的 `LoadXenium`）：
+## Load Xenium Data
 
 ```{r}
-xen <- readRDS(system.file("extdata", "xenium_demo.rds", package = "Seurat"))
-# 若包内无 demo，跳过此 chunk
+xen <- LoadXenium(
+  data.dir = cfg$xenium_dir,
+  fov = cfg$fov,
+  assay = cfg$assay
+)
+xen$sample <- basename(cfg$xenium_dir)
+if (!cfg$condition_col %in% colnames(xen@meta.data)) xen[[cfg$condition_col]] <- "group_1"
+if (!cfg$fov_col %in% colnames(xen@meta.data)) xen[[cfg$fov_col]] <- cfg$fov
+xen
 ```
 
-## QC
+## QC And Segmentation Review
+
+Xenium 的低质量细胞常来自分割异常、边缘细胞、panel 信号弱或背景高。先看 count / feature 分布，再结合空间位置过滤。
 
 ```{r}
-xen[["nCount"]] <- xen$nCount_Xenium
-xen[["nFeature"]] <- xen$nFeature_Xenium
-SpatialQCPlot(xen, features = c("nCount", "nFeature"))
-xen <- subset(xen, subset = nCount_Xenium > 10 & nFeature_Xenium > 5)
+qc_tbl <- xen@meta.data |>
+  tibble::rownames_to_column("cell") |>
+  summarise(
+    n_cells = n(),
+    median_counts = median(nCount_Xenium),
+    median_features = median(nFeature_Xenium),
+    p95_counts = quantile(nCount_Xenium, 0.95)
+  )
+qc_tbl
+
+VlnPlot(xen, features = c("nCount_Xenium", "nFeature_Xenium"), pt.size = 0, ncol = 2)
+ImageDimPlot(xen, fov = cfg$fov, axes = TRUE)
 ```
 
-## 标准化与聚类
-
-Xenium 基因数少，常用 `SCTransform` 或简单的 log-normalize：
+## QC Decision Table
 
 ```{r}
-xen <- NormalizeData(xen) |>
-  FindVariableFeatures(nfeatures = 2000) |>
-  ScaleData() |>
-  RunPCA(npcs = 30)
-xen <- FindNeighbors(xen, dims = 1:20) |>
-  FindClusters(resolution = 0.5)
-xen <- RunUMAP(xen, dims = 1:20)
-```
+qc_decision_table <- tibble::tibble(
+  metric = c("nCount_Xenium", "nFeature_Xenium", "segmentation_review", "edge_cells"),
+  current_rule = c(
+    paste(">=", cfg$min_counts, "and <=", cfg$max_counts),
+    paste(">=", cfg$min_features),
+    "manual ImageDimPlot review",
+    "manual FOV boundary review"
+  ),
+  rationale = c(
+    "remove very low RNA cells and extreme outliers",
+    "remove low panel-detection cells",
+    "exclude failed cell segmentation regions",
+    "avoid boundary artifacts"
+  ),
+  reviewer_note = NA_character_
+)
 
-## 可视化
+qc_decision_table
+```
 
 ```{r}
-ImageDimPlot(xen, fov = "fov", axes = TRUE, cols = "polychrome")
-ImageFeaturePlot(xen, fov = "fov", features = head(VariableFeatures(xen), 4))
+xen <- subset(
+  xen,
+  subset =
+    nCount_Xenium >= cfg$min_counts &
+    nCount_Xenium <= cfg$max_counts &
+    nFeature_Xenium >= cfg$min_features
+)
 ```
 
-## 与 scRNA 参考做标签迁移
+## Normalization And Clustering
+
+Panel 数据基因数有限，解释时更依赖 marker panel 和参考标签，不要把小 panel 的 cluster 过度解读成完整细胞状态。
 
 ```{r}
-#| eval: false
-ref <- qs2::qs_read("/path/to/scRNA_reference.qs") |> JoinLayers()
-ref <- SCTransform(ref) |> RunPCA() |> RunUMAP(dims = 1:30, return.model = TRUE)
-anchors <- FindTransferAnchors(reference = ref, query = xen,
-                               normalization.method = "LogNormalize",
-                               reduction = "pcaproject")
-preds <- TransferData(anchors, refdata = ref$celltype,
-                      weight.reduction = xen[["pca"]], dims = 1:30)
-xen <- AddMetaData(xen, preds)
-ImageDimPlot(xen, group.by = "predicted.id", fov = "fov")
+DefaultAssay(xen) <- cfg$assay
+xen <- NormalizeData(xen)
+xen <- FindVariableFeatures(xen)
+xen <- ScaleData(xen)
+xen <- RunPCA(xen, npcs = max(cfg$dims), verbose = FALSE)
+xen <- FindNeighbors(xen, dims = cfg$dims)
+xen <- FindClusters(xen, resolution = cfg$resolution)
+xen <- RunUMAP(xen, dims = cfg$dims)
+
+DimPlot(xen, reduction = "umap", group.by = "seurat_clusters", label = TRUE)
+ImageDimPlot(xen, fov = cfg$fov, group.by = "seurat_clusters", axes = TRUE)
 ```
 
-## 与 Visium 的关键差异
+## Marker Panel Review
 
-- **不需要反卷积**（已是单细胞分辨率）
-- 邻域分析直接基于 cell 中心坐标，邻接定义不同（Delaunay / 半径 vs hex）
-- 基因 panel 有限，HVG 选择基本无意义
+```{r}
+panel_genes <- intersect(cfg$marker_panel, rownames(xen))
+ImageFeaturePlot(xen, features = panel_genes, fov = cfg$fov, max.cutoff = "q95", cols = c("grey90", "red"))
+DotPlot(xen, features = panel_genes, group.by = "seurat_clusters") + RotatedAxis()
+```
 
-## 注意事项
+## Cluster Markers
 
-- `LoadXenium` 默认读 `cell_feature_matrix.h5` + `cells.csv.gz` + `morphology.ome.tif`
-- 多 FOV 数据需用 `SubsetByImageBox`
-- 大数据集用 BPCells 后端：`LoadXenium(..., load_bpcells = TRUE)`
+```{r}
+Idents(xen) <- "seurat_clusters"
+xen_markers <- FindAllMarkers(
+  xen,
+  only.pos = TRUE,
+  min.pct = 0.1,
+  logfc.threshold = 0.1
+)
 
-## 下游
+xen_marker_top <- xen_markers |>
+  group_by(cluster) |>
+  slice_max(avg_log2FC, n = 10, with_ties = FALSE) |>
+  ungroup()
+xen_marker_top
+```
 
-- niche / 邻域分析（基于 cell 邻接）： `spatial_niche.qmd` 中把 `k = 6` 改成更合适的 cell 邻接 k
-- 空间通讯： `spatial_celltalk.qmd`
+## Cluster Stability And Sample/FOV Composition
+
+```{r}
+cluster_composition <- xen@meta.data |>
+  tibble::rownames_to_column("cell") |>
+  count(.data[[cfg$sample_col]], .data[[cfg$condition_col]], .data[[cfg$fov_col]], seurat_clusters, name = "n_cells") |>
+  group_by(.data[[cfg$sample_col]], .data[[cfg$fov_col]]) |>
+  mutate(frac_cells = n_cells / sum(n_cells)) |>
+  ungroup()
+
+cluster_composition
+```
+
+```{r}
+ggplot(cluster_composition, aes(seurat_clusters, frac_cells, fill = .data[[cfg$fov_col]])) +
+  geom_col(position = "dodge") +
+  facet_wrap(stats::as.formula(paste("~", cfg$sample_col))) +
+  theme_classic() +
+  labs(x = "Cluster", y = "Fraction of cells")
+```
+
+## Manual / Reference Annotation Slot
+
+真实项目在这里把 cluster 映射为 cell type，或接入 `spatial_scRNA_integration.qmd` 风格的参考迁移。
+
+```{r}
+annotation_map <- tibble::tibble(
+  seurat_clusters = sort(unique(as.character(xen$seurat_clusters))),
+  cell_type = paste0("CellType_", seurat_clusters),
+  review_note = "replace with marker-supported label"
+)
+annotation_map
+
+xen@meta.data <- xen@meta.data |>
+  tibble::rownames_to_column("cell") |>
+  left_join(annotation_map, by = "seurat_clusters") |>
+  tibble::column_to_rownames("cell")
+
+ImageDimPlot(xen, fov = cfg$fov, group.by = cfg$celltype_col, axes = TRUE)
+```
+
+## Annotation Decision Table
+
+```{r}
+annotation_decision_table <- annotation_map |>
+  mutate(
+    positive_markers = NA_character_,
+    negative_markers = NA_character_,
+    spatial_location = NA_character_,
+    confidence = NA_character_,
+    use_for_downstream = NA
+  )
+
+annotation_decision_table
+```
+
+## Neighborhood Analysis Hook
+
+成像平台已有单细胞标签，直接做邻域组成，不需要 deconvolution。
+
+```{r}
+neighbor_long <- NeighborComposition(xen, group_col = cfg$celltype_col, k = 20)
+neighbor_summary <- neighbor_long |>
+  group_by(group, neighbor_group) |>
+  summarise(mean_neighbor_fraction = mean(fraction), .groups = "drop")
+
+ggplot(neighbor_summary, aes(neighbor_group, group, fill = mean_neighbor_fraction)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Export
+
+```{r}
+readr::write_csv(qc_tbl, file.path(cfg$results_dir, "xenium_qc_summary.csv"))
+readr::write_csv(qc_decision_table, file.path(cfg$results_dir, "xenium_qc_decision_table.csv"))
+readr::write_csv(xen_markers, file.path(cfg$results_dir, "xenium_cluster_markers.csv"))
+readr::write_csv(annotation_map, file.path(cfg$results_dir, "xenium_annotation_review_map.csv"))
+readr::write_csv(annotation_decision_table, file.path(cfg$results_dir, "xenium_annotation_decision_table.csv"))
+readr::write_csv(cluster_composition, file.path(cfg$results_dir, "xenium_cluster_fov_composition.csv"))
+readr::write_csv(neighbor_summary, file.path(cfg$results_dir, "xenium_neighbor_summary.csv"))
+qs2::qs_save(xen, file.path(cfg$results_dir, "xenium_processed.qs2"))
+```
+
+## Output Contract
+
+```{r}
+xenium_output_contract <- tibble::tribble(
+  ~artifact, ~file, ~used_by, ~description,
+  "processed Xenium object", "xenium_processed.qs2", "niche, celltalk, report", "Seurat object with clusters and cell_type labels",
+  "QC decision table", "xenium_qc_decision_table.csv", "project review", "records filtering and segmentation decisions",
+  "annotation decision table", "xenium_annotation_decision_table.csv", "downstream label policy", "marker-supported cell type review",
+  "neighbor summary", "xenium_neighbor_summary.csv", "niche analysis", "cell-type neighborhood composition"
+)
+
+xenium_output_contract
+readr::write_csv(xenium_output_contract, file.path(cfg$results_dir, "xenium_output_contract.csv"))
+```
+
+## Claim Evidence Table
+
+```{r}
+xenium_claim_evidence <- tibble::tibble(
+  claim_id = c("XEN1", "XEN2"),
+  claim = c(
+    "Xenium cell annotations are marker-supported and spatially plausible",
+    "Local neighborhoods reveal interpretable microenvironment structure"
+  ),
+  evidence_table = c("xenium_annotation_decision_table.csv", "xenium_neighbor_summary.csv"),
+  required_visual_check = c("ImageFeaturePlot marker panel and ImageDimPlot cell_type", "neighbor heatmap / spatial neighborhood maps"),
+  caveat = c("panel-limited data cannot validate absent genes", "segmentation artifacts can affect neighborhoods"),
+  status = "to_review"
+)
+
+xenium_claim_evidence
+readr::write_csv(xenium_claim_evidence, file.path(cfg$results_dir, "xenium_claim_evidence_table.csv"))
+```
+
+## Interactive Review
+
+- 低 count / low feature 细胞是否空间聚集在组织边缘或分割异常区域？
+- panel gene 是否足够支持 cell type 命名？
+- cluster marker 是否是 panel bias，还是可靠生物学信号？
+- 是否需要按 FOV / sample 分别 QC 后再合并？
+- 下游直接进入 `spatial_niche.qmd`，跳过 deconvolution。

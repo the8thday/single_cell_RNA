@@ -1,122 +1,325 @@
 ---
-title: "空间可变基因 (SVG)"
+title: "Spatially Variable Genes"
 format: html
+execute:
+  eval: false
+  warning: false
+  message: false
 ---
 
 ## 简介
 
-空间可变基因（spatially variable genes, SVG）是指表达模式在组织空间上**非随机**的基因——既包括聚集分布的，也包括沿梯度变化的。比单纯的高变基因（HVG）更能捕捉空间生物学。
+Spatially variable genes (SVGs) 关注“空间上非随机分布”的基因，不等同于 HVG，也不等同于 cluster marker。这个模板用于在 Visium 对象上比较 Seurat、SPARK-X、Moran's I / Voyager 三类思路，并把结果整理成可解释的候选基因表。
 
-本文件覆盖三种主流方法：
-- Seurat `FindSpatiallyVariableFeatures`（Moran's I / `markvariogram`）
-- SPARK-X（基于核的快速 SVG 测试，适合大样本）
-- `Voyager` 包计算的 Moran's I（更细粒度的空间统计）
+## Setup
 
 ```{r}
-#| include: false
 library(Seurat)
 library(SeuratData)
+library(dplyr)
+library(tidyr)
 library(ggplot2)
 library(patchwork)
-library(dplyr)
-library(SPARK)        # SPARK-X
-library(Voyager)
-library(SpatialFeatureExperiment)
 library(clusterProfiler)
-library(ReactomePA)   # 富集必须含 Reactome
+library(ReactomePA)
+library(org.Mm.eg.db)
+library(qs2)
+library(here)
 source(here::here("singlecell_utiles.R"))
 ```
 
-## 数据加载
+## Project Configuration
 
 ```{r}
-brain <- LoadData("stxBrain", type = "anterior1")
-brain[["percent.mt"]] <- PercentageFeatureSet(brain, pattern = "^mt-")
-brain <- subset(brain, subset = nFeature_Spatial > 200 & percent.mt < 20)
-brain <- SCTransform(brain, assay = "Spatial", verbose = FALSE)
+cfg <- list(
+  demo_mode = TRUE,
+  seurat_path = "Results/spatial_visium/visium_processed.qs2",
+  species = "mouse",
+  assay = "SCT",
+  count_assay = "Spatial",
+  image_index = 1,
+  sample_col = "sample",
+  group_col = "group",
+  n_svg = 500,
+  spark_n_cores = 4,
+  min_gene_count = 10,
+  results_dir = "Results/spatial_SVG"
+)
+
+dir.create(cfg$results_dir, recursive = TRUE, showWarnings = FALSE)
 ```
 
-## 方法 1：Seurat `FindSpatiallyVariableFeatures`
+## Load Spatial Object
 
 ```{r}
+if (cfg$demo_mode) {
+  brain <- SeuratData::LoadData("stxBrain", type = "anterior1")
+  brain[["percent.mt"]] <- PercentageFeatureSet(brain, pattern = "^mt-")
+  brain <- subset(brain, subset = nFeature_Spatial > 200 & percent.mt < 20)
+  brain <- SCTransform(brain, assay = "Spatial", verbose = FALSE)
+  brain <- RunPCA(brain, verbose = FALSE)
+  brain <- FindNeighbors(brain, dims = 1:20)
+  brain <- FindClusters(brain, resolution = 0.4, verbose = FALSE)
+} else {
+  brain <- qs2::qs_read(cfg$seurat_path)
+}
+
+if (!cfg$sample_col %in% colnames(brain@meta.data)) brain[[cfg$sample_col]] <- "sample_1"
+if (!cfg$group_col %in% colnames(brain@meta.data)) brain[[cfg$group_col]] <- "group_1"
+
+coords <- GetTissueCoordinates(brain@images[[cfg$image_index]]) |>
+  tibble::rownames_to_column("spot")
+head(coords)
+```
+
+## Baseline: HVG And Marker Contrast
+
+先显式保存 HVG 和 marker，后续与 SVG 交叉对照，避免把三类基因混为一谈。
+
+```{r}
+DefaultAssay(brain) <- cfg$assay
+brain <- FindVariableFeatures(brain, nfeatures = 3000)
+hvg_tbl <- tibble::tibble(gene = VariableFeatures(brain), source = "HVG")
+
+Idents(brain) <- "seurat_clusters"
+marker_tbl <- FindAllMarkers(brain, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25) |>
+  mutate(source = "cluster_marker")
+
+SpatialFeaturePlot(brain, features = head(hvg_tbl$gene, 4), ncol = 2)
+```
+
+## Method 1: Seurat Spatial Autocorrelation
+
+Seurat `FindSpatiallyVariableFeatures()` 适合快速筛选和可视化。不同 Seurat 版本支持的方法名略有变化，运行前可 `?FindSpatiallyVariableFeatures` 查看。
+
+```{r}
+DefaultAssay(brain) <- cfg$assay
 brain <- FindSpatiallyVariableFeatures(
   brain,
-  assay = "SCT",
-  features = VariableFeatures(brain)[1:1000],
-  selection.method = "moransi"
+  assay = cfg$assay,
+  selection.method = "markvariogram",
+  features = VariableFeatures(brain)[1:2000],
+  r.metric = 5,
+  slot = "scale.data"
 )
-top_svg <- SpatiallyVariableFeatures(brain, selection.method = "moransi") |> head(12)
-SpatialFeaturePlot(brain, features = top_svg[1:6], ncol = 3)
+
+seurat_svg <- SVFInfo(brain) |>
+  tibble::rownames_to_column("gene") |>
+  arrange(desc(moransi_observed)) |>
+  mutate(method = "Seurat_markvariogram")
+head(seurat_svg, 20)
+
+SpatialFeaturePlot(brain, features = head(seurat_svg$gene, 6), ncol = 3)
 ```
 
-## 方法 2：SPARK-X
+## Method 2: SPARK-X
 
-SPARK-X 在大样本下显著快于 SPARK / Moran's I。
+SPARK-X 对 Visium SVG 筛选很常用。Seurat v5 多层对象取 counts 前先 `JoinLayers()`。
 
 ```{r}
-# Seurat v5: 取 counts 前先 JoinLayers，否则多样本分层时 counts 为空
-brain <- JoinLayers(brain, assay = "Spatial")
-counts <- GetAssayData(brain, assay = "Spatial", layer = "counts")
-coords <- GetTissueCoordinates(brain@images[[1]])
-coords <- as.matrix(coords[, c("imagerow", "imagecol")])
-sparkx_res <- sparkx(counts, coords, numCores = 2, option = "mixture")
-sparkx_top <- rownames(sparkx_res$res_mtest)[order(sparkx_res$res_mtest$adjustedPval)][1:20]
-SpatialFeaturePlot(brain, features = sparkx_top[1:6], ncol = 3)
+brain_counts <- JoinLayers(brain, assay = cfg$count_assay)
+counts <- GetAssayData(brain_counts, assay = cfg$count_assay, layer = "counts")
+counts <- counts[rowSums(counts) >= cfg$min_gene_count, ]
+
+spark_coords <- GetTissueCoordinates(brain_counts@images[[cfg$image_index]])[, c("imagerow", "imagecol")]
+
+spark_res <- SPARK::sparkx(
+  counts = counts,
+  location = as.matrix(spark_coords),
+  numCores = cfg$spark_n_cores,
+  option = "mixture"
+)
+
+spark_svg <- spark_res$res_mtest |>
+  tibble::rownames_to_column("gene") |>
+  arrange(adjustedPval) |>
+  mutate(method = "SPARK-X")
+head(spark_svg, 20)
 ```
 
-## 方法 3：Voyager / Moran's I
+## Method 3: Moran's I / Voyager
+
+Voyager 使用 `SpatialFeatureExperiment` 更自然。这里保留项目替换模板：如果真实项目以 Space Ranger 输出为起点，建议直接构建 SFE，而不是从 Seurat 来回转换。
 
 ```{r}
-#| eval: false
-# Voyager 工作流以 SpatialFeatureExperiment (SFE) 为底层对象。
-# 推荐直接从 SpaceRanger 输出构建 SFE，而不是从 Seurat 转换：
+# library(SpatialFeatureExperiment)
+# library(Voyager)
 # sfe <- SpatialFeatureExperiment::read10xVisiumSFE(
-#   samples = sample_dirs,
-#   sample_id = sample_names
+#   samples = unname(sample_dirs),
+#   sample_id = names(sample_dirs)
 # )
-# sfe <- Voyager::runMoransI(sfe, features = rownames(sfe)[1:500])
+# sfe <- Voyager::runMoransI(sfe, features = rownames(sfe)[1:5000])
+# moran_tbl <- rowData(sfe) |>
+#   as.data.frame() |>
+#   tibble::rownames_to_column("gene") |>
+#   arrange(p.value)
 ```
 
-## SVG 富集分析（含 Reactome）
+## Consensus SVG Ranking
 
 ```{r}
-svg_genes <- top_svg
-ego <- enrichGO(gene = svg_genes,
-                OrgDb = "org.Mm.eg.db",
-                keyType = "SYMBOL",
-                ont = "BP",
-                pAdjustMethod = "BH")
-ekegg <- enrichKEGG(gene = clusterProfiler::bitr(svg_genes,
-                                                 fromType = "SYMBOL",
-                                                 toType = "ENTREZID",
-                                                 OrgDb = "org.Mm.eg.db")$ENTREZID,
-                    organism = "mmu")
-ereact <- ReactomePA::enrichPathway(
-  gene = clusterProfiler::bitr(svg_genes,
-                               fromType = "SYMBOL",
-                               toType = "ENTREZID",
-                               OrgDb = "org.Mm.eg.db")$ENTREZID,
-  organism = "mouse"
+seurat_rank <- seurat_svg |>
+  transmute(gene, rank_seurat = row_number())
+
+spark_rank <- spark_svg |>
+  transmute(gene, rank_spark = row_number(), spark_fdr = adjustedPval)
+
+svg_consensus <- full_join(seurat_rank, spark_rank, by = "gene") |>
+  mutate(
+    rank_seurat = replace_na(rank_seurat, max(rank_seurat, na.rm = TRUE) + 1),
+    rank_spark = replace_na(rank_spark, max(rank_spark, na.rm = TRUE) + 1),
+    consensus_rank = rank_seurat + rank_spark,
+    in_hvg = gene %in% hvg_tbl$gene,
+    in_marker = gene %in% marker_tbl$gene
+  ) |>
+  arrange(consensus_rank)
+
+head(svg_consensus, 50)
+SpatialFeaturePlot(brain, features = head(svg_consensus$gene, 6), ncol = 3)
+```
+
+## SVG Pattern Review
+
+这一步是人工解释核心：SVG 可以代表解剖层、技术梯度、组织边缘、病灶区域或细胞组成变化。
+
+```{r}
+svg_review <- svg_consensus |>
+  slice_head(n = 50) |>
+  mutate(
+    spatial_pattern = NA_character_,
+    likely_driver = NA_character_,
+    keep_for_story = NA,
+    reviewer_note = NA_character_
+  )
+svg_review
+```
+
+## Sample-Aware SVG Consistency
+
+如果项目有多个切片，先检查 top SVG 是否被单个样本驱动。SVG 很容易捕捉组织边缘、切片方向、组织损伤或局部测序深度梯度，所以多样本项目不要只看 pooled 结果。
+
+```{r}
+sample_svg_summary <- brain@meta.data |>
+  tibble::rownames_to_column("spot") |>
+  count(.data[[cfg$sample_col]], .data[[cfg$group_col]], name = "n_spots") |>
+  arrange(.data[[cfg$group_col]], .data[[cfg$sample_col]])
+
+sample_svg_summary
+```
+
+```{r}
+sample_svg_candidates <- svg_consensus |>
+  slice_head(n = 100) |>
+  transmute(
+    gene,
+    consensus_rank,
+    expected_pattern = NA_character_,
+    sample_consistency = NA_character_,
+    technical_concern = NA_character_,
+    keep_for_interpretation = NA
+  )
+
+sample_svg_candidates
+```
+
+## Method Decision Table
+
+```{r}
+svg_method_decision <- tibble::tribble(
+  ~method, ~primary_use, ~strength, ~caveat, ~use_for_final_claim,
+  "Seurat_markvariogram", "fast exploratory SVG screen", "quick and integrated with Seurat", "sensitive to feature selection and scaling", NA,
+  "SPARK-X", "formal spatial variability ranking", "widely used for Visium SVG", "runtime and package availability can vary", NA,
+  "Voyager_MoranI", "spatial autocorrelation sanity check", "interpretable Moran's I statistic", "best from SpatialFeatureExperiment input", NA,
+  "Consensus", "prioritize genes for interpretation", "reduces single-method dependence", "still requires spatial pattern review", NA
 )
+
+svg_method_decision
+```
+
+## Enrichment Including Reactome
+
+```{r}
+top_svg <- head(svg_consensus$gene, cfg$n_svg)
+entrez <- clusterProfiler::bitr(
+  top_svg,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Mm.eg.db
+)
+
+ego_bp <- clusterProfiler::enrichGO(
+  gene = entrez$ENTREZID,
+  OrgDb = org.Mm.eg.db,
+  ont = "BP",
+  readable = TRUE
+)
+
+ekegg <- clusterProfiler::enrichKEGG(
+  gene = entrez$ENTREZID,
+  organism = "mmu"
+)
+
+ereact <- ReactomePA::enrichPathway(
+  gene = entrez$ENTREZID,
+  organism = "mouse",
+  readable = TRUE
+)
+
+dotplot(ego_bp, showCategory = 15) + ggtitle("GO BP enrichment of SVGs")
 dotplot(ereact, showCategory = 15) + ggtitle("Reactome enrichment of SVGs")
 ```
 
-## 三种方法对比
+## Export
 
 ```{r}
-seurat_svg <- top_svg
-sparkx_svg <- sparkx_top[1:12]
-overlap <- intersect(seurat_svg, sparkx_svg)
-cat("Overlap:", length(overlap), "/", length(union(seurat_svg, sparkx_svg)), "\n")
+readr::write_csv(seurat_svg, file.path(cfg$results_dir, "seurat_svg.csv"))
+readr::write_csv(spark_svg, file.path(cfg$results_dir, "sparkx_svg.csv"))
+readr::write_csv(svg_consensus, file.path(cfg$results_dir, "svg_consensus_rank.csv"))
+readr::write_csv(svg_review, file.path(cfg$results_dir, "svg_interpretation_review.csv"))
+readr::write_csv(sample_svg_summary, file.path(cfg$results_dir, "svg_sample_summary.csv"))
+readr::write_csv(sample_svg_candidates, file.path(cfg$results_dir, "svg_sample_consistency_review.csv"))
+readr::write_csv(svg_method_decision, file.path(cfg$results_dir, "svg_method_decision.csv"))
+readr::write_csv(as.data.frame(ego_bp), file.path(cfg$results_dir, "svg_GO_BP.csv"))
+readr::write_csv(as.data.frame(ereact), file.path(cfg$results_dir, "svg_Reactome.csv"))
 ```
 
-## 注意事项
+## Output Contract
 
-- SPARK-X 比 Seurat Moran's I 快很多，大样本（>5k spots）首选
-- SVG 不等于 marker：marker 是 cluster 间高表达，SVG 是空间结构非随机
-- 富集中必须包含 Reactome（repo 约定）
+```{r}
+svg_output_contract <- tibble::tribble(
+  ~artifact, ~file, ~used_by, ~description,
+  "consensus SVG rank", "svg_consensus_rank.csv", "domain, pathway, manuscript figures", "combined Seurat/SPARK-X priority table",
+  "SVG review table", "svg_interpretation_review.csv", "manual interpretation", "spatial pattern and technical concern review",
+  "sample consistency table", "svg_sample_consistency_review.csv", "formal result filtering", "flags sample-specific SVG artifacts",
+  "Reactome enrichment", "svg_Reactome.csv", "pathway interpretation", "Reactome terms for top SVG genes"
+)
 
-## 下游
+svg_output_contract
+readr::write_csv(svg_output_contract, file.path(cfg$results_dir, "svg_output_contract.csv"))
+```
 
-- 找到 SVG 后可作为 BayesSpace / SpaGCN 的输入特征： `spatial/spatial_domain.qmd`
-- SVG 模块共表达分析可对接 `hdWGCNA.qmd`（根目录）
+## Claim Evidence Table
+
+```{r}
+svg_claim_evidence <- tibble::tibble(
+  claim_id = c("SVG1", "SVG2"),
+  claim = c(
+    "Top SVGs show spatially coherent expression patterns",
+    "SVG pathway enrichment supports regional biological programs"
+  ),
+  evidence_table = c("svg_interpretation_review.csv", "svg_Reactome.csv"),
+  required_visual_check = c("SpatialFeaturePlot top consensus genes", "Reactome dotplot plus top gene spatial maps"),
+  caveat = c("exclude edge/QC-driven patterns", "enrichment does not prove cell-intrinsic regulation"),
+  status = "to_review"
+)
+
+svg_claim_evidence
+readr::write_csv(svg_claim_evidence, file.path(cfg$results_dir, "svg_claim_evidence_table.csv"))
+```
+
+## Interactive Review
+
+- top SVG 是否集中在组织边缘、坏死区或低质量区域？
+- SVG 与 cluster marker 的重叠是生物学结构，还是细胞组成驱动？
+- Reactome / GO 结果是否和空间位置一致？
+- 是否需要按样本分别跑 SVG，再看共同 SVG，而不是合并后直接解释？

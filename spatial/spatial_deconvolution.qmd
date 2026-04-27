@@ -1,132 +1,393 @@
 ---
-title: "Spot 反卷积"
+title: "Spot Deconvolution"
 format: html
+execute:
+  eval: false
+  warning: false
+  message: false
 ---
 
 ## 简介
 
-Visium 每个 spot 直径约 55µm，包含多个细胞，因此需要用 scRNA 参考做反卷积，估计每个 spot 的细胞类型组成。
+Visium spot 通常包含多个细胞，不能直接当作单细胞标签解释。本文件以 scRNA reference 为输入，提供 RCTD、CARD、SPOTlight 三条路线，并把结果统一写回 Seurat 作为细胞类型比例 assay，供 `spatial_niche.qmd` 和 `spatial_celltalk.qmd` 使用。
 
-本文件涵盖三种工具：
-- **RCTD（spacexr）**：泊松似然 + 双类型混合，鲁棒，目前最常用
-- **CARD**：考虑空间相关性的非负回归
-- **SPOTlight**：非负矩阵分解（NMF）
+## Setup
 
 ```{r}
-#| include: false
 library(Seurat)
 library(SeuratData)
-library(spacexr)     # RCTD
+library(spacexr)
 library(CARD)
 library(SPOTlight)
-library(qs2)
 library(dplyr)
+library(tidyr)
 library(ggplot2)
+library(patchwork)
+library(qs2)
+library(here)
 source(here::here("singlecell_utiles.R"))
 ```
 
-## 数据加载（ST + 参考 scRNA）
+## Project Configuration
 
 ```{r}
-# 空转
-brain <- LoadData("stxBrain", type = "anterior1")
-brain[["percent.mt"]] <- PercentageFeatureSet(brain, pattern = "^mt-")
-brain <- subset(brain, subset = nFeature_Spatial > 200 & percent.mt < 20)
-# Seurat v5: 取 counts 前先 JoinLayers
-brain <- JoinLayers(brain, assay = "Spatial")
-brain <- SCTransform(brain, assay = "Spatial", verbose = FALSE)
-brain <- RunPCA(brain, assay = "SCT", verbose = FALSE)
+cfg <- list(
+  demo_mode = TRUE,
+  spatial_path = "Results/spatial_visium/visium_processed.qs2",
+  reference_path = "datasets/harmonized_seurat.qs2",
+  reference_celltype_col = "cell_type",
+  reference_sample_col = "sample",
+  spatial_sample_col = "sample",
+  spatial_group_col = "group",
+  spatial_assay = "Spatial",
+  deconv_assay = "RCTD",
+  image_index = 1,
+  max_reference_cells_per_type = 1500,
+  min_cells_per_type = 25,
+  rctd_doublet_mode = "doublet",
+  results_dir = "Results/spatial_deconvolution"
+)
 
-# 参考 scRNA（Allen 脑图谱）
-allen <- LoadData("allen_reference")
-allen <- UpdateSeuratObject(allen)
-# Seurat v5：JoinLayers 再取 counts
-allen <- JoinLayers(allen)
+dir.create(cfg$results_dir, recursive = TRUE, showWarnings = FALSE)
 ```
 
-## 方法 1：RCTD (spacexr)
+## Load Spatial And Reference Data
 
 ```{r}
-ref_counts <- GetAssayData(allen, assay = "RNA", layer = "counts")
-ref_meta <- as.factor(allen$subclass)
-names(ref_meta) <- colnames(allen)
-reference <- Reference(ref_counts, ref_meta)
+if (cfg$demo_mode) {
+  spatial_obj <- SeuratData::LoadData("stxBrain", type = "anterior1")
+  spatial_obj[["percent.mt"]] <- PercentageFeatureSet(spatial_obj, pattern = "^mt-")
+  spatial_obj <- subset(spatial_obj, subset = nFeature_Spatial > 200 & percent.mt < 20)
+  spatial_obj <- SCTransform(spatial_obj, assay = "Spatial", verbose = FALSE)
 
-st_counts <- GetAssayData(brain, assay = "Spatial", layer = "counts")
-st_coords <- GetTissueCoordinates(brain@images[[1]])[, c("imagerow", "imagecol")]
-puck <- SpatialRNA(st_coords, st_counts)
+  reference_obj <- SeuratData::LoadData("allen_reference")
+  reference_obj <- UpdateSeuratObject(reference_obj)
+  reference_obj$cell_type <- reference_obj$subclass
+} else {
+  spatial_obj <- qs2::qs_read(cfg$spatial_path)
+  reference_obj <- qs2::qs_read(cfg$reference_path)
+}
 
-rctd <- create.RCTD(puck, reference, max_cores = 2)
-rctd <- run.RCTD(rctd, doublet_mode = "doublet")
+if (!cfg$spatial_sample_col %in% colnames(spatial_obj@meta.data)) spatial_obj[[cfg$spatial_sample_col]] <- "sample_1"
+if (!cfg$spatial_group_col %in% colnames(spatial_obj@meta.data)) spatial_obj[[cfg$spatial_group_col]] <- "group_1"
 
-# 提取权重并写入 Seurat
-weights <- as.matrix(rctd@results$weights)
-norm_w <- sweep(weights, 1, rowSums(weights), "/")
-brain[["RCTD"]] <- CreateAssayObject(data = t(norm_w))
-
-# 可视化
-DefaultAssay(brain) <- "RCTD"
-SpatialFeaturePlot(brain, features = head(rownames(brain[["RCTD"]]), 6),
-                   ncol = 3, alpha = c(0.1, 1))
+stopifnot(cfg$reference_celltype_col %in% colnames(reference_obj@meta.data))
+table(reference_obj[[cfg$reference_celltype_col]][, 1]) |> sort(decreasing = TRUE) |> head(20)
 ```
 
-## 方法 2：CARD
+## Reference Review And Downsampling
+
+每个 cell type 过少会不稳定，过多会拖慢计算。先过滤再按类型下采样。
 
 ```{r}
-#| eval: false
-card_obj <- createCARDObject(
-  sc_count = ref_counts,
-  sc_meta = data.frame(cellType = ref_meta, sampleInfo = "all"),
-  spatial_count = st_counts,
-  spatial_location = data.frame(x = st_coords[, 1], y = st_coords[, 2]),
+ct <- reference_obj[[cfg$reference_celltype_col]][, 1]
+keep_types <- names(table(ct))[table(ct) >= cfg$min_cells_per_type]
+reference_obj <- subset(reference_obj, cells = colnames(reference_obj)[ct %in% keep_types])
+
+set.seed(1)
+down_cells <- reference_obj@meta.data |>
+  tibble::rownames_to_column("cell") |>
+  group_by(.data[[cfg$reference_celltype_col]]) |>
+  slice_sample(n = min(n(), cfg$max_reference_cells_per_type)) |>
+  pull(cell)
+reference_obj <- subset(reference_obj, cells = down_cells)
+
+reference_summary <- reference_obj@meta.data |>
+  count(.data[[cfg$reference_celltype_col]], name = "n_cells") |>
+  arrange(desc(n_cells))
+reference_summary
+```
+
+## Reference Suitability Review
+
+反卷积质量首先由 reference 决定。这里把 reference 组成、空间样本 marker 可见性和潜在缺失细胞类型整理成审查表。
+
+```{r}
+reference_review <- reference_summary |>
+  mutate(
+    expected_in_tissue = NA,
+    marker_support_in_spatial = NA,
+    merge_or_drop = NA_character_,
+    reviewer_note = NA_character_
+  )
+
+reference_review
+```
+
+## Prepare Counts And Coordinates
+
+Seurat v5 分层对象传给 RCTD / CARD / SPOTlight 前要 `JoinLayers()`。
+
+```{r}
+spatial_obj <- JoinLayers(spatial_obj, assay = cfg$spatial_assay)
+reference_obj <- JoinLayers(reference_obj)
+
+spatial_counts <- GetAssayData(spatial_obj, assay = cfg$spatial_assay, layer = "counts")
+reference_counts <- GetAssayData(reference_obj, assay = "RNA", layer = "counts")
+
+common_genes <- intersect(rownames(spatial_counts), rownames(reference_counts))
+spatial_counts <- spatial_counts[common_genes, ]
+reference_counts <- reference_counts[common_genes, ]
+
+coords <- GetTissueCoordinates(spatial_obj@images[[cfg$image_index]])[, c("imagerow", "imagecol")]
+coords <- coords[colnames(spatial_counts), , drop = FALSE]
+```
+
+## Method 1: RCTD
+
+```{r}
+cell_types <- as.factor(reference_obj[[cfg$reference_celltype_col]][, 1])
+names(cell_types) <- colnames(reference_obj)
+
+reference <- spacexr::Reference(reference_counts, cell_types)
+puck <- spacexr::SpatialRNA(coords, spatial_counts)
+
+rctd <- spacexr::create.RCTD(puck, reference, max_cores = 4)
+rctd <- spacexr::run.RCTD(rctd, doublet_mode = cfg$rctd_doublet_mode)
+
+rctd_weights <- as.matrix(rctd@results$weights)
+rctd_weights <- sweep(rctd_weights, 1, rowSums(rctd_weights), "/")
+rctd_weights[is.na(rctd_weights)] <- 0
+
+spatial_obj[[cfg$deconv_assay]] <- CreateAssayObject(data = t(rctd_weights))
+DefaultAssay(spatial_obj) <- cfg$deconv_assay
+
+SpatialFeaturePlot(
+  spatial_obj,
+  features = head(rownames(spatial_obj[[cfg$deconv_assay]]), 8),
+  ncol = 4,
+  alpha = c(0.05, 1)
+)
+```
+
+## Method 2: CARD
+
+```{r}
+card_obj <- CARD::createCARDObject(
+  sc_count = reference_counts,
+  sc_meta = data.frame(
+    cellType = cell_types,
+    sampleInfo = if (cfg$reference_sample_col %in% colnames(reference_obj@meta.data)) {
+      reference_obj[[cfg$reference_sample_col]][, 1]
+    } else {
+      "reference"
+    },
+    row.names = colnames(reference_counts)
+  ),
+  spatial_count = spatial_counts,
+  spatial_location = data.frame(x = coords[, 1], y = coords[, 2], row.names = rownames(coords)),
   ct.varname = "cellType",
-  ct.select = unique(ref_meta),
+  ct.select = levels(cell_types),
   sample.varname = "sampleInfo"
 )
-card_obj <- CARD_deconvolution(CARD_object = card_obj)
-CARD.visualize.pie(proportion = card_obj@Proportion_CARD,
-                   spatial_location = card_obj@spatial_location)
+card_obj <- CARD::CARD_deconvolution(CARD_object = card_obj)
+
+card_weights <- card_obj@Proportion_CARD
+head(card_weights[, 1:5])
 ```
 
-## 方法 3：SPOTlight
+## Method 3: SPOTlight
 
 ```{r}
-#| eval: false
-hvg <- VariableFeatures(allen)[1:3000]
-mgs <- FindAllMarkers(allen, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
-mgs_top <- mgs |> group_by(cluster) |> slice_max(avg_log2FC, n = 100)
-spotlight_res <- SPOTlight(
-  x = GetAssayData(allen, layer = "counts"),
-  y = GetAssayData(brain, assay = "Spatial", layer = "counts"),
-  groups = allen$subclass,
-  mgs = mgs_top,
-  hvg = hvg,
+Idents(reference_obj) <- cfg$reference_celltype_col
+reference_obj <- NormalizeData(reference_obj)
+reference_obj <- FindVariableFeatures(reference_obj)
+
+marker_tbl <- FindAllMarkers(
+  reference_obj,
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+) |>
+  group_by(cluster) |>
+  slice_max(avg_log2FC, n = 100, with_ties = FALSE) |>
+  ungroup()
+
+spotlight_res <- SPOTlight::SPOTlight(
+  x = reference_counts,
+  y = spatial_counts,
+  groups = cell_types,
+  mgs = marker_tbl,
+  hvg = VariableFeatures(reference_obj),
   weight_id = "avg_log2FC",
   group_id = "cluster",
   gene_id = "gene"
 )
+
+spotlight_weights <- spotlight_res$mat
 ```
 
-## 三种方法的可视化对比
+## Method Comparison
 
 ```{r}
-res <- PlotDeconvProportion(brain, decon_assay = "RCTD",
-                            group_col = "seurat_clusters", top_n = 10)
-res$bar
-res$spatial
+rctd_long <- as.data.frame(rctd_weights) |>
+  tibble::rownames_to_column("spot") |>
+  pivot_longer(-spot, names_to = "cell_type", values_to = "prop") |>
+  mutate(method = "RCTD")
+
+card_long <- as.data.frame(card_weights) |>
+  tibble::rownames_to_column("spot") |>
+  pivot_longer(-spot, names_to = "cell_type", values_to = "prop") |>
+  mutate(method = "CARD")
+
+method_summary <- bind_rows(rctd_long, card_long) |>
+  group_by(method, cell_type) |>
+  summarise(mean_prop = mean(prop), .groups = "drop") |>
+  arrange(method, desc(mean_prop))
+
+ggplot(method_summary, aes(x = reorder(cell_type, mean_prop), y = mean_prop, fill = method)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  theme_classic() +
+  labs(x = "Cell type", y = "Mean estimated proportion")
 ```
 
-## 与原 `spacexr_STalign` 文件的关系
+## Spatial Visualization
 
-`spacexr` 即 RCTD 包；本文件已涵盖。原 `spatial/spacexr_STalign.qmd` 占位文件已删除。
+```{r}
+deconv_plot <- PlotDeconvProportion(
+  spatial_obj,
+  decon_assay = cfg$deconv_assay,
+  group_col = "seurat_clusters",
+  top_n = 12
+)
+deconv_plot$bar
+deconv_plot$spatial
+```
 
-## 注意事项
+## Dominant Cell Type And Confidence
 
-- Seurat v5 参考对象在 `Reference()` 之前必须 `JoinLayers()`
-- `doublet_mode = "doublet"` 适合标准 Visium；高分辨率（Slide-seq、HD）用 `"full"`
-- 序列化反卷积结果用 `qs2::qs_save`
+```{r}
+dominant <- as.data.frame(rctd_weights) |>
+  tibble::rownames_to_column("spot")
+dominant_idx <- max.col(as.matrix(rctd_weights), ties.method = "first")
+dominant$dominant_celltype <- colnames(rctd_weights)[dominant_idx]
+dominant$dominant_prop <- apply(rctd_weights, 1, max)
 
-## 下游
+spatial_obj@meta.data <- spatial_obj@meta.data |>
+  tibble::rownames_to_column("spot") |>
+  left_join(dominant, by = "spot") |>
+  tibble::column_to_rownames("spot")
 
-- niche / 邻域分析（基于反卷积比例）： `spatial/spatial_niche.qmd`
-- 空间通讯（按反卷积细胞类型）： `spatial/spatial_celltalk.qmd`
+SpatialDimPlot(spatial_obj, group.by = "dominant_celltype", label = TRUE)
+SpatialFeaturePlot(spatial_obj, features = "dominant_prop")
+```
+
+## Confidence And Mixed-Spot Review
+
+```{r}
+confidence_summary <- spatial_obj@meta.data |>
+  tibble::rownames_to_column("spot") |>
+  mutate(
+    confidence_class = dplyr::case_when(
+      dominant_prop >= 0.7 ~ "high_dominant",
+      dominant_prop >= 0.4 ~ "mixed_intermediate",
+      TRUE ~ "highly_mixed"
+    )
+  ) |>
+  count(.data[[cfg$spatial_sample_col]], .data[[cfg$spatial_group_col]], confidence_class, name = "n_spots") |>
+  group_by(.data[[cfg$spatial_sample_col]]) |>
+  mutate(frac_spots = n_spots / sum(n_spots)) |>
+  ungroup()
+
+confidence_summary
+```
+
+```{r}
+SpatialDimPlot(spatial_obj, group.by = "confidence_class")
+```
+
+## Sample-Aware Deconvolution Summary
+
+```{r}
+deconv_sample_summary <- rctd_long |>
+  left_join(
+    spatial_obj@meta.data |>
+      tibble::rownames_to_column("spot") |>
+      select(spot, all_of(c(cfg$spatial_sample_col, cfg$spatial_group_col))),
+    by = "spot"
+  ) |>
+  group_by(.data[[cfg$spatial_sample_col]], .data[[cfg$spatial_group_col]], cell_type) |>
+  summarise(mean_prop = mean(prop), median_prop = median(prop), .groups = "drop")
+
+deconv_sample_summary
+```
+
+```{r}
+ggplot(deconv_sample_summary, aes(cell_type, mean_prop, fill = .data[[cfg$spatial_group_col]])) +
+  geom_col(position = "dodge") +
+  facet_wrap(stats::as.formula(paste("~", cfg$spatial_sample_col))) +
+  coord_flip() +
+  theme_classic() +
+  labs(x = "Reference cell type", y = "Mean estimated proportion")
+```
+
+## Method Decision Table
+
+```{r}
+deconv_method_decision <- tibble::tribble(
+  ~method, ~recommended_use, ~strength, ~caveat, ~use_for_downstream,
+  "RCTD", "primary Visium deconvolution", "robust and commonly used", "depends strongly on reference coverage", TRUE,
+  "CARD", "spatially smoothed cross-check", "uses spatial correlation", "may over-smooth sharp boundaries", NA,
+  "SPOTlight", "marker/NMF-based comparison", "interpretable marker-driven model", "sensitive to marker selection", NA
+)
+
+deconv_method_decision
+```
+
+## Export
+
+```{r}
+readr::write_csv(reference_summary, file.path(cfg$results_dir, "reference_celltype_summary.csv"))
+readr::write_csv(reference_review, file.path(cfg$results_dir, "reference_suitability_review.csv"))
+readr::write_csv(rctd_long, file.path(cfg$results_dir, "rctd_proportions_long.csv"))
+readr::write_csv(method_summary, file.path(cfg$results_dir, "deconvolution_method_summary.csv"))
+readr::write_csv(confidence_summary, file.path(cfg$results_dir, "deconvolution_confidence_summary.csv"))
+readr::write_csv(deconv_sample_summary, file.path(cfg$results_dir, "deconvolution_sample_summary.csv"))
+readr::write_csv(deconv_method_decision, file.path(cfg$results_dir, "deconvolution_method_decision.csv"))
+readr::write_csv(dominant, file.path(cfg$results_dir, "dominant_celltype_by_spot.csv"))
+qs2::qs_save(spatial_obj, file.path(cfg$results_dir, "spatial_with_rctd.qs2"))
+qs2::qs_save(rctd, file.path(cfg$results_dir, "rctd_object.qs2"))
+```
+
+## Output Contract
+
+```{r}
+deconv_output_contract <- tibble::tribble(
+  ~artifact, ~file, ~used_by, ~description,
+  "spatial object with RCTD assay", "spatial_with_rctd.qs2", "niche, celltalk, integration cross-check", "Seurat object with deconvolution proportions",
+  "long RCTD proportions", "rctd_proportions_long.csv", "plotting and statistics", "spot x cell type long table",
+  "dominant cell type", "dominant_celltype_by_spot.csv", "quick label review", "argmax cell type and dominant proportion",
+  "sample summary", "deconvolution_sample_summary.csv", "group comparison", "sample-aware mean proportions"
+)
+
+deconv_output_contract
+readr::write_csv(deconv_output_contract, file.path(cfg$results_dir, "deconvolution_output_contract.csv"))
+```
+
+## Claim Evidence Table
+
+```{r}
+deconv_claim_evidence <- tibble::tibble(
+  claim_id = c("DC1", "DC2"),
+  claim = c(
+    "Spatial spots can be assigned interpretable dominant cell-type mixtures",
+    "Group or region differences in cell-type composition are sample-supported"
+  ),
+  evidence_table = c("dominant_celltype_by_spot.csv; deconvolution_confidence_summary.csv", "deconvolution_sample_summary.csv"),
+  required_visual_check = c("SpatialFeaturePlot top proportions; confidence map", "sample-level proportion barplots"),
+  caveat = c("dominant label should not be treated as pure cell identity", "requires biological replicates for formal claims"),
+  status = "to_review"
+)
+
+deconv_claim_evidence
+readr::write_csv(deconv_claim_evidence, file.path(cfg$results_dir, "deconvolution_claim_evidence_table.csv"))
+```
+
+## Interactive Review
+
+- scRNA reference 是否覆盖空间样本里预期出现的细胞类型？
+- dominant cell type 是否与组织区域和 marker 空间表达一致？
+- RCTD / CARD 的高丰度细胞类型是否方向一致？
+- 低置信度 spot 是否集中在边缘、空洞或混合组织区域？
+- 下游 niche / 通讯是否应使用比例矩阵，还是 dominant label？

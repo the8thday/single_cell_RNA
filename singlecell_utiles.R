@@ -1911,14 +1911,35 @@ NeighborComposition <- function(obj, group_col, k = 6) {
     stop("No image slot found on Seurat object.")
   }
   coords <- Seurat::GetTissueCoordinates(obj@images[[1]])
-  coords <- as.matrix(coords[, c("imagerow", "imagecol")])
-  nn <- FNN::get.knn(coords, k = k)$nn.index
-  labels <- obj@meta.data[[group_col]]
+  if (is.null(rownames(coords)) || !any(rownames(coords) %in% rownames(obj@meta.data))) {
+    id_col <- intersect(c("cell", "barcode", "spot"), colnames(coords))[1]
+    if (!is.na(id_col)) {
+      rownames(coords) <- coords[[id_col]]
+    }
+  }
+  coord_cols <- intersect(c("imagerow", "imagecol"), colnames(coords))
+  if (length(coord_cols) < 2) {
+    coord_cols <- intersect(c("y", "x"), colnames(coords))
+  }
+  if (length(coord_cols) < 2) {
+    coord_cols <- intersect(c("Y", "X"), colnames(coords))
+  }
+  if (length(coord_cols) < 2) {
+    stop("Could not find spatial coordinate columns in image slot.")
+  }
+  common <- intersect(rownames(coords), rownames(obj@meta.data))
+  if (length(common) <= k) {
+    stop("Not enough cells/spots with both coordinates and metadata for k = ", k)
+  }
+  coords <- as.matrix(coords[common, coord_cols[1:2], drop = FALSE])
+  k_use <- min(k, nrow(coords) - 1)
+  nn <- FNN::get.knn(coords, k = k_use)$nn.index
+  labels <- obj@meta.data[rownames(coords), group_col]
   spots <- rownames(coords)
   out <- vector("list", length(spots))
   for (i in seq_along(spots)) {
     nb_lab <- labels[nn[i, ]]
-    tab <- table(nb_lab) / k
+    tab <- table(nb_lab) / k_use
     out[[i]] <- data.frame(
       spot = spots[i],
       group = labels[i],

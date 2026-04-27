@@ -1,153 +1,726 @@
 ---
-title: "10x Visium 端到端工作流"
+title: "10x Visium Project Workflow"
 format: html
+execute:
+  eval: false
+  warning: false
+  message: false
 ---
 
-## 简介
+## Introduction
 
-本文件是 10x Genomics Visium 空转数据的端到端模板：从数据加载、QC、标准化、聚类、空间区域差异分析到 marker 可视化。后续的反卷积、空间可变基因、空间 domain、niche、空间通讯、ST × scRNA 整合等分析，分别在 `spatial/` 下的同名 `.qmd` 文件中展开。
+本文件是标准 10x Visium 项目的主分析模板，定位接近根目录 `cellchat.qmd`：不是一次性 render 报告，而是在 RStudio / Quarto notebook 中逐段运行、逐段决策、逐段导出结果。新项目优先修改 `Project Configuration` 和 `sample_table`，然后按 QC、过滤、标准化、聚类、空间区域注释、marker、区域差异、多样本比较、导出契约推进。
 
-适用平台：标准 Visium（55µm spot）。Visium HD 见 `visium_hd.qmd`，亚细胞分辨率成像平台见 `xenium_workflow.qmd` / `merfish_cosmx.qmd`。
+本模板只覆盖标准 Visium 55 µm spot。Visium HD 见 `visium_hd.qmd`；Xenium / MERFISH / CosMx 见 `xenium_workflow.qmd` 和 `merfish_cosmx.qmd`。
+
+## Setup
 
 ```{r}
-#| include: false
 library(Seurat)
 library(SeuratData)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
 library(ggplot2)
 library(patchwork)
-library(dplyr)
+library(readr)
 library(qs2)
+library(here)
 source(here::here("singlecell_utiles.R"))
 ```
 
-## 数据加载
+## Project Configuration
 
-使用 `SeuratData::stxBrain` 作演示样本（小鼠脑前后冠状切片各一）。第一次运行需要 `InstallData("stxBrain")`。
-
-```{r}
-# InstallData("stxBrain")  # 首次运行解开
-brain_a <- LoadData("stxBrain", type = "anterior1")
-brain_p <- LoadData("stxBrain", type = "posterior1")
-brain_a$sample <- "anterior"
-brain_p$sample <- "posterior"
-```
-
-实际项目里把样本路径放进 `LoadVisiumMulti()`：
+新项目主要改这里。`demo_mode = TRUE` 使用 `SeuratData::stxBrain` 两张切片；真实项目改为 `FALSE`，填写每个样本的 Space Ranger `outs/` 路径、group、batch 和组织注释。
 
 ```{r}
-#| eval: false
-sample_dirs <- c("/path/to/sample1/outs",
-                 "/path/to/sample2/outs")
-sample_names <- c("sample1", "sample2")
-obj_list <- LoadVisiumMulti(sample_dirs, sample_names, mt_pattern = "^mt-")
-```
-
-## QC
-
-```{r}
-brain_a[["percent.mt"]] <- PercentageFeatureSet(brain_a, pattern = "^mt-")
-SpatialQCPlot(brain_a)
-```
-
-按 nCount / nFeature / 线粒体比例过滤。阈值需按组织类型调整：
-
-```{r}
-brain_a <- subset(brain_a,
-                  subset = nCount_Spatial > 500 &
-                           nFeature_Spatial > 200 &
-                           percent.mt < 20)
-```
-
-## 标准化与降维
-
-```{r}
-brain_a <- SCTransform(brain_a, assay = "Spatial", verbose = FALSE)
-brain_a <- RunPCA(brain_a, assay = "SCT", verbose = FALSE)
-ElbowPlot(brain_a, ndims = 30)
-```
-
-## 聚类与可视化
-
-```{r}
-brain_a <- FindNeighbors(brain_a, reduction = "pca", dims = 1:20)
-brain_a <- FindClusters(brain_a, resolution = 0.4, verbose = FALSE)
-brain_a <- RunUMAP(brain_a, reduction = "pca", dims = 1:20)
-
-p1 <- SpatialDimPlot(brain_a, label = TRUE, label.size = 4)
-p2 <- DimPlot(brain_a, reduction = "umap", label = TRUE) + NoLegend()
-p1 + p2
-```
-
-## 空间区域定义与差异分析
-
-通过 H&E 形态学 + 聚类位置手工定义解剖区域，然后做区域间差异：
-
-```{r}
-brain_a$Region <- dplyr::case_when(
-  brain_a$seurat_clusters %in% c("0", "3") ~ "Cortex",
-  brain_a$seurat_clusters %in% c("1", "2") ~ "Striatum",
-  TRUE ~ "Other"
+cfg <- list(
+  demo_mode = TRUE,
+  project_name = "visium_project",
+  species = "mouse",
+  mt_pattern = "^mt-",
+  sample_col = "sample",
+  group_col = "group",
+  batch_col = "batch",
+  region_col = "spatial_region",
+  cluster_col = "selected_cluster",
+  assay = "Spatial",
+  norm_assay = "SCT",
+  normalization = "SCT",
+  vars_to_regress = c("percent.mt"),
+  dims = 1:30,
+  resolution_grid = c(0.2, 0.4, 0.6, 0.8, 1.0),
+  selected_resolution = 0.4,
+  min_counts = 500,
+  max_counts = Inf,
+  min_features = 200,
+  max_features = Inf,
+  max_percent_mt = 20,
+  marker_min_pct = 0.25,
+  marker_logfc = 0.25,
+  de_min_pct = 0.1,
+  de_logfc = 0.1,
+  top_marker_n = 10,
+  roi_table_path = "resources/spatial_region_map.csv",
+  results_dir = "Results/spatial_visium",
+  figures_dir = "figures/spatial_visium"
 )
-SpatialDimPlot(brain_a, group.by = "Region")
+
+dir.create(cfg$results_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(cfg$figures_dir, recursive = TRUE, showWarnings = FALSE)
 ```
 
-区域间差异基因（Cortex vs Striatum，方向写明保持一致）：
+真实项目的 `sample_table` 建议至少包含 `sample`, `group`, `batch`, `data_dir`。如果有病理分区、切片方向、组织块编号，也建议加列，后面所有 summary 都会保留这些信息。
 
 ```{r}
-Idents(brain_a) <- "Region"
-de_cortex_vs_striatum <- FindMarkers(brain_a,
-                                     ident.1 = "Cortex",
-                                     ident.2 = "Striatum",
-                                     test.use = "wilcox")
-head(de_cortex_vs_striatum, 10)
+sample_table <- tibble::tribble(
+  ~sample,     ~group,     ~batch,    ~data_dir,
+  "sample1",   "control",  "batch1",  "/path/to/sample1/outs",
+  "sample2",   "treated",  "batch1",  "/path/to/sample2/outs"
+)
+
+sample_table
 ```
 
-## Marker 基因
+## Data Loading
+
+### Demo Data
 
 ```{r}
-Idents(brain_a) <- "seurat_clusters"
-all_markers <- FindAllMarkers(brain_a,
-                              only.pos = TRUE,
-                              min.pct = 0.25,
-                              logfc.threshold = 0.25)
-top5 <- all_markers |>
-  dplyr::group_by(cluster) |>
-  dplyr::slice_max(avg_log2FC, n = 5)
-SpatialFeaturePlot(brain_a, features = head(top5$gene, 4))
+if (cfg$demo_mode) {
+  # InstallData("stxBrain")  # first run only
+  obj_list <- list(
+    anterior = SeuratData::LoadData("stxBrain", type = "anterior1"),
+    posterior = SeuratData::LoadData("stxBrain", type = "posterior1")
+  )
+  sample_table <- tibble::tribble(
+    ~sample,     ~group,  ~batch,   ~data_dir,
+    "anterior",  "demo",  "demo1",  "SeuratData::stxBrain anterior1",
+    "posterior", "demo",  "demo1",  "SeuratData::stxBrain posterior1"
+  )
+} else {
+  obj_list <- LoadVisiumMulti(
+    dirs = sample_table$data_dir,
+    sample_names = sample_table$sample,
+    mt_pattern = cfg$mt_pattern
+  )
+}
+
+obj_list <- purrr::imap(obj_list, function(obj, nm) {
+  meta <- sample_table |> filter(.data[[cfg$sample_col]] == nm)
+  obj[[cfg$sample_col]] <- nm
+  obj[[cfg$group_col]] <- meta[[cfg$group_col]][1]
+  obj[[cfg$batch_col]] <- meta[[cfg$batch_col]][1]
+  obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = cfg$mt_pattern)
+  obj
+})
+
+obj_list
 ```
 
-## 多样本整合
+## Pre-QC Audit
+
+先逐样本看 spot 数、UMI、基因数、线粒体比例和空间分布。这里的目标是决定 cutoff，不是先过滤再解释。
 
 ```{r}
-#| eval: false
-obj_list <- list(anterior = brain_a, posterior = brain_p)
-obj_list <- lapply(obj_list, SCTransform, assay = "Spatial", verbose = FALSE)
-features <- SelectIntegrationFeatures(obj_list, nfeatures = 3000)
-obj_list <- PrepSCTIntegration(obj_list, anchor.features = features)
-anchors  <- FindIntegrationAnchors(obj_list,
-                                   normalization.method = "SCT",
-                                   anchor.features = features)
-brain    <- IntegrateData(anchorset = anchors, normalization.method = "SCT")
-```
+qc_by_spot <- purrr::imap_dfr(obj_list, function(obj, nm) {
+  obj@meta.data |>
+    tibble::rownames_to_column("spot") |>
+    mutate(sample = nm) |>
+    select(sample, spot, nCount_Spatial, nFeature_Spatial, percent.mt, all_of(c(cfg$group_col, cfg$batch_col)))
+})
 
-## 保存
+qc_summary <- qc_by_spot |>
+  group_by(sample, .data[[cfg$group_col]], .data[[cfg$batch_col]]) |>
+  summarise(
+    n_spots = n(),
+    median_counts = median(nCount_Spatial),
+    median_features = median(nFeature_Spatial),
+    median_percent_mt = median(percent.mt),
+    p95_counts = quantile(nCount_Spatial, 0.95),
+    p95_percent_mt = quantile(percent.mt, 0.95),
+    .groups = "drop"
+  )
+qc_summary
+```
 
 ```{r}
-#| eval: false
-qs2::qs_save(brain_a, "Results/brain_anterior.qs")
+qc_long <- qc_by_spot |>
+  select(sample, nCount_Spatial, nFeature_Spatial, percent.mt) |>
+  pivot_longer(-sample, names_to = "metric", values_to = "value")
+
+ggplot(qc_long, aes(value, fill = sample)) +
+  geom_histogram(bins = 80, alpha = 0.55, position = "identity") +
+  facet_wrap(~ metric, scales = "free", ncol = 1) +
+  theme_classic()
 ```
 
-## 下游分析
+逐样本空间 QC 图。真实项目里先在这里决定是否某个样本整体质量不合格。
 
-- 反卷积： `spatial/spatial_deconvolution.qmd`
-- 空间可变基因： `spatial/spatial_SVG.qmd`
-- 空间 domain 检测： `spatial/spatial_domain.qmd`
-- niche / 邻域： `spatial/spatial_niche.qmd`
-- 空间通讯： `spatial/spatial_celltalk.qmd`
-- ST × scRNA 整合： `spatial/spatial_scRNA_integration.qmd`
+```{r}
+purrr::iwalk(obj_list, function(obj, nm) {
+  print(
+    SpatialQCPlot(
+      obj,
+      features = c("nCount_Spatial", "nFeature_Spatial", "percent.mt")
+    ) + patchwork::plot_annotation(title = nm)
+  )
+})
+```
 
-## 注意事项
+## QC Cutoff Sweep
 
-- Seurat v5 多样本整合后调用反卷积 / CytoTRACE2 等之前需 `JoinLayers()`
-- 序列化用 `qs2::qs_save`，不要用 `qs::`
-- 区域差异分析比较方向（如 Cortex vs Striatum）变量名 / 标题 / 注释三者保持一致
+这个表用于回答“如果 cutoff 这样设，每个样本会丢多少 spot”。如果某个组别或样本损失特别多，要先解释，再进入下游。
+
+```{r}
+qc_grid <- tidyr::crossing(
+  min_counts = c(200, 500, 1000),
+  min_features = c(100, 200, 500),
+  max_percent_mt = c(15, 20, 30)
+)
+
+qc_sweep <- qc_grid |>
+  mutate(setting_id = row_number()) |>
+  tidyr::crossing(sample = unique(qc_by_spot$sample)) |>
+  left_join(qc_by_spot, by = "sample") |>
+  group_by(setting_id, sample, min_counts, min_features, max_percent_mt) |>
+  summarise(
+    n_before = n(),
+    n_after = sum(
+      nCount_Spatial >= first(min_counts) &
+        nFeature_Spatial >= first(min_features) &
+        percent.mt <= first(max_percent_mt)
+    ),
+    frac_kept = n_after / n_before,
+    .groups = "drop"
+  ) |>
+  arrange(setting_id, sample)
+
+qc_sweep
+```
+
+```{r}
+ggplot(qc_sweep, aes(factor(setting_id), frac_kept, fill = sample)) +
+  geom_col(position = "dodge") +
+  theme_classic() +
+  labs(x = "QC setting", y = "Fraction of spots kept")
+```
+
+## Filtering
+
+```{r}
+filter_one <- function(obj) {
+  keep <- rownames(obj@meta.data)[
+    obj@meta.data$nCount_Spatial >= cfg$min_counts &
+      obj@meta.data$nCount_Spatial <= cfg$max_counts &
+      obj@meta.data$nFeature_Spatial >= cfg$min_features &
+      obj@meta.data$nFeature_Spatial <= cfg$max_features &
+      obj@meta.data$percent.mt <= cfg$max_percent_mt
+  ]
+  subset(obj, cells = keep)
+}
+
+obj_list_filtered <- purrr::map(obj_list, filter_one)
+
+filter_summary <- tibble::tibble(
+  sample = names(obj_list),
+  n_before = purrr::map_int(obj_list, ncol),
+  n_after = purrr::map_int(obj_list_filtered, ncol)
+) |>
+  mutate(frac_kept = n_after / n_before) |>
+  left_join(sample_table, by = "sample")
+
+filter_summary
+```
+
+## Normalization And Per-Sample Preprocessing
+
+先逐样本做基础降维和聚类，避免 integration 后才发现某个样本自身结构异常。
+
+```{r}
+preprocess_one <- function(obj) {
+  if (cfg$normalization == "SCT") {
+    obj <- SCTransform(
+      obj,
+      assay = cfg$assay,
+      vars.to.regress = cfg$vars_to_regress,
+      verbose = FALSE
+    )
+    DefaultAssay(obj) <- cfg$norm_assay
+  } else {
+    obj <- NormalizeData(obj, assay = cfg$assay)
+    obj <- FindVariableFeatures(obj, assay = cfg$assay)
+    obj <- ScaleData(obj, assay = cfg$assay)
+    DefaultAssay(obj) <- cfg$assay
+  }
+  obj <- RunPCA(obj, npcs = max(cfg$dims), verbose = FALSE)
+  obj <- FindNeighbors(obj, reduction = "pca", dims = cfg$dims)
+  obj <- FindClusters(obj, resolution = cfg$selected_resolution, verbose = FALSE)
+  obj <- RunUMAP(obj, reduction = "pca", dims = cfg$dims)
+  obj
+}
+
+obj_list_processed <- purrr::map(obj_list_filtered, preprocess_one)
+```
+
+```{r}
+purrr::iwalk(obj_list_processed, function(obj, nm) {
+  print(SpatialDimPlot(obj, label = TRUE) + ggtitle(paste(nm, "spatial clusters")))
+  print(DimPlot(obj, reduction = "umap", label = TRUE) + ggtitle(paste(nm, "UMAP")))
+})
+```
+
+## Merge Samples For Joint Exploration
+
+这个对象用于共同 embedding、共同 cluster 和跨样本概览。统计结论仍建议回到 sample 层面汇总。
+
+```{r}
+if (length(obj_list_processed) == 1) {
+  brain <- obj_list_processed[[1]]
+} else {
+  brain <- merge(
+    x = obj_list_processed[[1]],
+    y = obj_list_processed[-1],
+    add.cell.ids = names(obj_list_processed),
+    project = cfg$project_name
+  )
+  if (cfg$normalization == "SCT") {
+    brain <- SCTransform(
+      brain,
+      assay = cfg$assay,
+      vars.to.regress = cfg$vars_to_regress,
+      verbose = FALSE
+    )
+    DefaultAssay(brain) <- cfg$norm_assay
+  } else {
+    brain <- NormalizeData(brain, assay = cfg$assay)
+    brain <- FindVariableFeatures(brain, assay = cfg$assay)
+    brain <- ScaleData(brain, assay = cfg$assay)
+    DefaultAssay(brain) <- cfg$assay
+  }
+  brain <- RunPCA(brain, npcs = max(cfg$dims), verbose = FALSE)
+}
+
+ElbowPlot(brain, ndims = max(cfg$dims))
+```
+
+## Optional SCT Integration
+
+如果多个样本存在明显 batch effect，可运行 SCT integration。注意：整合对象适合共同 embedding / cluster，不适合直接替代 raw counts 做差异分析或反卷积。
+
+```{r}
+if (length(obj_list_filtered) > 1 && cfg$normalization == "SCT") {
+  obj_list_sct <- purrr::map(
+    obj_list_filtered,
+    ~ SCTransform(.x, assay = cfg$assay, vars.to.regress = cfg$vars_to_regress, verbose = FALSE)
+  )
+  features <- SelectIntegrationFeatures(obj_list_sct, nfeatures = 3000)
+  obj_list_sct <- PrepSCTIntegration(obj_list_sct, anchor.features = features)
+  anchors <- FindIntegrationAnchors(
+    object.list = obj_list_sct,
+    normalization.method = "SCT",
+    anchor.features = features
+  )
+  brain_integrated <- IntegrateData(anchorset = anchors, normalization.method = "SCT")
+  DefaultAssay(brain_integrated) <- "integrated"
+  brain_integrated <- RunPCA(brain_integrated, npcs = max(cfg$dims), verbose = FALSE)
+  brain_integrated <- RunUMAP(brain_integrated, dims = cfg$dims)
+}
+```
+
+## Clustering Resolution Explorer
+
+多跑几个 resolution，优先选择空间上连续、marker 能解释、样本间稳定的 cluster。
+
+```{r}
+brain <- FindNeighbors(brain, reduction = "pca", dims = cfg$dims)
+
+for (res in cfg$resolution_grid) {
+  brain <- FindClusters(brain, resolution = res, verbose = FALSE)
+}
+
+resolution_prefix <- paste0(cfg$norm_assay, "_snn_res.")
+cluster_cols <- paste0(resolution_prefix, cfg$resolution_grid)
+cluster_cols <- cluster_cols[cluster_cols %in% colnames(brain@meta.data)]
+
+resolution_review <- tibble::tibble(
+  resolution = cfg$resolution_grid,
+  cluster_col = paste0(resolution_prefix, cfg$resolution_grid)
+) |>
+  filter(cluster_col %in% colnames(brain@meta.data)) |>
+  mutate(
+    n_clusters = purrr::map_int(cluster_col, ~ n_distinct(brain@meta.data[[.x]])),
+    reviewer_note = NA_character_,
+    keep_for_analysis = .data$resolution == cfg$selected_resolution
+  )
+resolution_review
+```
+
+```{r}
+for (col in cluster_cols) {
+  print(
+    SpatialDimPlot(brain, group.by = col, label = TRUE, label.size = 3) +
+      ggtitle(paste("Resolution", sub(".*res\\.", "", col)))
+  )
+}
+
+selected_cluster_col <- paste0(resolution_prefix, cfg$selected_resolution)
+brain[[cfg$cluster_col]] <- brain@meta.data[[selected_cluster_col]]
+Idents(brain) <- cfg$cluster_col
+brain <- RunUMAP(brain, reduction = "pca", dims = cfg$dims)
+
+SpatialDimPlot(brain, group.by = cfg$cluster_col, label = TRUE, label.size = 3) +
+  DimPlot(brain, group.by = cfg$cluster_col, reduction = "umap", label = TRUE)
+```
+
+## Cluster Composition By Sample And Group
+
+```{r}
+cluster_sample_summary <- brain@meta.data |>
+  tibble::rownames_to_column("spot") |>
+  count(.data[[cfg$sample_col]], .data[[cfg$group_col]], .data[[cfg$cluster_col]], name = "n_spots") |>
+  group_by(.data[[cfg$sample_col]]) |>
+  mutate(frac_spots = n_spots / sum(n_spots)) |>
+  ungroup()
+
+cluster_group_summary <- cluster_sample_summary |>
+  group_by(.data[[cfg$group_col]], .data[[cfg$cluster_col]]) |>
+  summarise(mean_frac = mean(frac_spots), .groups = "drop")
+
+cluster_sample_summary
+```
+
+```{r}
+ggplot(cluster_sample_summary, aes(.data[[cfg$cluster_col]], frac_spots, fill = .data[[cfg$sample_col]])) +
+  geom_col(position = "dodge") +
+  facet_wrap(stats::as.formula(paste("~", cfg$group_col))) +
+  theme_classic() +
+  labs(x = "Cluster", y = "Fraction of spots")
+```
+
+## Spatial Region Annotation
+
+空间转录组的关键不是 cluster 编号，而是能解释的空间区域。推荐做法：
+
+- 先用 cluster / H&E / marker 表达生成初版 `region_map`
+- 在 notebook 中查看空间图
+- 修改 `spatial_region` 为解剖、病理或功能区域
+- 导出 `region_review_map.csv` 作为手工审查记录
+
+如果已有外部 ROI 表，例如 Loupe / pathologist 标注，可准备 `spot, spatial_region` 两列并放到 `cfg$roi_table_path`。
+
+```{r}
+if (file.exists(cfg$roi_table_path)) {
+  roi_tbl <- readr::read_csv(cfg$roi_table_path, show_col_types = FALSE)
+  stopifnot(all(c("spot", cfg$region_col) %in% colnames(roi_tbl)))
+  brain@meta.data <- brain@meta.data |>
+    tibble::rownames_to_column("spot") |>
+    left_join(roi_tbl, by = "spot") |>
+    tibble::column_to_rownames("spot")
+} else {
+  region_map <- tibble::tibble(
+    selected_cluster = sort(unique(as.character(brain[[cfg$cluster_col]][, 1]))),
+    spatial_region = paste0("Region_", selected_cluster),
+    histology_support = NA_character_,
+    marker_support = NA_character_,
+    reviewer_note = "replace with anatomy / pathology label"
+  )
+
+  brain@meta.data <- brain@meta.data |>
+    tibble::rownames_to_column("spot") |>
+    left_join(region_map, by = c("selected_cluster" = "selected_cluster")) |>
+    tibble::column_to_rownames("spot")
+}
+
+SpatialDimPlot(brain, group.by = cfg$region_col, label = TRUE, label.size = 3)
+```
+
+## Marker Discovery
+
+```{r}
+Idents(brain) <- cfg$cluster_col
+cluster_markers <- FindAllMarkers(
+  brain,
+  only.pos = TRUE,
+  min.pct = cfg$marker_min_pct,
+  logfc.threshold = cfg$marker_logfc
+)
+
+top_cluster_markers <- cluster_markers |>
+  group_by(cluster) |>
+  slice_max(avg_log2FC, n = cfg$top_marker_n, with_ties = FALSE) |>
+  ungroup()
+
+top_cluster_markers
+```
+
+```{r}
+marker_panel <- top_cluster_markers |>
+  group_by(cluster) |>
+  slice_head(n = 3) |>
+  pull(gene) |>
+  unique()
+
+SpatialFeaturePlot(brain, features = head(marker_panel, 12), ncol = 4)
+DotPlot(brain, features = head(marker_panel, 40), group.by = cfg$cluster_col) + RotatedAxis()
+```
+
+## Region Marker Validation
+
+```{r}
+Idents(brain) <- cfg$region_col
+region_markers <- FindAllMarkers(
+  brain,
+  only.pos = TRUE,
+  min.pct = cfg$marker_min_pct,
+  logfc.threshold = cfg$marker_logfc
+)
+
+region_marker_top <- region_markers |>
+  group_by(cluster) |>
+  slice_max(avg_log2FC, n = cfg$top_marker_n, with_ties = FALSE) |>
+  ungroup()
+
+region_marker_top
+SpatialFeaturePlot(brain, features = unique(head(region_marker_top$gene, 12)), ncol = 4)
+```
+
+```{r}
+region_review <- region_marker_top |>
+  group_by(cluster) |>
+  summarise(top_markers = paste(head(gene, cfg$top_marker_n), collapse = ", "), .groups = "drop") |>
+  transmute(
+    spatial_region = cluster,
+    top_markers,
+    histology_location = NA_character_,
+    biological_interpretation = NA_character_,
+    keep_for_downstream = NA,
+    reviewer_note = NA_character_
+  )
+
+region_review
+```
+
+## Pairwise Region DE
+
+这里生成所有 region pair 的差异基因。比较方向统一为 `region_a - region_b`，变量名和 `comparison` 字段保持一致。
+
+```{r}
+run_pairwise_de <- function(obj, ident_col, ident_a, ident_b) {
+  Idents(obj) <- ident_col
+  out <- FindMarkers(
+    obj,
+    ident.1 = ident_a,
+    ident.2 = ident_b,
+    test.use = "wilcox",
+    min.pct = cfg$de_min_pct,
+    logfc.threshold = cfg$de_logfc
+  )
+  out |>
+    tibble::rownames_to_column("gene") |>
+    mutate(
+      region_a = ident_a,
+      region_b = ident_b,
+      comparison = paste(ident_a, "vs", ident_b)
+    )
+}
+
+regions <- sort(unique(na.omit(as.character(brain[[cfg$region_col]][, 1]))))
+region_pairs <- t(combn(regions, 2)) |> as.data.frame()
+colnames(region_pairs) <- c("region_a", "region_b")
+
+region_de_all <- purrr::pmap_dfr(
+  region_pairs,
+  ~ run_pairwise_de(brain, cfg$region_col, ..1, ..2)
+)
+
+region_de_all |>
+  group_by(comparison) |>
+  slice_min(p_val_adj, n = 10, with_ties = FALSE)
+```
+
+## Sample-Aware Region Abundance
+
+这个部分是多样本项目的基本统计单元：先按 sample 汇总 region / cluster 比例，再看 group 差异。不要只用 pooled spots 做结论。
+
+```{r}
+region_sample_summary <- brain@meta.data |>
+  tibble::rownames_to_column("spot") |>
+  count(.data[[cfg$sample_col]], .data[[cfg$group_col]], .data[[cfg$region_col]], name = "n_spots") |>
+  group_by(.data[[cfg$sample_col]]) |>
+  mutate(frac_spots = n_spots / sum(n_spots)) |>
+  ungroup()
+
+region_sample_summary
+```
+
+```{r}
+ggplot(region_sample_summary, aes(.data[[cfg$region_col]], frac_spots, fill = .data[[cfg$group_col]])) +
+  geom_col(position = "dodge") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = "Spatial region", y = "Fraction of spots")
+```
+
+```{r}
+if (n_distinct(region_sample_summary[[cfg$group_col]]) == 2) {
+  groups <- unique(region_sample_summary[[cfg$group_col]])
+  group_a <- groups[1]
+  group_b <- groups[2]
+
+  region_abundance_tests <- region_sample_summary |>
+    group_by(.data[[cfg$region_col]]) |>
+    summarise(
+      p_value = wilcox.test(
+        frac_spots[.data[[cfg$group_col]] == group_a],
+        frac_spots[.data[[cfg$group_col]] == group_b]
+      )$p.value,
+      mean_a = mean(frac_spots[.data[[cfg$group_col]] == group_a]),
+      mean_b = mean(frac_spots[.data[[cfg$group_col]] == group_b]),
+      delta_a_vs_b = mean_a - mean_b,
+      comparison = paste(group_a, "vs", group_b),
+      .groups = "drop"
+    ) |>
+    mutate(p_adj = p.adjust(p_value, method = "BH"))
+
+  region_abundance_tests
+}
+```
+
+## Sample-Aware Pseudobulk DE Template
+
+spot-level Wilcoxon 对探索很有用，但如果有生物学重复，正式 claim 应该尽量回到 sample-aware pseudobulk。这里按 `sample × region` 聚合 counts，并导出给 edgeR / DESeq2 / limma-voom。
+
+```{r}
+brain_counts <- JoinLayers(brain, assay = cfg$assay)
+counts <- GetAssayData(brain_counts, assay = cfg$assay, layer = "counts")
+
+pseudobulk_meta <- brain@meta.data |>
+  tibble::rownames_to_column("spot") |>
+  transmute(
+    spot,
+    sample = .data[[cfg$sample_col]],
+    group = .data[[cfg$group_col]],
+    spatial_region = .data[[cfg$region_col]],
+    pb_id = paste(sample, spatial_region, sep = "__")
+  )
+
+pb_ids <- unique(pseudobulk_meta$pb_id)
+pseudobulk_counts <- sapply(pb_ids, function(id) {
+  spots <- pseudobulk_meta$spot[pseudobulk_meta$pb_id == id]
+  Matrix::rowSums(counts[, spots, drop = FALSE])
+})
+
+pseudobulk_design <- pseudobulk_meta |>
+  distinct(pb_id, sample, group, spatial_region) |>
+  arrange(pb_id)
+
+pseudobulk_design
+```
+
+后续可用 `SC_DESeq2.qmd` 或 limma-voom 做 region 内 group comparison。这个主模板只负责生成可靠输入。
+
+## Biological Claim Table
+
+这个表用于把前面的 QC、marker、DE、composition 结果组织成可写结果的 evidence chain。
+
+```{r}
+claim_evidence_table <- tibble::tibble(
+  claim_id = character(),
+  claim = character(),
+  evidence_type = character(),
+  supporting_table = character(),
+  supporting_figure = character(),
+  strength = character(),
+  caveat = character(),
+  next_check = character()
+)
+
+claim_evidence_table <- bind_rows(
+  claim_evidence_table,
+  tibble::tibble(
+    claim_id = "C1",
+    claim = "Spatial regions are marker-supported and spatially coherent",
+    evidence_type = "region marker + SpatialFeaturePlot + H&E review",
+    supporting_table = "region_marker_top.csv; region_review_table.csv",
+    supporting_figure = "SpatialDimPlot(region); SpatialFeaturePlot(top markers)",
+    strength = "to_review",
+    caveat = "region labels are provisional until histology review",
+    next_check = "review region_review_table.csv"
+  )
+)
+
+claim_evidence_table
+```
+
+## Output Contract
+
+下游文件默认读取这个主流程导出的对象和字段。改字段名时要同步修改下游模板。
+
+```{r}
+output_contract <- tibble::tribble(
+  ~field, ~location, ~required_for, ~description,
+  "sample", "meta.data", "all downstream", "sample identifier",
+  "group", "meta.data", "sample-aware comparison", "condition / treatment group",
+  "selected_cluster", "meta.data", "marker, domain, niche", "chosen Seurat cluster",
+  "spatial_region", "meta.data", "DE, niche, celltalk", "interpretable anatomy/pathology region",
+  "percent.mt", "meta.data", "QC", "mitochondrial percentage",
+  "Spatial counts", "assay/layer", "deconvolution, pseudobulk", "raw count matrix",
+  "SCT data", "assay/layer", "visualization, clustering", "normalized expression"
+)
+
+output_contract
+```
+
+## Result Exports
+
+```{r}
+readr::write_csv(sample_table, file.path(cfg$results_dir, "sample_table.csv"))
+readr::write_csv(qc_summary, file.path(cfg$results_dir, "qc_summary_by_sample.csv"))
+readr::write_csv(qc_sweep, file.path(cfg$results_dir, "qc_cutoff_sweep.csv"))
+readr::write_csv(filter_summary, file.path(cfg$results_dir, "filter_summary.csv"))
+readr::write_csv(resolution_review, file.path(cfg$results_dir, "resolution_review.csv"))
+if (exists("region_map")) readr::write_csv(region_map, file.path(cfg$results_dir, "region_review_map.csv"))
+readr::write_csv(cluster_sample_summary, file.path(cfg$results_dir, "cluster_sample_summary.csv"))
+readr::write_csv(cluster_group_summary, file.path(cfg$results_dir, "cluster_group_summary.csv"))
+readr::write_csv(cluster_markers, file.path(cfg$results_dir, "cluster_markers.csv"))
+readr::write_csv(top_cluster_markers, file.path(cfg$results_dir, "cluster_top_markers.csv"))
+readr::write_csv(region_markers, file.path(cfg$results_dir, "region_markers.csv"))
+readr::write_csv(region_marker_top, file.path(cfg$results_dir, "region_top_markers.csv"))
+readr::write_csv(region_review, file.path(cfg$results_dir, "region_review_table.csv"))
+readr::write_csv(region_de_all, file.path(cfg$results_dir, "region_pairwise_de.csv"))
+readr::write_csv(region_sample_summary, file.path(cfg$results_dir, "region_sample_summary.csv"))
+if (exists("region_abundance_tests")) readr::write_csv(region_abundance_tests, file.path(cfg$results_dir, "region_abundance_tests.csv"))
+readr::write_csv(pseudobulk_design, file.path(cfg$results_dir, "pseudobulk_design.csv"))
+readr::write_csv(claim_evidence_table, file.path(cfg$results_dir, "claim_evidence_table.csv"))
+readr::write_csv(output_contract, file.path(cfg$results_dir, "output_contract.csv"))
+
+qs2::qs_save(brain, file.path(cfg$results_dir, "visium_processed.qs2"))
+qs2::qs_save(obj_list_processed, file.path(cfg$results_dir, "visium_processed_by_sample.qs2"))
+qs2::qs_save(pseudobulk_counts, file.path(cfg$results_dir, "pseudobulk_counts.qs2"))
+if (exists("brain_integrated")) qs2::qs_save(brain_integrated, file.path(cfg$results_dir, "visium_sct_integrated.qs2"))
+```
+
+## Interactive Review
+
+进入下游文件前，至少回答这些问题：
+
+- QC cutoff 是否对某个 sample / group 造成系统性 spot 损失？
+- 低 UMI、低 feature、高线粒体 spot 是否空间聚集在边缘、裂隙、坏死或组织外区域？
+- 选定 resolution 是否空间连续、marker 可解释、样本间稳定？
+- `spatial_region` 是否已经从 `Region_x` 占位名替换为解剖 / 病理 / 功能区域？
+- region marker 是否支持区域命名？是否需要病理或参考图谱复核？
+- group 差异是否有 sample-level 重复，而不只是 pooled spot-level 显著？
+- pseudobulk 输入是否已经按 `sample × region` 导出？
+- 下游反卷积 / SVG / domain / niche / celltalk 使用的是同一个 `visium_processed.qs2` 和同一套字段名吗？
+
+## Downstream
+
+- 空间可变基因：`spatial_SVG.qmd`
+- spot 反卷积：`spatial_deconvolution.qmd`
+- spatial domain：`spatial_domain.qmd`
+- niche / 邻域：`spatial_niche.qmd`
+- 空间通讯：`spatial_celltalk.qmd`
+- ST × scRNA 参考整合：`spatial_scRNA_integration.qmd`
+

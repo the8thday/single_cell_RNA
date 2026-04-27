@@ -1,114 +1,299 @@
 ---
-title: "Niche / 邻域分析"
+title: "Spatial Niche And Neighborhood Analysis"
 format: html
+execute:
+  eval: false
+  warning: false
+  message: false
 ---
 
 ## 简介
 
-Niche / 邻域分析关心的是"哪些细胞类型 / domain 在空间上**共定位**"。本文件三种角度：
-- **邻接共定位矩阵**（自定义 + helper）
-- **hoodscanR**：基于 KNN 的邻域统计 + 富集 vs 随机
-- **MISTy**：用 ML 模型把局部 / 中度 / 远距离邻域的影响拆开
+Spatial niche 分析关注某类 spot / cell 周围是什么组成，以及这种邻域结构是否随区域、疾病或处理组变化。本文件支持三种输入：反卷积比例、dominant cell type 标签、或 Xenium/MERFISH/CosMx 的真实单细胞标签。
+
+## Setup
 
 ```{r}
-#| include: false
 library(Seurat)
 library(SeuratData)
-library(hoodscanR)
-library(SpatialExperiment)
-library(mistyR)
-library(future)
 library(dplyr)
+library(tidyr)
 library(ggplot2)
+library(patchwork)
+library(qs2)
+library(here)
 source(here::here("singlecell_utiles.R"))
 ```
 
-## 数据加载（已带反卷积结果）
-
-假设 `spatial_deconvolution.qmd` 已跑完，加载结果：
+## Project Configuration
 
 ```{r}
-#| eval: false
-brain <- qs2::qs_read("Results/brain_with_RCTD.qs")
-DefaultAssay(brain) <- "RCTD"
+cfg <- list(
+  demo_mode = TRUE,
+  spatial_path = "Results/spatial_deconvolution/spatial_with_rctd.qs2",
+  group_col = "dominant_celltype",
+  fallback_group_col = "seurat_clusters",
+  sample_col = "sample",
+  condition_col = "group",
+  deconv_assay = "RCTD",
+  k_neighbors = 6,
+  niche_resolution = 0.4,
+  results_dir = "Results/spatial_niche"
+)
+
+dir.create(cfg$results_dir, recursive = TRUE, showWarnings = FALSE)
 ```
 
-为了独立可跑，这里 mock 一个 dominant cell type 标签：
+## Load Data
 
 ```{r}
-brain <- LoadData("stxBrain", type = "anterior1")
-brain <- SCTransform(brain, assay = "Spatial", verbose = FALSE) |>
-  RunPCA(assay = "SCT", verbose = FALSE) |>
-  FindNeighbors(dims = 1:20) |>
-  FindClusters(resolution = 0.4, verbose = FALSE)
-brain$celltype <- paste0("CT", brain$seurat_clusters)
-# Seurat v5: 取 counts/data 前先 JoinLayers
-brain <- JoinLayers(brain, assay = "Spatial")
+if (cfg$demo_mode) {
+  brain <- SeuratData::LoadData("stxBrain", type = "anterior1")
+  brain <- SCTransform(brain, assay = "Spatial", verbose = FALSE)
+  brain <- RunPCA(brain, verbose = FALSE)
+  brain <- FindNeighbors(brain, dims = 1:20)
+  brain <- FindClusters(brain, resolution = 0.4, verbose = FALSE)
+  brain$dominant_celltype <- paste0("CT", brain$seurat_clusters)
+  brain$sample <- "demo_sample"
+  brain$group <- "demo_group"
+} else {
+  brain <- qs2::qs_read(cfg$spatial_path)
+}
+
+label_col <- if (cfg$group_col %in% colnames(brain@meta.data)) cfg$group_col else cfg$fallback_group_col
+SpatialDimPlot(brain, group.by = label_col, label = TRUE)
 ```
 
-## 方法 1：邻接共定位（helper）
+## Neighbor Composition
+
+`NeighborComposition()` 使用空间坐标计算每个 spot 的 kNN 邻居标签组成。标准 Visium 六边形邻域通常先用 `k = 6`。
 
 ```{r}
-nb <- NeighborComposition(brain, group_col = "celltype", k = 6)
-agg <- nb |>
-  dplyr::group_by(group, neighbor_group) |>
-  dplyr::summarise(mean_frac = mean(fraction), .groups = "drop")
-ggplot(agg, aes(x = neighbor_group, y = group, fill = mean_frac)) +
-  geom_tile() +
+neighbor_long <- NeighborComposition(brain, group_col = label_col, k = cfg$k_neighbors)
+head(neighbor_long)
+
+neighbor_wide <- neighbor_long |>
+  select(spot, neighbor_group, fraction) |>
+  pivot_wider(names_from = neighbor_group, values_from = fraction, values_fill = 0) |>
+  tibble::column_to_rownames("spot")
+
+neighbor_mat <- as.matrix(neighbor_wide[colnames(brain), , drop = FALSE])
+```
+
+## Niche Clustering
+
+把每个 spot 的邻域组成当作特征做 niche 聚类。这个标签解释的是“周围是谁”，不是该 spot 自身是谁。
+
+```{r}
+niche_obj <- CreateSeuratObject(counts = t(neighbor_mat), meta.data = brain@meta.data)
+niche_obj <- ScaleData(niche_obj, features = rownames(niche_obj), verbose = FALSE)
+niche_obj <- RunPCA(niche_obj, features = rownames(niche_obj), npcs = min(20, nrow(niche_obj) - 1), verbose = FALSE)
+niche_obj <- FindNeighbors(niche_obj, dims = 1:min(10, ncol(Embeddings(niche_obj, "pca"))))
+niche_obj <- FindClusters(niche_obj, resolution = cfg$niche_resolution, verbose = FALSE)
+
+brain$niche_cluster <- niche_obj$seurat_clusters[colnames(brain)]
+SpatialDimPlot(brain, group.by = "niche_cluster", label = TRUE)
+```
+
+## Niche Composition Heatmap
+
+```{r}
+niche_composition <- neighbor_long |>
+  left_join(
+    brain@meta.data |> tibble::rownames_to_column("spot") |> select(spot, niche_cluster),
+    by = "spot"
+  ) |>
+  group_by(niche_cluster, neighbor_group) |>
+  summarise(mean_fraction = mean(fraction), .groups = "drop")
+
+ggplot(niche_composition, aes(neighbor_group, niche_cluster, fill = mean_fraction)) +
+  geom_tile(color = "white") +
   scale_fill_viridis_c() +
   theme_classic() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-  labs(x = "Neighbor cell type", y = "Center cell type", fill = "Mean fraction")
+  labs(x = "Neighbor label", y = "Niche cluster", fill = "Mean fraction")
 ```
 
-## 方法 2：hoodscanR
+## Pairwise Co-Localization
 
 ```{r}
-spe <- SpatialExperiment::SpatialExperiment(
-  assays = list(counts = GetAssayData(brain, assay = "Spatial", layer = "counts")),
-  colData = brain@meta.data,
-  spatialCoords = as.matrix(GetTissueCoordinates(brain@images[[1]])[, c("imagerow", "imagecol")])
+coloc_tbl <- neighbor_long |>
+  group_by(group, neighbor_group) |>
+  summarise(mean_neighbor_fraction = mean(fraction), .groups = "drop") |>
+  arrange(desc(mean_neighbor_fraction))
+
+ggplot(coloc_tbl, aes(neighbor_group, group, fill = mean_neighbor_fraction)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = "Neighbor label", y = "Spot label", fill = "Neighbor fraction")
+```
+
+## Sample / Condition Aware Niche Summary
+
+真实项目至少要按 sample 汇总，再比较 condition；不要只在 pooled spot 层面做统计。
+
+```{r}
+sample_cols <- intersect(c(cfg$sample_col, cfg$condition_col), colnames(brain@meta.data))
+
+niche_sample_summary <- brain@meta.data |>
+  tibble::rownames_to_column("spot") |>
+  count(across(all_of(sample_cols)), niche_cluster, name = "n_spots") |>
+  group_by(across(all_of(sample_cols))) |>
+  mutate(frac_spots = n_spots / sum(n_spots)) |>
+  ungroup()
+niche_sample_summary
+
+if (all(c(cfg$sample_col, cfg$condition_col) %in% colnames(niche_sample_summary))) {
+  ggplot(niche_sample_summary, aes(.data[[cfg$condition_col]], frac_spots, fill = niche_cluster)) +
+    geom_col(position = "fill") +
+    facet_wrap(stats::as.formula(paste("~", cfg$sample_col))) +
+    theme_classic() +
+    labs(x = "Condition", y = "Niche fraction")
+}
+```
+
+## Differential Neighborhood Features
+
+示例：比较两个 condition 的 niche abundance。方向为 `condition_a - condition_b`。
+
+```{r}
+if (cfg$condition_col %in% colnames(niche_sample_summary)) {
+  conditions <- unique(niche_sample_summary[[cfg$condition_col]])
+  condition_a <- conditions[1]
+  condition_b <- conditions[2]
+
+  niche_tests <- niche_sample_summary |>
+    filter(.data[[cfg$condition_col]] %in% c(condition_a, condition_b)) |>
+    group_by(niche_cluster) |>
+    summarise(
+      p_value = wilcox.test(
+        frac_spots[.data[[cfg$condition_col]] == condition_a],
+        frac_spots[.data[[cfg$condition_col]] == condition_b]
+      )$p.value,
+      mean_a = mean(frac_spots[.data[[cfg$condition_col]] == condition_a]),
+      mean_b = mean(frac_spots[.data[[cfg$condition_col]] == condition_b]),
+      delta_a_vs_b = mean_a - mean_b,
+      .groups = "drop"
+    ) |>
+    mutate(p_adj = p.adjust(p_value, method = "BH"))
+  niche_tests
+}
+```
+
+## MISTy / Multi-View Modeling Hook
+
+MISTy 可把 intrinsic 表达、近邻组成、较远组织背景分成多个 view 建模。这里先导出输入，避免把大型依赖绑定到主模板。
+
+```{r}
+misty_input <- list(
+  expression = GetAssayData(brain, assay = DefaultAssay(brain), layer = "data"),
+  neighbor_composition = neighbor_wide,
+  metadata = brain@meta.data
 )
-spe <- hoodscanR::readHoodData(spe, anno_col = "celltype")
-fnc  <- hoodscanR::findNearCells(spe, k = 100)
-pm   <- hoodscanR::scanHoods(fnc$distance)
-hoods <- hoodscanR::mergeByGroup(pm, fnc$cells)
-spe   <- hoodscanR::mergeHoodSpe(spe, hoods)
-hoodscanR::plotHoodMat(spe, n = 20)
+qs2::qs_save(misty_input, file.path(cfg$results_dir, "misty_input.qs2"))
 ```
 
-## 方法 3：MISTy（多视角邻域回归）
+## Niche Interpretation Table
 
 ```{r}
-#| eval: false
-plan(multisession, workers = 2)
-expr <- as.matrix(GetAssayData(brain, assay = "SCT", layer = "data"))
-markers <- VariableFeatures(brain)[1:50]
-expr_sub <- t(expr[markers, ])
-
-coords_df <- as.data.frame(GetTissueCoordinates(brain@images[[1]])[, c("imagerow", "imagecol")])
-
-views <- create_initial_view(as.data.frame(expr_sub)) |>
-  add_juxtaview(positions = coords_df, neighbor.thr = 200) |>
-  add_paraview(positions = coords_df, l = 1000)
-
-run_misty(views, results.folder = "Results/misty_brain")
-misty_results <- collect_results("Results/misty_brain")
-plot_improvement_stats(misty_results)
-plot_view_contributions(misty_results)
+niche_review <- niche_composition |>
+  group_by(niche_cluster) |>
+  arrange(desc(mean_fraction), .by_group = TRUE) |>
+  summarise(
+    dominant_neighbors = paste(head(neighbor_group, 5), collapse = ", "),
+    .groups = "drop"
+  ) |>
+  mutate(
+    spatial_location = NA_character_,
+    biological_label = NA_character_,
+    keep_for_story = NA,
+    reviewer_note = NA_character_
+  )
+niche_review
 ```
 
-## 比较方向约定
+## K Sensitivity Review
 
-本文件中每个矩阵的"row = center, column = neighbor"，所有标题与文字保持一致。
+邻域分析对 `k` 很敏感。标准 Visium 可从 6、12、18 做敏感性复核；成像平台常用更大的 k。
 
-## 注意事项
+```{r}
+k_sensitivity <- tibble::tibble(k = c(6, 12, 18)) |>
+  mutate(
+    recommended_context = c("immediate Visium ring", "local tissue microenvironment", "broader tissue neighborhood"),
+    run_status = ifelse(k == cfg$k_neighbors, "current_run", "optional_review"),
+    reviewer_note = NA_character_
+  )
 
-- hoodscanR `k = 100` 是默认，组织小时调小
-- MISTy 训练耗时长，示例只跑 50 个特征
-- 反卷积比例输入 niche 分析需先 `JoinLayers()` 后再取 spot × cell-type 矩阵
+k_sensitivity
+```
 
-## 下游
+## Niche Decision Table
 
-- niche × 通讯： `spatial_celltalk.qmd`
-- niche × 区域 DE：参考 `spatial_workflow.qmd` Region 那节，把 Region 替换成 niche 标签
+```{r}
+niche_decision_table <- niche_review |>
+  mutate(
+    spatial_coherence = NA_character_,
+    marker_or_deconv_support = NA_character_,
+    condition_relevance = NA_character_,
+    final_niche_label = biological_label,
+    use_for_celltalk = NA
+  )
+
+niche_decision_table
+```
+
+## Export
+
+```{r}
+readr::write_csv(neighbor_long, file.path(cfg$results_dir, "neighbor_composition_long.csv"))
+readr::write_csv(niche_composition, file.path(cfg$results_dir, "niche_composition_heatmap.csv"))
+readr::write_csv(coloc_tbl, file.path(cfg$results_dir, "pairwise_colocalization.csv"))
+readr::write_csv(niche_sample_summary, file.path(cfg$results_dir, "niche_sample_summary.csv"))
+readr::write_csv(niche_review, file.path(cfg$results_dir, "niche_interpretation_review.csv"))
+readr::write_csv(k_sensitivity, file.path(cfg$results_dir, "niche_k_sensitivity_review.csv"))
+readr::write_csv(niche_decision_table, file.path(cfg$results_dir, "niche_decision_table.csv"))
+qs2::qs_save(brain, file.path(cfg$results_dir, "spatial_with_niches.qs2"))
+```
+
+## Output Contract
+
+```{r}
+niche_output_contract <- tibble::tribble(
+  ~artifact, ~file, ~used_by, ~description,
+  "spatial object with niches", "spatial_with_niches.qs2", "celltalk, report", "Seurat object with niche_cluster metadata",
+  "neighbor composition", "neighbor_composition_long.csv", "custom niche plots", "spot-level neighbor labels and fractions",
+  "niche decision table", "niche_decision_table.csv", "manual interpretation", "final label and downstream inclusion review",
+  "sample summary", "niche_sample_summary.csv", "sample-aware comparison", "niche abundance by sample/group"
+)
+
+niche_output_contract
+readr::write_csv(niche_output_contract, file.path(cfg$results_dir, "niche_output_contract.csv"))
+```
+
+## Claim Evidence Table
+
+```{r}
+niche_claim_evidence <- tibble::tibble(
+  claim_id = c("N1", "N2"),
+  claim = c(
+    "Niche clusters represent distinct local cell-type neighborhoods",
+    "Niche differences are condition-relevant and sample-supported"
+  ),
+  evidence_table = c("niche_decision_table.csv", "niche_sample_summary.csv"),
+  required_visual_check = c("SpatialDimPlot niche_cluster plus composition heatmap", "sample/group niche abundance plot"),
+  caveat = c("k choice can alter niche boundaries", "requires replicate-aware testing for formal claims"),
+  status = "to_review"
+)
+
+niche_claim_evidence
+readr::write_csv(niche_claim_evidence, file.path(cfg$results_dir, "niche_claim_evidence_table.csv"))
+```
+
+## Interactive Review
+
+- niche cluster 是否解释“邻域组成”，而不是误读为自身细胞类型？
+- dominant neighbor 是否与空间位置、反卷积比例和 marker 一致？
+- condition 差异是否在 sample 层面重复出现？
+- 是否需要把 niche 标签用于 `spatial_celltalk.qmd` 的 sender / receiver 分组？
